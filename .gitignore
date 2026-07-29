@@ -1,0 +1,209 @@
+# ==============================================================================
+# OpenbookLM core — .gitignore
+# Stack: Rust/Axum core + reference server, TypeScript SDK, Docker, GitHub Actions
+# ==============================================================================
+
+# =============
+# SECURITY
+# =============
+
+# Environment files (secrets, API keys)
+.env
+.env.*
+!.env.example
+!.env.local.example
+**/.env
+**/.env.*
+!**/.env.example
+!**/.env.local.example
+
+# Private keys & certificates
+*.pem
+*.key
+*.p12
+*.pfx
+*.p8
+*.crt
+*.der
+*.jks
+*.keystore
+
+# Credential files
+service-account*.json
+*-credentials.json
+credentials.json
+client_secret*.json
+*.token
+
+# Clerk (can include secrets)
+**/.clerk/
+
+# Sentry auth
+.sentryclirc
+
+# Cargo registry credentials (cargo login tokens)
+.cargo/credentials
+.cargo/credentials.toml
+
+# =============
+# BACKEND (Rust)
+# =============
+
+# Build outputs
+backend/target/
+
+# Rust artifacts
+backend/**/*.rs.bk
+backend/*.rlib
+backend/*.rmeta
+*.pdb
+
+# Profiling & coverage
+*.profraw
+*.profdata
+flamegraph.svg
+perf.data
+perf.data.old
+tarpaulin-report.html
+tarpaulin-report.json
+lcov.info
+cobertura.xml
+
+# Rust-doctor cache
+**/.rust-doctor-cache.json
+
+# Mutation testing
+mutants.out/
+mutants.out.old/
+
+# =============
+# PACKAGES (public SDK workspace)
+# =============
+
+packages/*/node_modules/
+packages/*/dist/
+packages/*/*.tsbuildinfo
+
+# =============
+# ROOT TOOLING
+# =============
+
+# Root node_modules (lefthook via npm)
+/node_modules/
+
+# Root lock files
+/package-lock.json
+
+# =============
+# DOCKER
+# =============
+
+# Local compose overrides (never commit — devs customize locally)
+docker-compose.override.yml
+docker-compose.local.yml
+
+# Local volume mounts
+postgres-data/
+redis-data/
+
+# =============
+# TESTING
+# =============
+
+# Coverage reports
+coverage/
+.nyc_output/
+
+# Test output / CI integration
+junit.xml
+test-report.xml
+coverage.xml
+
+# =============
+# CI / GENERATED
+# =============
+
+# Audit & analysis reports (generated, not source)
+.meta/
+
+# Turbo cache
+.turbo/
+
+# Vercel
+.vercel
+
+# =============
+# IDE / EDITORS
+# =============
+
+# JetBrains (RustRover, WebStorm, IntelliJ)
+.idea/
+*.iml
+
+# VS Code
+.vscode/
+
+# Vim / Neovim
+*.swp
+*.swo
+*.un~
+Session.vim
+tags
+TAGS
+
+# Emacs
+*~
+\#*\#
+.#*
+
+# Sublime Text
+*.sublime-*
+
+# direnv
+.envrc
+.direnv/
+
+# =============
+# OS
+# =============
+
+# macOS
+.DS_Store
+.DS_Store?
+._*
+.AppleDouble
+.LSOverride
+.Spotlight-V100
+.Trashes
+.fseventsd
+.TemporaryItems
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# Linux
+.directory
+.Trash-*
+.nfs*
+
+# =============
+# MISC
+# =============
+
+# Logs
+*.log
+logs/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Cache
+.cache/
+
+# Claude Code
+.claude/
+.mcp.json

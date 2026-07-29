@@ -1,0 +1,209 @@
+//! SeaORM/raw SQL implementation of SearchRepository.
+//!
+//! Encapsulates all search-related raw SQL queries (pgvector similarity,
+//! PostgreSQL full-text search) that cannot be expressed via SeaORM's query builder.
+
+use async_trait::async_trait;
+use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, Statement, TransactionTrait};
+use uuid::Uuid;
+
+use crate::services::rag::utils::{format_embedding, sanitize_tsquery};
+
+use super::traits::{ChunkSearchResult, RepoResult, SearchRepository};
+
+// ============================================================================
+// SQL constants
+// ============================================================================
+
+const SEARCH_SIMILAR_SQL: &str = r"
+    SELECT c.id, c.source_id, c.chunk_index, c.content, c.parent_content,
+           c.metadata,
+           s.title as source_title,
+           (c.embedding <=> $1::vector) as distance
+    FROM chunks c
+    JOIN sources s ON c.source_id = s.id
+    WHERE s.notebook_id = $2
+    ORDER BY c.embedding <=> $1::vector
+    LIMIT $3
+";
+
+/// Tune HNSW ef_search for 1024-dim embeddings (default 40 is too low
+/// for high-dimensional spaces; 100 balances recall vs latency).
+const SET_HNSW_EF_SEARCH: &str = "SET LOCAL hnsw.ef_search = 100";
+
+const SEARCH_LEXICAL_SQL: &str = r"
+    SELECT c.id, c.source_id, c.chunk_index, c.content, c.parent_content,
+           c.metadata,
+           s.title as source_title,
+           ts_rank_cd(c.content_tsv, plainto_tsquery('simple', $1)) as rank
+    FROM chunks c
+    JOIN sources s ON c.source_id = s.id
+    WHERE s.notebook_id = $2
+      AND c.content_tsv @@ plainto_tsquery('simple', $1)
+    ORDER BY rank DESC
+    LIMIT $3
+";
+
+const COUNT_CHUNKS_FOR_NOTEBOOK_SQL: &str = r"
+    SELECT COUNT(*) as total
+    FROM chunks c
+    JOIN sources s ON c.source_id = s.id
+    WHERE s.notebook_id = $1
+";
+
+const GET_ALL_CHUNKS_FOR_NOTEBOOK_SQL: &str = r"
+    SELECT c.id, c.source_id, c.chunk_index, c.content, c.parent_content,
+           s.title as source_title
+    FROM chunks c
+    JOIN sources s ON c.source_id = s.id
+    WHERE s.notebook_id = $1
+    ORDER BY s.id, c.chunk_index
+";
+
+// ============================================================================
+// Implementation
+// ============================================================================
+
+#[derive(Clone)]
+pub struct SeaOrmSearchRepository {
+    db: DatabaseConnection,
+}
+
+impl SeaOrmSearchRepository {
+    pub fn new(db: &DatabaseConnection) -> Self {
+        Self { db: db.clone() }
+    }
+
+    #[allow(clippy::unused_self)]
+    fn stmt(&self, sql: &str, values: impl IntoIterator<Item = sea_orm::Value>) -> Statement {
+        Statement::from_sql_and_values(DbBackend::Postgres, sql, values)
+    }
+}
+
+#[async_trait]
+impl SearchRepository for SeaOrmSearchRepository {
+    #[tracing::instrument(skip(self, query_embedding), fields(%notebook_id, %limit))]
+    async fn search_similar_chunks(
+        &self,
+        notebook_id: Uuid,
+        query_embedding: &[f32],
+        limit: i32,
+    ) -> RepoResult<Vec<ChunkSearchResult>> {
+        let embedding_str = format_embedding(query_embedding);
+
+        // Use a transaction to scope SET LOCAL (resets automatically on commit/rollback).
+        let txn = self.db.begin().await?;
+
+        // Tune HNSW ef_search for 1024-dim embeddings before the search query.
+        txn.execute(Statement::from_string(
+            DbBackend::Postgres,
+            SET_HNSW_EF_SEARCH,
+        ))
+        .await?;
+
+        let rows = txn
+            .query_all(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                SEARCH_SIMILAR_SQL,
+                [embedding_str.into(), notebook_id.into(), limit.into()],
+            ))
+            .await?;
+
+        txn.commit().await?;
+
+        rows.into_iter()
+            .map(|row| {
+                let distance: f64 = row.try_get("", "distance")?;
+                #[allow(clippy::cast_possible_truncation)]
+                Ok(ChunkSearchResult {
+                    id: row.try_get("", "id")?,
+                    source_id: row.try_get("", "source_id")?,
+                    chunk_index: row.try_get("", "chunk_index")?,
+                    content: row.try_get("", "content")?,
+                    parent_content: row.try_get("", "parent_content")?,
+                    source_title: row.try_get("", "source_title")?,
+                    relevance_score: (1.0 - distance).max(0.0) as f32,
+                    metadata: row.try_get("", "metadata").ok(),
+                })
+            })
+            .collect()
+    }
+
+    #[tracing::instrument(skip(self), fields(%notebook_id, %limit))]
+    async fn search_lexical_chunks(
+        &self,
+        notebook_id: Uuid,
+        query: &str,
+        limit: i32,
+    ) -> RepoResult<Vec<ChunkSearchResult>> {
+        let sanitized = sanitize_tsquery(query);
+        if sanitized.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let rows = self
+            .db
+            .query_all(self.stmt(
+                SEARCH_LEXICAL_SQL,
+                [sanitized.into(), notebook_id.into(), limit.into()],
+            ))
+            .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                let rank: f32 = row.try_get("", "rank")?;
+                Ok(ChunkSearchResult {
+                    id: row.try_get("", "id")?,
+                    source_id: row.try_get("", "source_id")?,
+                    chunk_index: row.try_get("", "chunk_index")?,
+                    content: row.try_get("", "content")?,
+                    parent_content: row.try_get("", "parent_content")?,
+                    source_title: row.try_get("", "source_title")?,
+                    relevance_score: rank.min(1.0),
+                    metadata: row.try_get("", "metadata").ok(),
+                })
+            })
+            .collect()
+    }
+
+    #[tracing::instrument(skip(self), fields(%notebook_id))]
+    async fn count_chunks_for_notebook(&self, notebook_id: Uuid) -> RepoResult<i64> {
+        let rows = self
+            .db
+            .query_all(self.stmt(COUNT_CHUNKS_FOR_NOTEBOOK_SQL, [notebook_id.into()]))
+            .await?;
+
+        let total: i64 = rows
+            .first()
+            .and_then(|r| r.try_get::<i64>("", "total").ok())
+            .unwrap_or(0);
+
+        Ok(total)
+    }
+
+    #[tracing::instrument(skip(self), fields(%notebook_id))]
+    async fn get_all_chunks_for_notebook(
+        &self,
+        notebook_id: Uuid,
+    ) -> RepoResult<Vec<ChunkSearchResult>> {
+        let rows = self
+            .db
+            .query_all(self.stmt(GET_ALL_CHUNKS_FOR_NOTEBOOK_SQL, [notebook_id.into()]))
+            .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                Ok(ChunkSearchResult {
+                    id: row.try_get("", "id")?,
+                    source_id: row.try_get("", "source_id")?,
+                    chunk_index: row.try_get("", "chunk_index")?,
+                    content: row.try_get("", "content")?,
+                    parent_content: row.try_get("", "parent_content")?,
+                    source_title: row.try_get("", "source_title")?,
+                    relevance_score: 1.0,
+                    metadata: None,
+                })
+            })
+            .collect()
+    }
+}

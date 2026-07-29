@@ -1,0 +1,35 @@
+# Cargo audit configuration — machine-readable CVE suppression.
+#
+# Each ignored advisory has a justification explaining why it is safe
+# to suppress in this codebase. Review periodically and remove entries
+# when upstream fixes become available.
+
+[advisories]
+ignore = [
+    # quinn-proto: transitive via reqwest → quinn. We use HTTP/1.1 + TLS only,
+    # QUIC/UDP paths are not reachable from our code.
+    "RUSTSEC-2026-0037",
+
+    # rsa: transitive via sqlx-mysql → rsa. We use PostgreSQL exclusively,
+    # no MySQL connections or RSA operations in our code. No fix available.
+    "RUSTSEC-2023-0071",
+
+    # rustls-webpki: transitive, patched version not yet available in our dep tree.
+    "RUSTSEC-2026-0049",
+
+    # time: localtime_r issue only affects Unix with setenv() from multiple threads.
+    # Our server does not call setenv() after startup.
+    "RUSTSEC-2026-0009",
+
+    # fxhash: unmaintained crate, transitive dependency. Not security-critical
+    # in our usage (no adversarial hash input).
+    "RUSTSEC-2025-0057",
+
+    # kuchiki: unmaintained HTML parser, transitive via scraper.
+    # Only used for server-side HTML processing of trusted content (web sources).
+    "RUSTSEC-2023-0019",
+
+    # proc-macro-error: unmaintained proc-macro helper, compile-time only.
+    # No runtime impact.
+    "RUSTSEC-2024-0370",
+]

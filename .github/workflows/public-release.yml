@@ -1,0 +1,341 @@
+# Public release (US-015, EP-004).
+#
+# Tag-driven and fail-closed. Every gate runs *before* anything is published, so
+# contract drift, a migration failure, a high or critical advisory, or a
+# boundary violation stops the release with no tag artifact and no package.
+#
+# What a release publishes:
+#   - an immutable source archive
+#   - a versioned container image (ghcr.io)
+#   - the TypeScript SDK at the same version as the core
+#   - an SBOM and a GitHub artifact attestation for each of the above
+#
+# An attestation proves what built an artifact. It is provenance, not a
+# security audit, and the release notes say so.
+
+name: public-release
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+", "v[0-9]+.[0-9]+.[0-9]+-*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        # Only a collaborator with write access can dispatch a workflow, and the
+        # `verify` job refuses any tag whose version does not match both the
+        # crate and the SDK manifest. Nothing is published before that passes.
+        description: "Existing tag to release (vX.Y.Z)"
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  REGISTRY: ghcr.io
+
+jobs:
+  # ==========================================================================
+  # Gate. Nothing is published unless this passes.
+  # ==========================================================================
+  verify:
+    name: Release gate
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: openbooklm
+          POSTGRES_PASSWORD: openbooklm
+          POSTGRES_DB: openbooklm
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U openbooklm -d openbooklm"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: backend
+
+      # The tag is the version. A manifest that disagrees with it produces
+      # artifacts nobody can correlate afterwards.
+      - name: Tag, crate and SDK versions agree
+        id: version
+        env:
+          REF_NAME: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${REF_NAME#v}"
+          crate="$(grep -m1 '^version = ' backend/Cargo.public.toml | cut -d'"' -f2)"
+          sdk="$(jq -r .version packages/sdk-ts/package.json)"
+          if [[ "$version" != "$crate" || "$version" != "$sdk" ]]; then
+            echo "tag $version, crate $crate, sdk $sdk — all three must match" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Quality gates
+        working-directory: backend
+        run: |
+          set -euo pipefail
+          # See the note in public-ci.yml: rustfmt does not evaluate `cfg`, so
+          # it cannot start from a crate root that declares hosted modules this
+          # repository does not ship.
+          git ls-files '*.rs' | grep -v '^src/lib\.rs$' \
+            | xargs rustfmt --check --edition 2024
+          cargo clippy --no-default-features --all-targets -- -D warnings
+          cargo test --no-default-features
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      - name: Advisories, licenses and bans
+        working-directory: backend
+        run: cargo deny check licenses bans advisories
+
+      - name: Boundary, manifest and contracts
+        run: |
+          ./scripts/check-open-core-boundary.sh
+          python3 scripts/check-public-manifest.py
+          ./scripts/check-contracts.sh
+
+      - name: Core migrations apply to a fresh pgvector database
+        working-directory: backend
+        env:
+          DATABASE_URL: postgres://openbooklm:openbooklm@localhost:5432/openbooklm
+        run: |
+          cargo run -p openbooklm-migration-core --bin openbooklm-migrate -- validate
+          cargo run -p openbooklm-migration-core --bin openbooklm-migrate -- up
+          cargo run -p openbooklm-migration-core --bin openbooklm-migrate -- up   # idempotent
+
+  # ==========================================================================
+  # Container image + SBOM + provenance
+  # ==========================================================================
+  container:
+    name: Container image
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}},value=v${{ needs.verify.outputs.version }}
+            type=semver,pattern={{major}}.{{minor}},value=v${{ needs.verify.outputs.version }}
+
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Immutable by digest. The tags are conveniences; the digest is the
+          # identity the attestation binds to.
+          provenance: true
+          sbom: true
+
+      - name: Attest the image
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ github.repository }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+  # ==========================================================================
+  # Source archive + SBOM + provenance
+  # ==========================================================================
+  source:
+    name: Source archive
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-cyclonedx
+
+      - name: Archive
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          git archive --format=tar.gz --prefix="openbooklm-$VERSION/" \
+            -o "dist/openbooklm-$VERSION.tar.gz" HEAD
+          ( cd dist && sha256sum "openbooklm-$VERSION.tar.gz" > "openbooklm-$VERSION.tar.gz.sha256" )
+
+      - name: SBOM
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          set -euo pipefail
+          ( cd backend && cargo cyclonedx --format json --all )
+          # `--all` writes one SBOM per workspace member, so the tree contains
+          # both `openbooklm.cdx.json` and `openbooklm-migration-core.cdx.json`.
+          # Naming the root crate explicitly matters: picking whichever one a
+          # directory walk returned first could publish the migration crate's
+          # handful of components as the release SBOM. The root crate depends on
+          # migration-core, so its graph is the superset.
+          test -f backend/openbooklm.cdx.json \
+            || { echo "root SBOM missing; did the crate name change?" >&2; exit 1; }
+          cp backend/openbooklm.cdx.json "dist/openbooklm-$VERSION.cdx.json"
+
+      - name: Attest the archive
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/*.tar.gz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: source-artifacts
+          path: dist/
+
+  # ==========================================================================
+  # TypeScript SDK
+  # ==========================================================================
+  sdk:
+    name: TypeScript SDK
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    defaults:
+      run:
+        working-directory: packages/sdk-ts
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - uses: oven-sh/setup-bun@v2
+
+      - run: bun install --frozen-lockfile
+      - run: bun run typecheck
+      - run: bun test
+
+      # No build step: the package ships its TypeScript sources (`main` and
+      # `types` both point into `src/`, and `files` is `src` plus the README),
+      # so consumers compile it with their own toolchain. There is no `build`
+      # script to run, and calling one failed the job before it could pack.
+      - name: Pack
+        run: npm pack --pack-destination ../../dist
+
+      - name: Attest the package
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/*.tgz
+
+      - name: Publish
+        # npm provenance requires id-token: write, which is granted above.
+        run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  # ==========================================================================
+  # Release page, last: every artifact already exists and is attested.
+  # ==========================================================================
+  publish:
+    name: Release notes
+    needs: [verify, container, source, sdk]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: source-artifacts
+          path: dist
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.verify.outputs.version }}
+          DIGEST: ${{ needs.container.outputs.digest }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          notes="$(mktemp)"
+          {
+            if [[ -f "docs/public/RELEASE-NOTES-$VERSION.md" ]]; then
+              cat "docs/public/RELEASE-NOTES-$VERSION.md"
+              echo
+            fi
+            echo "## Artifacts"
+            echo
+            echo "| Artifact | Identity |"
+            echo "|---|---|"
+            echo "| Container | \`${REGISTRY}/${GITHUB_REPOSITORY}@${DIGEST}\` |"
+            echo "| Source | \`openbooklm-${VERSION}.tar.gz\` (SHA-256 alongside) |"
+            echo "| SDK | \`@openbooklm/sdk@${VERSION}\` |"
+            echo
+            echo "Every artifact has an SBOM and a GitHub artifact attestation:"
+            echo
+            echo '```bash'
+            echo "gh attestation verify oci://${REGISTRY}/${GITHUB_REPOSITORY}@${DIGEST} \\"
+            echo "  --repo ${GITHUB_REPOSITORY}"
+            echo '```'
+            echo
+            echo "An attestation proves what built the artifact. It is provenance,"
+            echo "not a security certification."
+            echo
+            echo "Upgrade instructions: [docs/upgrading.md](docs/upgrading.md)."
+          } > "$notes"
+
+          gh release create "$TAG" \
+            --title "OpenbookLM $VERSION" \
+            --notes-file "$notes" \
+            dist/*

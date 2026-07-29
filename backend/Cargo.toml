@@ -1,0 +1,130 @@
+# Public manifest for the OpenbookLM core.
+#
+# Published as `backend/Cargo.toml` in the public repository. It is the private
+# manifest minus the `saas` feature, its optional Clerk and Stripe
+# dependencies, the hosted binary and the hosted test suites (US-013/US-014).
+#
+# `scripts/check-public-manifest.py` fails when the two drift: every dependency
+# here must exist in the private manifest at the same version, and no forbidden
+# crate may appear.
+
+[package]
+name = "openbooklm"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "Apache-2.0"
+publish = false
+description = "OpenbookLM core — RAG-powered document chat: ingestion, retrieval, citations and multi-LLM chat"
+
+[workspace]
+members = [".", "migration-core"]
+
+[workspace.dependencies]
+sea-orm = { version = "1", features = ["sqlx-postgres", "runtime-tokio-rustls"] }
+sea-orm-migration = { version = "1", features = ["sqlx-postgres", "runtime-tokio-rustls"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "macros", "signal"] }
+
+# Declared and empty on purpose. The source tree is shared with the hosted
+# composition, which gates its modules behind `#[cfg(feature = "saas")]`.
+# Without the feature named here every one of those attributes would warn as an
+# unexpected cfg. Enabling it does not build: the modules it gates are not part
+# of this repository.
+[features]
+saas = []
+
+[lib]
+name = "openbooklm"
+path = "src/lib.rs"
+
+[[bin]]
+name = "openbooklm-server"
+path = "src/bin/openbooklm-server.rs"
+
+[[bin]]
+name = "contracts"
+path = "src/bin/contracts.rs"
+
+
+[dependencies]
+# The public core schema. The private SaaS migration track is a separate
+# workspace member built as its own binary; the server never links it.
+openbooklm-migration-core = { path = "migration-core" }
+# Web framework
+axum = { version = "0.8", features = ["macros", "multipart"] }
+tokio = { workspace = true }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tower = { version = "0.5", features = ["limit", "timeout", "util"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+
+# Async utilities
+futures = "0.3"
+bytes = "1"
+tokio-util = { version = "0.7", features = ["rt"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Database
+sea-orm = { workspace = true, features = ["macros", "with-uuid", "with-chrono", "with-json"] }
+
+# UUID and time
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+reqwest = { version = "0.12", features = ["json", "multipart", "stream"] }
+
+# Document processing
+pdf-extract = "0.12"
+# Pinned to the same 0.42 line pdf-extract requires: for a 0.x crate `^0.42`
+# and `^0.44` are incompatible ranges, so asking for 0.44 here would build two
+# copies of lopdf. `time` is a default feature whose datetime module does not
+# compile against the current `time` release, and nothing here reads PDF dates.
+lopdf = { version = "0.42", default-features = false, features = ["chrono", "rayon"] }
+zip = "2"
+quick-xml = "0.41"
+scraper = "0.22"
+ego-tree = "0.10"
+
+# Text processing
+text-splitter = { version = "0.18", features = ["tiktoken-rs", "markdown"] }
+regex = "1"
+
+# Encoding
+base64 = "0.22"
+
+# URL parsing
+url = "2"
+
+# Cryptography (for webhook signature verification)
+hmac = "0.12"
+sha2 = "0.10"
+subtle = "2"
+
+# Environment
+dotenvy = "0.15"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Async traits for repository pattern
+async-trait = "0.1"
+
+# Synchronization primitives for clients
+parking_lot = "0.12"
+rand = "0.8"
+dashmap = "6"
+
+# In-memory caching
+moka = { version = "0.12", features = ["future"] }
+utoipa = { version = "5.5.0", features = ["axum_extras", "uuid", "chrono"] }
+
+[dev-dependencies]
+wiremock = "0.6"
+

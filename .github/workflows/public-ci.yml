@@ -1,0 +1,219 @@
+# Public core CI (US-015, EP-004).
+#
+# This workflow is exported to the public repository. It must pass with **no
+# commercial secret**: no Clerk, Stripe, PostHog or Resend value is read, and
+# the only credentials it uses are the ones GitHub provides.
+#
+# In this repository it also guards the boundary: the core edition is built
+# with `--no-default-features`, which is what proves the public export will
+# compile before anyone runs the export.
+
+name: public-ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: public-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  quality:
+    name: Rust quality gates
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: backend
+
+      # Not `cargo fmt --check`: rustfmt walks `mod` declarations without
+      # evaluating `cfg`, so starting from the crate root makes it look for the
+      # hosted modules (`app_state`, `auth`, `config`, `saas`) that this
+      # repository deliberately does not contain, and it fails before checking
+      # anything. Every other file is checked directly; `src/lib.rs` holds only
+      # module declarations and is formatted upstream, where those files exist.
+      - name: Format
+        run: |
+          set -euo pipefail
+          git ls-files '*.rs' | grep -v '^src/lib\.rs$' \
+            | xargs rustfmt --check --edition 2024
+
+      # The core edition, on its own. A core file that only compiles with the
+      # hosted feature has acquired a private dependency, and this is where
+      # that fails — not in the public repository's first CI run.
+      - name: Check (core only)
+        run: cargo check --no-default-features --all-targets
+
+      - name: Clippy (core only)
+        run: cargo clippy --no-default-features --all-targets -- -D warnings
+
+      - name: Test (core only)
+        run: cargo test --no-default-features
+
+  dependencies:
+    name: Licenses and advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - run: cargo deny check licenses bans advisories
+        working-directory: backend
+
+  boundary:
+    name: Boundary and contracts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The boundary check classifies tracked files, so it needs the tree,
+          # not a shallow clone of one commit's changes.
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: backend
+
+      - name: Open-core boundary
+        run: ./scripts/check-open-core-boundary.sh
+
+      - name: Public manifest
+        run: python3 scripts/check-public-manifest.py
+
+      - name: Generated contracts match their Rust sources
+        run: ./scripts/check-contracts.sh
+
+  migrations:
+    name: Core migrations against pgvector
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: openbooklm
+          POSTGRES_PASSWORD: openbooklm
+          POSTGRES_DB: openbooklm
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U openbooklm -d openbooklm"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+    env:
+      DATABASE_URL: postgres://openbooklm:openbooklm@localhost:5432/openbooklm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: backend
+
+      - name: Fresh database reaches the core schema
+        working-directory: backend
+        run: |
+          cargo run -p openbooklm-migration-core --bin openbooklm-migrate -- validate
+          cargo run -p openbooklm-migration-core --bin openbooklm-migrate -- up
+
+      # Applying twice must be a no-op. A migration that is not idempotent
+      # fails a restart, a rolling deploy, or a retried job.
+      - name: Applying again changes nothing
+        working-directory: backend
+        run: |
+          cargo run -p openbooklm-migration-core --bin openbooklm-migrate -- up
+          cargo run -p openbooklm-migration-core --bin openbooklm-migrate -- status
+
+      - name: The schema is what the core expects
+        env:
+          PGPASSWORD: openbooklm
+        run: |
+          set -euo pipefail
+          missing=0
+          for table in accounts account_settings notebooks sources chunks notes \
+                       chat_messages notebook_memories rag_logs ocr_cache; do
+            if ! psql -h localhost -U openbooklm -d openbooklm -tAc \
+                 "SELECT to_regclass('public.$table') IS NOT NULL" | grep -q '^t$'; then
+              echo "missing table: $table"
+              missing=$((missing + 1))
+            fi
+          done
+          # pgvector is a hard prerequisite, so assert the extension too.
+          psql -h localhost -U openbooklm -d openbooklm -tAc \
+            "SELECT 1 FROM pg_extension WHERE extname = 'vector'" | grep -q '^1$' \
+            || { echo "pgvector extension not installed"; missing=$((missing + 1)); }
+          # No hosted table may exist in a public database.
+          for table in users identities subscriptions usage processed_events; do
+            if psql -h localhost -U openbooklm -d openbooklm -tAc \
+                 "SELECT to_regclass('public.$table') IS NOT NULL" | grep -q '^t$'; then
+              echo "hosted table present in a core-only database: $table"
+              missing=$((missing + 1))
+            fi
+          done
+          exit $missing
+
+  sdk:
+    name: TypeScript SDK
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: packages/sdk-ts
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - run: bun run typecheck
+      - run: bun test
+
+  smoke:
+    name: Compose stack smoke path
+    runs-on: ubuntu-latest
+    needs: [quality, migrations]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure the stack
+        run: |
+          set -euo pipefail
+          cp .env.example .env
+          {
+            echo "OPENBOOKLM_AUTH_TOKEN=$(openssl rand -hex 32)"
+            # Deterministic providers (US-020): embeddings, reranking and
+            # generation are in-process fixtures, so this job holds no
+            # commercial credential of any kind.
+            echo "OPENBOOKLM_DETERMINISTIC_PROVIDERS=true"
+          } >> .env
+
+      - name: Start
+        env:
+          OPENBOOKLM_DETERMINISTIC_PROVIDERS: "true"
+        run: docker compose -f docker/docker-compose.yml up --build --detach --wait
+
+      - name: Clean start, ingest, cited answer
+        run: |
+          set -euo pipefail
+          OPENBOOKLM_AUTH_TOKEN="$(grep '^OPENBOOKLM_AUTH_TOKEN=' .env | cut -d= -f2)" \
+            ./scripts/smoke-public-stack.sh http://localhost:3001
+
+      - name: Logs on failure
+        if: failure()
+        run: docker compose -f docker/docker-compose.yml logs --no-color --tail 300
+
+      - name: Stop
+        if: always()
+        run: docker compose -f docker/docker-compose.yml down --volumes

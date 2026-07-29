@@ -1,0 +1,37 @@
+{
+  "memory": {
+    "content": "The reader prefers concise answers.",
+    "created_at": "2026-01-01T00:00:00+00:00",
+    "id": "55555555-5555-4555-8555-555555555555",
+    "memory_type": "preference",
+    "metadata": {
+      "source": "chat"
+    },
+    "notebook_id": "11111111-1111-4111-8111-111111111111",
+    "salience": 0.75,
+    "updated_at": "2026-01-02T00:00:00+00:00"
+  },
+  "memory_list": {
+    "count": 1,
+    "limit": 50,
+    "memories": [
+      {
+        "content": "The reader prefers concise answers.",
+        "created_at": "2026-01-01T00:00:00+00:00",
+        "id": "55555555-5555-4555-8555-555555555555",
+        "memory_type": "preference",
+        "metadata": {
+          "source": "chat"
+        },
+        "notebook_id": "11111111-1111-4111-8111-111111111111",
+        "salience": 0.75,
+        "updated_at": "2026-01-02T00:00:00+00:00"
+      }
+    ]
+  },
+  "memory_list_empty": {
+    "count": 0,
+    "limit": 0,
+    "memories": []
+  }
+}

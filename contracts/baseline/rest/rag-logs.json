@@ -1,0 +1,22 @@
+{
+  "metrics_empty": {
+    "avg_answer_faithfulness": null,
+    "avg_context_relevance": null,
+    "negative_feedback": 0,
+    "positive_feedback": 0,
+    "positive_feedback_rate": 0.0,
+    "success_rate": 0.0,
+    "successful_retrievals": 0,
+    "total_interactions": 0
+  },
+  "metrics_populated": {
+    "avg_answer_faithfulness": 0.88,
+    "avg_context_relevance": 0.72,
+    "negative_feedback": 1,
+    "positive_feedback": 9,
+    "positive_feedback_rate": 90.0,
+    "success_rate": 90.0,
+    "successful_retrievals": 36,
+    "total_interactions": 40
+  }
+}

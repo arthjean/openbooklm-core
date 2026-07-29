@@ -1,0 +1,21 @@
+[package]
+name = "openbooklm-migration-core"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "Apache-2.0"
+publish = false
+description = "OpenbookLM public core schema: baseline, migration track and startup validation"
+
+[lib]
+name = "openbooklm_migration_core"
+path = "src/lib.rs"
+
+[[bin]]
+name = "openbooklm-migrate"
+path = "src/main.rs"
+
+[dependencies]
+sea-orm-migration = { workspace = true }
+tokio = { workspace = true }
+async-trait = "0.1"

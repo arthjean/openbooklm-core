@@ -1,0 +1,131 @@
+{
+  "history": {
+    "has_more": false,
+    "limit": 50,
+    "messages": [
+      {
+        "citations": [],
+        "content": "What does the source say?",
+        "created_at": "2026-01-01T00:00:00+00:00",
+        "id": "44444444-4444-4444-8444-444444444444",
+        "model": null,
+        "notebook_id": "11111111-1111-4111-8111-111111111111",
+        "role": "user"
+      },
+      {
+        "citations": [
+          {
+            "chunk_index": 0,
+            "page_number": 2,
+            "relevance_score": 0.91,
+            "section_header": "Introduction",
+            "source_id": "22222222-2222-4222-8222-222222222222",
+            "text": "Cited passage."
+          },
+          {
+            "chunk_index": 4,
+            "citation_url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=12s",
+            "relevance_score": 0.66,
+            "source_id": "22222222-2222-4222-8222-222222222222",
+            "text": "Spoken passage.",
+            "timestamp_end": 31.0,
+            "timestamp_start": 12.5,
+            "video_id": "dQw4w9WgXcQ"
+          }
+        ],
+        "content": "It says this [1].",
+        "created_at": "2026-01-02T00:00:00+00:00",
+        "feedback": "positive",
+        "id": "44444444-4444-4444-8444-444444444444",
+        "model": "claude-sonnet-4-6-20260220",
+        "notebook_id": "11111111-1111-4111-8111-111111111111",
+        "rag_log_id": "66666666-6666-4666-8666-666666666666",
+        "role": "assistant",
+        "session_id": "77777777-7777-4777-8777-777777777777"
+      }
+    ],
+    "offset": 0,
+    "total": 2
+  },
+  "message_assistant": {
+    "citations": [
+      {
+        "chunk_index": 0,
+        "page_number": 2,
+        "relevance_score": 0.91,
+        "section_header": "Introduction",
+        "source_id": "22222222-2222-4222-8222-222222222222",
+        "text": "Cited passage."
+      },
+      {
+        "chunk_index": 4,
+        "citation_url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=12s",
+        "relevance_score": 0.66,
+        "source_id": "22222222-2222-4222-8222-222222222222",
+        "text": "Spoken passage.",
+        "timestamp_end": 31.0,
+        "timestamp_start": 12.5,
+        "video_id": "dQw4w9WgXcQ"
+      }
+    ],
+    "content": "It says this [1].",
+    "created_at": "2026-01-02T00:00:00+00:00",
+    "feedback": "positive",
+    "id": "44444444-4444-4444-8444-444444444444",
+    "model": "claude-sonnet-4-6-20260220",
+    "notebook_id": "11111111-1111-4111-8111-111111111111",
+    "rag_log_id": "66666666-6666-4666-8666-666666666666",
+    "role": "assistant",
+    "session_id": "77777777-7777-4777-8777-777777777777"
+  },
+  "message_user": {
+    "citations": [],
+    "content": "What does the source say?",
+    "created_at": "2026-01-01T00:00:00+00:00",
+    "id": "44444444-4444-4444-8444-444444444444",
+    "model": null,
+    "notebook_id": "11111111-1111-4111-8111-111111111111",
+    "role": "user"
+  },
+  "teaching_modes": {
+    "default": "deep",
+    "modes": [
+      {
+        "description": "Quick essential summary",
+        "icon": "⚡",
+        "id": "flash",
+        "name": "Flash"
+      },
+      {
+        "description": "Complete detailed exploration",
+        "icon": "🧠",
+        "id": "deep",
+        "name": "Deep"
+      },
+      {
+        "description": "Interactive multiple-choice quiz",
+        "icon": "❓",
+        "id": "quiz",
+        "name": "Quiz"
+      },
+      {
+        "description": "Key terms extraction",
+        "icon": "📖",
+        "id": "glossary",
+        "name": "Glossary"
+      },
+      {
+        "description": "Structured summary with sections",
+        "icon": "📄",
+        "id": "summary",
+        "name": "Summary"
+      },
+      {
+        "description": "Chronological events",
+        "icon": "🕐",
+        "id": "timeline",
+        "name": "Timeline"
+      }
+    ]
+  }
+}

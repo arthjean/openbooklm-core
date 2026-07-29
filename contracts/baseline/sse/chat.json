@@ -1,0 +1,68 @@
+{
+  "chunk": {
+    "text": "It says this "
+  },
+  "citation": {
+    "index": 1,
+    "source_id": "22222222-2222-4222-8222-222222222222"
+  },
+  "citations": {
+    "citations": [
+      {
+        "chunk_index": 0,
+        "page_number": 2,
+        "relevance_score": 0.91,
+        "section_header": "Introduction",
+        "source_id": "22222222-2222-4222-8222-222222222222",
+        "text": "Cited passage."
+      }
+    ]
+  },
+  "done": {
+    "model": "claude-sonnet-4-6-20260220",
+    "provider": "anthropic",
+    "rag_log_id": "66666666-6666-4666-8666-666666666666"
+  },
+  "done_without_rag_log": {
+    "model": "mistral-small-latest",
+    "provider": "mistral",
+    "rag_log_id": null
+  },
+  "error": {
+    "message": "Provider unavailable"
+  },
+  "follow_up_suggestions": {
+    "suggestions": [
+      "What about the second chapter?"
+    ]
+  },
+  "metrics": {
+    "context_relevance": 0.72
+  },
+  "metrics_no_context": {
+    "context_relevance": null
+  },
+  "shutdown": {
+    "message": "Server shutting down"
+  },
+  "system_history_summarized": {
+    "dropped_count": 8,
+    "type": "history_summarized"
+  },
+  "system_history_truncated": {
+    "kept": 12,
+    "type": "history_truncated"
+  },
+  "thinking_generating": {
+    "stage": "generating"
+  },
+  "thinking_reformulating_query": {
+    "stage": "reformulating_query"
+  },
+  "thinking_retrieving_context": {
+    "stage": "retrieving_context"
+  },
+  "warning": {
+    "type": "low_retrieval_quality"
+  }
+}

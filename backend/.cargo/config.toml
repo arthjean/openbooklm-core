@@ -1,0 +1,12 @@
+[alias]
+# Quick aliases
+ca = ["clippy", "--", "-D", "warnings"]
+ta = ["test"]
+fa = ["fmt", "--check"]
+
+# PRD-specified aliases (US-016)
+# Note: cargo aliases cannot chain commands, so check-all runs clippy only.
+# For the full suite (fmt + clippy + test), use: cargo fa && cargo ca && cargo ta
+check-all = ["clippy", "--all-targets", "--", "-D", "warnings"]
+migrate-up = ["run", "-p", "migration", "--bin", "migration", "--", "up", "-u"]
+migrate-down = ["run", "-p", "migration", "--bin", "migration", "--", "down", "-u"]

@@ -1,0 +1,26 @@
+# Frontend (not needed for backend build)
+frontend/
+
+# Backend build artifacts
+backend/target/
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Documentation
+*.md
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Claude
+.claude/

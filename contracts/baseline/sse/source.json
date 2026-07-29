@@ -1,0 +1,82 @@
+{
+  "error": {
+    "data": {
+      "message": "Unsupported source type",
+      "source_id": "22222222-2222-4222-8222-222222222222"
+    },
+    "event": "source:error"
+  },
+  "ocr_cache_hit": {
+    "data": {
+      "source_id": "22222222-2222-4222-8222-222222222222"
+    },
+    "event": "source:ocr_cache_hit"
+  },
+  "ocr_completed": {
+    "data": {
+      "pages_processed": 8,
+      "source_id": "22222222-2222-4222-8222-222222222222"
+    },
+    "event": "source:ocr_completed"
+  },
+  "ocr_progress": {
+    "data": {
+      "current_page": 3,
+      "source_id": "22222222-2222-4222-8222-222222222222",
+      "total_pages": 8
+    },
+    "event": "source:ocr_progress"
+  },
+  "ocr_started": {
+    "data": {
+      "source_id": "22222222-2222-4222-8222-222222222222",
+      "total_pages": 8
+    },
+    "event": "source:ocr_started"
+  },
+  "ready": {
+    "data": {
+      "chunk_count": 12,
+      "degraded_services": [],
+      "source_id": "22222222-2222-4222-8222-222222222222"
+    },
+    "event": "source:ready"
+  },
+  "ready_degraded": {
+    "data": {
+      "chunk_count": 12,
+      "degraded_services": [
+        "contextualization"
+      ],
+      "source_id": "22222222-2222-4222-8222-222222222222"
+    },
+    "event": "source:ready"
+  },
+  "resync": {
+    "data": {
+      "missed": 7
+    },
+    "event": "source:resync"
+  },
+  "status_error": {
+    "data": {
+      "error_message": "Extraction failed",
+      "progress": null,
+      "source_id": "22222222-2222-4222-8222-222222222222",
+      "status": "error"
+    },
+    "event": "source:status"
+  },
+  "status_processing": {
+    "data": {
+      "error_message": null,
+      "progress": {
+        "chunks_done": 4,
+        "chunks_total": 12
+      },
+      "source_id": "22222222-2222-4222-8222-222222222222",
+      "status": "processing"
+    },
+    "event": "source:status"
+  }
+}

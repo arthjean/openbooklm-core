@@ -1,0 +1,44 @@
+{
+  "notebook_full": {
+    "created_at": "2026-01-01T00:00:00+00:00",
+    "description": "A synthetic notebook used by the contract baseline.",
+    "id": "11111111-1111-4111-8111-111111111111",
+    "is_demo": false,
+    "memory_enabled": true,
+    "source_count": 3,
+    "suggested_questions": [
+      "What is in this notebook?"
+    ],
+    "title": "Baseline notebook",
+    "updated_at": "2026-01-02T00:00:00+00:00"
+  },
+  "notebook_list": {
+    "notebooks": [
+      {
+        "created_at": "2026-01-01T00:00:00+00:00",
+        "description": null,
+        "id": "11111111-1111-4111-8111-111111111111",
+        "is_demo": true,
+        "memory_enabled": false,
+        "source_count": 0,
+        "suggested_questions": [],
+        "title": "Minimal notebook",
+        "updated_at": "2026-01-01T00:00:00+00:00"
+      }
+    ]
+  },
+  "notebook_list_empty": {
+    "notebooks": []
+  },
+  "notebook_minimal": {
+    "created_at": "2026-01-01T00:00:00+00:00",
+    "description": null,
+    "id": "11111111-1111-4111-8111-111111111111",
+    "is_demo": true,
+    "memory_enabled": false,
+    "source_count": 0,
+    "suggested_questions": [],
+    "title": "Minimal notebook",
+    "updated_at": "2026-01-01T00:00:00+00:00"
+  }
+}

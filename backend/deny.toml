@@ -1,0 +1,58 @@
+# cargo-deny configuration — license compliance and dependency auditing.
+# Run: cargo deny check licenses bans advisories
+
+[advisories]
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+# Every entry here is an advisory with **no** upgrade path, and every one is an
+# `unmaintained` notice rather than a known vulnerability. Anything with a fix
+# available is fixed, not ignored: this list must not become the place where a
+# real vulnerability goes quiet.
+#
+# Re-check on each release. An entry that stops matching is reported by
+# cargo-deny as `advisory-not-detected` and must be deleted, not left behind.
+ignore = [
+    # fxhash <- selectors <- scraper. Non-cryptographic hasher used for CSS
+    # selector matching on HTML we already treat as untrusted input. No fixed
+    # version exists; the fix is scraper moving off `selectors` 0.26.
+    "RUSTSEC-2025-0057",
+    # ttf-parser <- lopdf 0.42 <- pdf-extract 0.12. Reached only when parsing an
+    # uploaded PDF's embedded fonts, so the input is untrusted, which is why
+    # this is the entry to revisit first. `cargo deny` reports no safe upgrade:
+    # lopdf made ttf-parser optional in 0.44, but pdf-extract pins `^0.42` and
+    # for a 0.x crate that range cannot reach 0.44. It clears itself when
+    # pdf-extract moves to lopdf 0.44.
+    "RUSTSEC-2026-0192",
+    # proc-macro-error2 <- sea-bae <- sea-orm-macros. A proc-macro crate: it
+    # runs at compile time and ships no code into the binary, so the runtime
+    # attack surface is nil. Clears when sea-orm updates sea-bae.
+    "RUSTSEC-2026-0173",
+]
+
+[licenses]
+confidence-threshold = 0.8
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "CC0-1.0",
+    "BSL-1.0",
+    "MPL-2.0",
+]
+
+# Our own workspace crates are private (no published license).
+[licenses.private]
+ignore = true
+
+[[licenses.exceptions]]
+crate = "webpki-roots"
+allow = ["CDLA-Permissive-2.0"]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"

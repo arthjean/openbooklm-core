@@ -1,0 +1,10 @@
+{
+  "settings_default": {
+    "default_model": "mistral-small-latest",
+    "default_provider": "mistral"
+  },
+  "settings_non_default_provider": {
+    "default_model": "claude-sonnet-4-6-20260220",
+    "default_provider": "anthropic"
+  }
+}

@@ -1,0 +1,45 @@
+{
+  "forbidden": {
+    "detail": "Model not available on your plan",
+    "status": 403,
+    "title": "Forbidden",
+    "type": "https://openbooklm.dev/errors/forbidden"
+  },
+  "internal": {
+    "detail": "Internal server error",
+    "status": 500,
+    "title": "Internal Server Error",
+    "type": "https://openbooklm.dev/errors/internal-error"
+  },
+  "limit_reached": {
+    "detail": "Daily message limit reached",
+    "status": 403,
+    "title": "Limit Reached",
+    "type": "https://openbooklm.dev/errors/limit-reached"
+  },
+  "not_found": {
+    "detail": "Notebook not found",
+    "status": 404,
+    "title": "Not Found",
+    "type": "https://openbooklm.dev/errors/not-found"
+  },
+  "rate_limited": {
+    "detail": "Too many requests",
+    "retry_after": 30,
+    "status": 429,
+    "title": "Rate Limit Exceeded",
+    "type": "https://openbooklm.dev/errors/rate-limited"
+  },
+  "unauthorized": {
+    "detail": "Missing or invalid token",
+    "status": 401,
+    "title": "Unauthorized",
+    "type": "https://openbooklm.dev/errors/unauthorized"
+  },
+  "validation": {
+    "detail": "title is required",
+    "status": 400,
+    "title": "Validation Error",
+    "type": "https://openbooklm.dev/errors/validation-error"
+  }
+}

@@ -1,0 +1,124 @@
+{
+  "event_protocol_version": "v1",
+  "validation": {
+    "max_title_length": 255,
+    "max_description_length": 1000,
+    "max_system_prompt_length": 10000,
+    "max_message_length": 10000,
+    "default_max_context_chunks": 15,
+    "max_context_chunks": 20,
+    "default_chat_history_limit": 50,
+    "max_chat_history_limit": 200
+  },
+  "source_types": [
+    "pdf",
+    "text",
+    "markdown",
+    "web",
+    "docx",
+    "epub",
+    "youtube"
+  ],
+  "source_statuses": [
+    "pending",
+    "processing",
+    "contextualizing",
+    "embedding",
+    "ready",
+    "error"
+  ],
+  "teaching_modes": [
+    {
+      "id": "flash",
+      "name": "Flash",
+      "icon": "⚡",
+      "description": "Quick essential summary",
+      "is_default": false
+    },
+    {
+      "id": "deep",
+      "name": "Deep",
+      "icon": "🧠",
+      "description": "Complete detailed exploration",
+      "is_default": true
+    },
+    {
+      "id": "quiz",
+      "name": "Quiz",
+      "icon": "❓",
+      "description": "Interactive multiple-choice quiz",
+      "is_default": false
+    },
+    {
+      "id": "glossary",
+      "name": "Glossary",
+      "icon": "📖",
+      "description": "Key terms extraction",
+      "is_default": false
+    },
+    {
+      "id": "summary",
+      "name": "Summary",
+      "icon": "📄",
+      "description": "Structured summary with sections",
+      "is_default": false
+    },
+    {
+      "id": "timeline",
+      "name": "Timeline",
+      "icon": "🕐",
+      "description": "Chronological events",
+      "is_default": false
+    }
+  ],
+  "default_teaching_mode": "deep",
+  "providers": [
+    {
+      "provider": "mistral",
+      "native_citations": false,
+      "models": []
+    },
+    {
+      "provider": "anthropic",
+      "native_citations": true,
+      "models": [
+        {
+          "id": "claude-opus-4-6-20260220",
+          "name": "Claude Opus 4.6",
+          "description": "Most capable model for complex tasks",
+          "context_window": 200000
+        },
+        {
+          "id": "claude-sonnet-4-6-20260220",
+          "name": "Claude Sonnet 4.6",
+          "description": "Best for complex agents and coding",
+          "context_window": 200000
+        },
+        {
+          "id": "claude-haiku-4-5-20251001",
+          "name": "Claude Haiku 4.5",
+          "description": "Fastest model with near-frontier intelligence",
+          "context_window": 200000
+        }
+      ]
+    },
+    {
+      "provider": "openai",
+      "native_citations": false,
+      "models": [
+        {
+          "id": "gpt-5.2",
+          "name": "GPT-5.2",
+          "description": "Advanced reasoning",
+          "context_window": 400000
+        },
+        {
+          "id": "gpt-5-mini",
+          "name": "GPT-5 mini",
+          "description": "Fast and affordable",
+          "context_window": 400000
+        }
+      ]
+    }
+  ]
+}

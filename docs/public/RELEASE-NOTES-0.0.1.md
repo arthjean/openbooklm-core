@@ -1,4 +1,4 @@
-# OpenbookLM 0.1.0
+# OpenbookLM 0.0.1
 
 The first public release of the OpenbookLM core: the RAG, ingestion, retrieval,
 citation and multi-LLM chat implementation that runs the hosted product, with a

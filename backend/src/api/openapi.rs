@@ -55,7 +55,11 @@ impl Modify for BearerAuth {
                        memories, chat and retrieval metrics. Event-stream semantics are \
                        specified separately in docs/contracts/sse-protocol-v1.md.",
         license(name = "Apache-2.0", url = "https://www.apache.org/licenses/LICENSE-2.0"),
-        version = "0.1.0"
+        // Taken from the crate rather than written here: a hardcoded version
+        // drifts the moment the crate is bumped, and the release gate only
+        // checks the tag against the manifest and the SDK, so a contract
+        // claiming a version nobody published would pass unnoticed.
+        version = env!("CARGO_PKG_VERSION")
     ),
     modifiers(&BearerAuth),
     tags(

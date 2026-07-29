@@ -93,11 +93,17 @@ jobs:
         with:
           workspaces: backend
 
-      - name: Open-core boundary
-        run: ./scripts/check-open-core-boundary.sh
-
-      - name: Public manifest
-        run: python3 scripts/check-public-manifest.py
+      # These two guard the split between this source tree and the private
+      # repository it is exported from. They only mean something where both
+      # halves exist: in the public repository there is no private half to
+      # separate from, and `Cargo.public.toml` has already become `Cargo.toml`.
+      # Gated on that file's presence rather than on a repository name, so a
+      # fork behaves like the public repository rather than failing.
+      - name: Open-core boundary and public manifest
+        if: hashFiles('backend/Cargo.public.toml') != ''
+        run: |
+          ./scripts/check-open-core-boundary.sh
+          python3 scripts/check-public-manifest.py
 
       - name: Generated contracts match their Rust sources
         run: ./scripts/check-contracts.sh

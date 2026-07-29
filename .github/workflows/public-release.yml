@@ -105,11 +105,16 @@ jobs:
         working-directory: backend
         run: cargo deny check licenses bans advisories
 
-      - name: Boundary, manifest and contracts
+      # See the note in public-ci.yml: the boundary and manifest checks need the
+      # private half of the split to exist, which it does not here.
+      - name: Boundary and manifest (private origin only)
+        if: hashFiles('backend/Cargo.public.toml') != ''
         run: |
           ./scripts/check-open-core-boundary.sh
           python3 scripts/check-public-manifest.py
-          ./scripts/check-contracts.sh
+
+      - name: Generated contracts match their Rust sources
+        run: ./scripts/check-contracts.sh
 
       - name: Core migrations apply to a fresh pgvector database
         working-directory: backend

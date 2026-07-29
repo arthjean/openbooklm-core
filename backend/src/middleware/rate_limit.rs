@@ -609,8 +609,11 @@ mod tests {
     /// which costs more than this assertion is worth.
     ///
     /// Run it explicitly with `cargo test -- --ignored`.
+    ///
+    /// Tracked as openbooklm-core#1: making the Redis backend injectable would
+    /// remove the network I/O and let this assert on behaviour instead.
     #[test]
-    #[ignore = "asserts on a log through a thread-local subscriber plus network I/O; flaky on CI runners"]
+    #[ignore = "asserts on a log through a thread-local subscriber plus network I/O; flaky on CI runners (openbooklm-core#1)"]
     fn redis_fallback_logs_warning_on_redis_failure() {
         use std::sync::Mutex;
         use tracing_subscriber::layer::SubscriberExt;

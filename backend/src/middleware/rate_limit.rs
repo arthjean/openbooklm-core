@@ -590,11 +590,27 @@ mod tests {
     /// "falling back to in-memory" must be emitted so operators can
     /// detect degraded mode in production logs.
     ///
-    /// Uses a plain `#[test]` with an explicit tokio runtime inside
-    /// `tracing::subscriber::with_default` to guarantee the capture
-    /// layer is active regardless of any global subscriber set by
-    /// other tests in the suite.
+    /// # Why this is ignored by default
+    ///
+    /// It asserts on an emitted log, and it can only observe one by combining a
+    /// thread-local subscriber with real network I/O. Both halves are fragile.
+    /// It first failed about one run in five locally, because `closed_port_url`
+    /// released an ephemeral port that the suite's `wiremock` servers sometimes
+    /// claimed; pointing it at the privileged port 1 fixed that and made it
+    /// stable over ten local runs, then it failed on a GitHub runner with an
+    /// empty event list, meaning the capture layer saw nothing at all rather
+    /// than seeing the wrong thing.
+    ///
+    /// What it protects is observability, not behaviour. The fallback itself is
+    /// covered by `redis_fallback_allows_requests_when_redis_unreachable` and
+    /// `redis_fallback_falls_back_to_in_memory_limit`, which assert on what the
+    /// limiter does rather than on what it prints, and which are deterministic.
+    /// A public CI that goes red at random teaches contributors to ignore it,
+    /// which costs more than this assertion is worth.
+    ///
+    /// Run it explicitly with `cargo test -- --ignored`.
     #[test]
+    #[ignore = "asserts on a log through a thread-local subscriber plus network I/O; flaky on CI runners"]
     fn redis_fallback_logs_warning_on_redis_failure() {
         use std::sync::Mutex;
         use tracing_subscriber::layer::SubscriberExt;

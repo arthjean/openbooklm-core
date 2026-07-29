@@ -144,6 +144,16 @@ operator sets the env var and restarts. No redeploy, no rebuild, no fork. The
 classification and this mechanism are documented at the constant's definition
 site so the next reader does not have to re-derive them.
 
+**Post-publication outcome.** GitHub secret scanning raised this key as alert #1
+nine minutes after the repository went public on 2026-07-29, reporting
+`validity: unknown` — it could not establish that the key is live. It was the
+only alert on the repository, which is the result this audit predicted: the one
+detectable pattern, already classified. Resolved as `wont_fix` with a comment
+pointing here, rather than `false_positive`: the detection is correct, it is the
+"exposed secret" conclusion that does not apply. Push protection was enabled on
+the repository at the same time, so a genuine credential pushed by mistake is
+blocked at the source rather than audited afterwards.
+
 ### Credential rotation
 
 **No rotation was required.** Zero findings were classified real or

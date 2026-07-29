@@ -18,11 +18,18 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-openbooklm}
     volumes:
       - postgres_data:/var/lib/postgresql/data
-    # Published on loopback only. The database is the server's dependency, not
-    # a service anyone else should reach; comment this out to inspect it with a
-    # local client.
-    ports:
-      - "127.0.0.1:5432:5432"
+    # No published port on purpose. The server reaches the database over this
+    # Compose network as `postgres:5432`, so nothing needs a port on the host.
+    #
+    # The default password below is published in this file and in .env.example,
+    # which makes it known to everyone. Not publishing the port is what keeps
+    # that harmless: an unprivileged process on the host cannot reach the
+    # database at all, rather than being stopped by a password anyone can read.
+    #
+    # Uncomment to inspect the database with a local client, and set
+    # POSTGRES_PASSWORD to something of your own first.
+    # ports:
+    #   - "127.0.0.1:5432:5432"
     healthcheck:
       # `-d` matters: without it pg_isready reports the server is up before the
       # application database exists, and the first migration races the initdb

@@ -174,14 +174,19 @@ service container, written in plain text seven lines above the URL that uses it
 and reachable only from the job that starts it. Replacing it with a secret would
 add a secret to a pipeline whose entire point is to need none.
 
-In the public sample it is a development default. The Compose stack binds
-Postgres to `127.0.0.1`, so nothing off-host reaches it, and the file now says
-plainly that the value is published, therefore known, and must change before the
-database is reachable by anything else. Removing the default instead was
-considered and rejected: it breaks the one-command start the PRD treats as the
-operator-DX mitigation, and it trades a documented weak default for a worse
-failure mode, an operator inventing their own `DATABASE_URL` with no working
-example to copy.
+In the public sample it is a development default, and this is the one that was
+worth hardening. Documenting a weak published password is not the same as making
+it unreachable, so the Compose stack no longer publishes the database port at
+all: the server reaches Postgres over the Compose network as `postgres:5432`,
+and no process on the host can reach the database, rather than being stopped by
+a password anyone can read. Uncommenting the port is a deliberate act, and the
+comment there says to set a password of your own first.
+
+Changing the default value instead would have been cosmetic: a published
+default is known whatever it is. Removing it entirely was also considered and
+rejected: it breaks the one-command start the PRD treats as the operator-DX
+mitigation, and trades a documented default for a worse failure mode, an
+operator inventing their own `DATABASE_URL` with no working example to copy.
 
 ### Credential rotation
 

@@ -1,0 +1,23 @@
+// Emit configuration, separate from the checking one.
+//
+// `tsconfig.json` type-checks the whole workspace including tests and sets
+// `noEmit`. Publishing needs the opposite: emit, and only from `src`, so no
+// test file ever reaches the package.
+//
+// No bundler. Every internal import already carries its `.js` extension, so
+// plain `tsc` output is valid Node ESM as-is, and a consumer's bundler sees
+// the same module graph the sources describe.
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "outDir": "dist",
+    "rootDir": "src",
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "types": ["node"]
+  },
+  "include": ["src"],
+  "exclude": ["test", "**/*.test.ts"]
+}

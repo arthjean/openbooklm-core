@@ -268,10 +268,11 @@ jobs:
       - run: bun run typecheck
       - run: bun test
 
-      # No build step: the package ships its TypeScript sources (`main` and
-      # `types` both point into `src/`, and `files` is `src` plus the README),
-      # so consumers compile it with their own toolchain. There is no `build`
-      # script to run, and calling one failed the job before it could pack.
+      # Emits `dist/` from `src/` only. The package publishes compiled ESM plus
+      # declarations rather than TypeScript sources, so it imports from plain
+      # Node and does not force consumers to transpile it out of node_modules.
+      - run: bun run build
+
       - name: Pack
         run: npm pack --pack-destination ../../dist
 

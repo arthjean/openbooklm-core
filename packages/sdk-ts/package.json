@@ -17,6 +17,9 @@
     "dist",
     "README.md"
   ],
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "generate": "openapi-typescript ../../contracts/openapi.json --output src/generated/openapi.ts && node scripts/generate-catalog.mjs",
     "build": "tsc -p tsconfig.build.json",

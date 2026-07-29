@@ -261,10 +261,13 @@ jobs:
         with:
           ref: ${{ inputs.tag || github.ref }}
 
-      - uses: actions/setup-node@v4
+      # npm Trusted Publishing requires a recent npm CLI. Node 24 ships one
+      # and setup-node configures the registry without an auth token.
+      - uses: actions/setup-node@v6
         with:
-          node-version: 22
+          node-version: 24
           registry-url: https://registry.npmjs.org
+          package-manager-cache: false
 
       - uses: oven-sh/setup-bun@v2
 
@@ -286,10 +289,12 @@ jobs:
           subject-path: dist/*.tgz
 
       - name: Publish
-        # npm provenance requires id-token: write, which is granted above.
+        # npm Trusted Publishing exchanges GitHub's OIDC token for a
+        # short-lived publishing credential. No NPM_TOKEN is stored in GitHub.
+        # Configure this workflow once with:
+        # npm trust github @openbooklm/sdk --repo arthjean/openbooklm-core \
+        #   --file public-release.yml --allow-publish -y
         run: npm publish --provenance --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
   # ==========================================================================
   # Release page, last: every artifact already exists and is attested.

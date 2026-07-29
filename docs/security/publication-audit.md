@@ -154,6 +154,35 @@ pointing here, rather than `false_positive`: the detection is correct, it is the
 the repository at the same time, so a genuine credential pushed by mistake is
 blocked at the source rather than audited afterwards.
 
+#### F-004 — `openbooklm` Postgres password in the public sample and CI
+
+| Field | Value |
+|---|---|
+| Rule | `postgres_url_password` (HIGH severity pattern) |
+| Paths | `docs/self-hosting/env.core.example` (exported as `.env.example`), `.github/workflows/public-ci.yml`, `.github/workflows/public-release.yml` |
+| Fingerprint | `8d91f87a34f4881c56238ad455824e62d602fe07706d54aca448471978f4904a` |
+| Classification | **PLACEHOLDER** (sample) / **SYNTHETIC_TEST_FIXTURE** (CI) |
+
+**Decision: keep, classified, with the sample documented as a development default.**
+
+Introduced by EP-004, after the original audit ran, which is why it appears as
+UNRESOLVED on a first re-scan rather than in the table above. One value in three
+places, none of them a credential.
+
+In the two workflows it is the password of the throwaway `pgvector/pgvector:pg16`
+service container, written in plain text seven lines above the URL that uses it
+and reachable only from the job that starts it. Replacing it with a secret would
+add a secret to a pipeline whose entire point is to need none.
+
+In the public sample it is a development default. The Compose stack binds
+Postgres to `127.0.0.1`, so nothing off-host reaches it, and the file now says
+plainly that the value is published, therefore known, and must change before the
+database is reachable by anything else. Removing the default instead was
+considered and rejected: it breaks the one-command start the PRD treats as the
+operator-DX mitigation, and it trades a documented weak default for a worse
+failure mode, an operator inventing their own `DATABASE_URL` with no working
+example to copy.
+
 ### Credential rotation
 
 **No rotation was required.** Zero findings were classified real or

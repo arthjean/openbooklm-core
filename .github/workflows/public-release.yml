@@ -113,6 +113,10 @@ jobs:
           ./scripts/check-open-core-boundary.sh
           python3 scripts/check-public-manifest.py
 
+      # FR-18: no tag artifact is published while a secret is unresolved.
+      - name: No unresolved secret in the history
+        run: python3 scripts/scan-git-history-secrets.py
+
       - name: Generated contracts match their Rust sources
         run: ./scripts/check-contracts.sh
 

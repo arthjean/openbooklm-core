@@ -192,6 +192,24 @@ describe("catalog", () => {
     expect(PROVIDERS.map((p) => p.provider)).toEqual(["mistral", "anthropic", "openai"]);
     expect(PROVIDERS.find((p) => p.provider === "anthropic")?.native_citations).toBe(true);
   });
+
+  it("exports stable Mistral model capabilities", () => {
+    const mistral = PROVIDERS.find((provider) => provider.provider === "mistral");
+    expect(mistral?.models).toEqual([
+      {
+        id: "mistral-small-latest",
+        name: "Mistral Small",
+        description: "Fast and efficient",
+        context_window: 32_768,
+      },
+      {
+        id: "mistral-large-latest",
+        name: "Mistral Large",
+        description: "Advanced reasoning",
+        context_window: 131_072,
+      },
+    ]);
+  });
 });
 
 describe("public boundary", () => {

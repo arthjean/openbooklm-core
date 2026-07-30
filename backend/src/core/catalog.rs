@@ -14,7 +14,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::api::chat::types::{DEFAULT_MAX_CONTEXT_CHUNKS, MAX_CONTEXT_CHUNKS};
-use crate::clients::models::{ModelInfo, anthropic_models, openai_models};
+use crate::clients::models::{ModelInfo, anthropic_models, mistral_models, openai_models};
 use crate::entities::source::SourceStatus;
 use crate::llm::TeachingMode;
 use crate::repositories::{DEFAULT_CHAT_HISTORY_LIMIT, MAX_CHAT_HISTORY_LIMIT};
@@ -82,8 +82,8 @@ pub struct ProviderCapabilities {
     /// Whether the provider returns structured citations, as opposed to the
     /// core extracting `[N]` markers from the answer text.
     pub native_citations: bool,
-    /// Empty when the provider's catalogue is discovered at runtime rather than
-    /// pinned in the core (Mistral).
+    /// Stable models supported by the public client contract. A provider's
+    /// runtime discovery endpoint may return additional models.
     pub models: Vec<ModelInfo>,
 }
 
@@ -172,13 +172,15 @@ const fn teaching_mode_id(mode: TeachingMode) -> &'static str {
 
 /// Provider catalogue, ordered to match [`VALID_PROVIDERS`].
 ///
-/// Mistral publishes a models endpoint, so the core does not pin its catalogue;
-/// the empty list is the contract's way of saying "ask the provider", not an
-/// omission.
 fn provider_capabilities() -> Vec<ProviderCapabilities> {
     VALID_PROVIDERS
         .iter()
         .map(|provider| match *provider {
+            "mistral" => ProviderCapabilities {
+                provider: "mistral",
+                native_citations: false,
+                models: mistral_models(),
+            },
             "anthropic" => ProviderCapabilities {
                 provider: "anthropic",
                 native_citations: true,
@@ -215,6 +217,28 @@ mod tests {
     fn every_provider_named_by_validation_is_described() {
         let described: Vec<&str> = catalog().providers.iter().map(|p| p.provider).collect();
         assert_eq!(described, VALID_PROVIDERS.to_vec());
+    }
+
+    #[test]
+    fn mistral_defaults_are_part_of_the_public_contract() {
+        let c = catalog();
+        let mistral = c
+            .providers
+            .iter()
+            .find(|provider| provider.provider == "mistral")
+            .expect("Mistral provider capabilities");
+        let model_ids: Vec<&str> = mistral
+            .models
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect();
+
+        assert_eq!(
+            model_ids,
+            vec!["mistral-small-latest", "mistral-large-latest"]
+        );
+        assert_eq!(mistral.models[0].context_window, Some(32_768));
+        assert_eq!(mistral.models[1].context_window, Some(131_072));
     }
 
     #[test]

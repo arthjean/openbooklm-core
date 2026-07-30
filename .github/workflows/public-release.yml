@@ -81,8 +81,14 @@ jobs:
           [[ -f "$manifest" ]] || manifest=backend/Cargo.toml
           crate="$(grep -m1 '^version = ' "$manifest" | cut -d'"' -f2)"
           sdk="$(jq -r .version packages/sdk-ts/package.json)"
+          sdk_repository="$(jq -r .repository.url packages/sdk-ts/package.json)"
+          expected_repository="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
           if [[ "$version" != "$crate" || "$version" != "$sdk" ]]; then
             echo "tag $version, crate $crate, sdk $sdk — all three must match" >&2
+            exit 1
+          fi
+          if [[ "$sdk_repository" != "$expected_repository" ]]; then
+            echo "SDK repository $sdk_repository, expected $expected_repository" >&2
             exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"

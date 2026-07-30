@@ -192,6 +192,7 @@ RULES=(
   "packages/sdk-ts/*|public|"
 
   "README.md|private|the hosted README; docs/public/README.md is exported in its place"
+  ".codex/*|private|local coding-agent state and hooks"
   ".editorconfig|public|"
   ".gitignore|private|the hosted ignore rules, which cover the Next.js app; docs/public/gitignore is exported in its place"
   ".dockerignore|public|"

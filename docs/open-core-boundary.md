@@ -308,8 +308,10 @@ Their remaining divergence from the Rust definitions is catalogued in
 |---|---|
 | `LICENSE`, `CONTRIBUTING.md`, `SECURITY.md`, `CODE_OF_CONDUCT.md`, `TRADEMARK.md` | public |
 | `.editorconfig`, `.gitignore`, `.dockerignore` | public |
-| `README.md` | transitional (US-014) |
-| `docker-compose.yml`, `.env.example`, `.github/**` | transitional (US-013, US-015) |
+| `.codex/**` | private local tooling state |
+| `README.md`, `docker-compose.yml`, `.env.example` | private; public replacements are exported |
+| `.github/workflows/ci.yml` | private |
+| `.github/workflows/public-ci.yml`, `.github/workflows/public-release.yml` | public |
 | `Caddyfile`, `lefthook.yml`, `package.json`, `CLAUDE.md`, `tasks/**` | private |
 | `IMPORTANT_FUTUR.md`, `OpenbookLM-FAQ.md`, `PRODUCT_HUNT_STRATEGY.md` | private |
 

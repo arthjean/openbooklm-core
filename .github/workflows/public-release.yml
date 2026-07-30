@@ -8,7 +8,8 @@
 #   - an immutable source archive
 #   - a versioned container image (ghcr.io)
 #   - the TypeScript SDK at the same version as the core
-#   - an SBOM and a GitHub artifact attestation for each of the above
+#   - SBOMs for the source dependency graph and container image
+#   - a GitHub artifact attestation for each published artifact
 #
 # An attestation proves what built an artifact. It is provenance, not a
 # security audit, and the release notes say so.
@@ -345,7 +346,8 @@ jobs:
             echo "| Source | \`openbooklm-${VERSION}.tar.gz\` (SHA-256 alongside) |"
             echo "| SDK | \`@openbooklm/sdk@${VERSION}\` |"
             echo
-            echo "Every artifact has an SBOM and a GitHub artifact attestation:"
+            echo "The container carries an SPDX SBOM, and the CycloneDX source SBOM is attached."
+            echo "GitHub artifact attestations cover the container, source archive and SDK:"
             echo
             echo '```bash'
             echo "gh attestation verify oci://${REGISTRY}/${GITHUB_REPOSITORY}@${DIGEST} \\"

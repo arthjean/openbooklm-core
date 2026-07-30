@@ -12,5 +12,6 @@ core API or database contract.
 - npm publishing uses the repository's scoped Trusted Publisher through OIDC.
   No long-lived npm token is stored in GitHub.
 
-The source archive, TypeScript SDK and container image remain contract-checked,
-SBOM-backed and attested by GitHub Actions.
+The container and source dependency graph remain SBOM-backed. The source
+archive, TypeScript SDK and container image remain contract-checked and
+attested by GitHub Actions.

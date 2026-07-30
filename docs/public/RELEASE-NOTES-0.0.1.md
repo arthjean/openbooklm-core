@@ -104,7 +104,7 @@ cited answer.
 
 ## Security
 
-Report vulnerabilities through `SECURITY.md`, not a public issue. Every release
-artifact ships with an SBOM and a GitHub artifact attestation; the release page
-links both. An attestation proves what built the artifact — it is not a security
-audit and does not claim to be.
+Report vulnerabilities through `SECURITY.md`, not a public issue. The container
+carries an SPDX SBOM, and the CycloneDX source SBOM is attached to the release.
+Every published artifact has a GitHub artifact attestation. An attestation proves
+what built the artifact — it is not a security audit and does not claim to be.

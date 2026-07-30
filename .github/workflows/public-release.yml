@@ -289,12 +289,11 @@ jobs:
           subject-path: dist/*.tgz
 
       - name: Publish
-        # npm Trusted Publishing exchanges GitHub's OIDC token for a
-        # short-lived publishing credential. No NPM_TOKEN is stored in GitHub.
-        # Configure this workflow once with:
-        # npm trust github @openbooklm/sdk --repo arthjean/openbooklm-core \
-        #   --file public-release.yml --allow-publish -y
+        # Bootstrap only: npm cannot establish OIDC trust until the package
+        # exists. The one-day token is removed immediately after v0.0.1.
         run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
   # ==========================================================================
   # Release page, last: every artifact already exists and is attested.

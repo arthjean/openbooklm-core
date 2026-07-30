@@ -283,7 +283,9 @@ jobs:
       - run: bun run build
 
       - name: Pack
-        run: npm pack --pack-destination ../../dist
+        run: |
+          mkdir -p ../../dist
+          npm pack --pack-destination ../../dist
 
       - name: Attest the package
         uses: actions/attest-build-provenance@v2

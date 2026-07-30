@@ -192,6 +192,11 @@ jobs:
       - run: bun install --frozen-lockfile
       - run: bun run typecheck
       - run: bun test
+      - run: bun run build
+      - name: Pack the publishable SDK
+        run: |
+          mkdir -p ../../dist
+          npm pack --pack-destination ../../dist
 
   smoke:
     name: Compose stack smoke path

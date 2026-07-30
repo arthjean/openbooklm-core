@@ -1,6 +1,6 @@
 {
   "name": "@openbooklm/sdk",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "Typed client for the OpenbookLM core API. Generated from the Rust definitions.",
   "license": "Apache-2.0",
   "repository": {

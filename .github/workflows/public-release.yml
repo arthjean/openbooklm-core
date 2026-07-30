@@ -358,7 +358,23 @@ jobs:
             echo "Upgrade instructions: [docs/upgrading.md](docs/upgrading.md)."
           } > "$notes"
 
+          # Immutable releases lock their tag and assets at publication time.
+          # Build the complete release as a draft, then publish it atomically.
           gh release create "$TAG" \
+            --draft \
+            --verify-tag \
             --title "OpenbookLM $VERSION" \
             --notes-file "$notes" \
             dist/*
+          gh release edit "$TAG" --draft=false
+
+          # The repository policy applies only to future releases. Prove that
+          # this specific release was locked before declaring the job green.
+          for attempt in {1..10}; do
+            if [[ "$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" --jq .immutable)" == "true" ]]; then
+              exit 0
+            fi
+            sleep 3
+          done
+          echo "release $TAG was published but is not immutable" >&2
+          exit 1

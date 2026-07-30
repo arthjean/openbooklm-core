@@ -84,7 +84,20 @@ export const CORE_CATALOG = {
     {
       "provider": "mistral",
       "native_citations": false,
-      "models": [],
+      "models": [
+        {
+          "id": "mistral-small-latest",
+          "name": "Mistral Small",
+          "description": "Fast and efficient",
+          "context_window": 32768,
+        },
+        {
+          "id": "mistral-large-latest",
+          "name": "Mistral Large",
+          "description": "Advanced reasoning",
+          "context_window": 131072,
+        },
+      ],
     },
     {
       "provider": "anthropic",

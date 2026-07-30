@@ -59,6 +59,28 @@ pub fn openai_models() -> Vec<ModelInfo> {
     ]
 }
 
+/// Stable Mistral models exposed through the public client contract.
+///
+/// The settings API can still discover additional models from Mistral at
+/// runtime. This subset gives clients deterministic defaults without an API
+/// key or network request.
+pub fn mistral_models() -> Vec<ModelInfo> {
+    vec![
+        ModelInfo {
+            id: "mistral-small-latest".into(),
+            name: "Mistral Small".into(),
+            description: Some("Fast and efficient".into()),
+            context_window: Some(32_768),
+        },
+        ModelInfo {
+            id: "mistral-large-latest".into(),
+            name: "Mistral Large".into(),
+            description: Some("Advanced reasoning".into()),
+            context_window: Some(131_072),
+        },
+    ]
+}
+
 /// Format a model ID into a human-readable name.
 pub fn format_model_name(id: &str) -> String {
     let name = id

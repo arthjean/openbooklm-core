@@ -299,11 +299,10 @@ jobs:
           subject-path: dist/*.tgz
 
       - name: Publish
-        # Bootstrap only: npm cannot establish OIDC trust until the package
-        # exists. The one-day token is removed immediately after v0.0.1.
+        # npm Trusted Publishing exchanges GitHub's OIDC token for a
+        # short-lived publishing credential. No NPM_TOKEN is stored in GitHub.
+        # Trust is scoped to this workflow in arthjean/openbooklm-core.
         run: npm publish --provenance --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
   # ==========================================================================
   # Release page, last: every artifact already exists and is attested.

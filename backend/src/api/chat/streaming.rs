@@ -30,6 +30,9 @@ use crate::services::memory::{
     MIN_DROPPED_FOR_SUMMARY, apply_memory_actions, decay_memories, extract_memories,
     store_conversation_summary, summarize_truncated_history,
 };
+use crate::services::rag::eval::trace::{
+    ReasonCode, RetrievalTrace, ScoreDomain, StageCounts, StageDurations,
+};
 use crate::services::rag::rag_log::{ChunkLogEntry, RagLogEntry, create_rag_log};
 use crate::services::rag::search::PipelineTimings;
 use crate::types::MemoryDecayTracker;
@@ -79,6 +82,9 @@ pub(super) struct StreamContext {
     pub locale: String,
     /// Per-stage RAG pipeline timings (embed, search, rerank).
     pub rag_timings: PipelineTimings,
+    /// The standalone query retrieval used, when reformulation changed it.
+    /// Reaches the trace as a hash and is never logged as text.
+    pub reformulated_query: Option<String>,
     /// Whether memory extraction is enabled for this notebook.
     pub memory_enabled: bool,
     /// Voyage client for embedding memories (optional — extraction skipped if None).
@@ -130,6 +136,7 @@ pub(super) async fn stream_llm_response(
         user_question,
         locale,
         rag_timings,
+        reformulated_query,
         memory_enabled,
         embeddings,
         memory_repo,
@@ -315,29 +322,20 @@ pub(super) async fn stream_llm_response(
         }
     }
 
-    // Emit per-request RAG pipeline timing summary
-    {
-        let embed_ms = rag_timings.embed_ms;
-        let search_ms = rag_timings.search_ms;
-        let rerank_ms = rag_timings.rerank_ms;
-        let stuffed = rag_timings.stuffed;
-        let stuffing_load_ms = rag_timings.stuffing_load_ms;
-        let cache_hit = rag_timings.cache_hit;
-        let llm_ttft = llm_ttft_ms.unwrap_or(0);
-        let total_rag_ms = embed_ms + search_ms + rerank_ms + stuffing_load_ms + llm_ttft;
-        tracing::info!(
-            embed_ms,
-            search_ms,
-            rerank_ms,
-            stuffed,
-            stuffing_load_ms,
-            cache_hit,
-            llm_ttft_ms = llm_ttft,
-            total_rag_ms,
-            %notebook_id,
-            "RAG pipeline timings"
-        );
-    }
+    // Emit the per-request retrieval trace (US-004). This replaces the timing
+    // summary that used to live here: the timings are still in it, alongside the
+    // stage counts, score domain and reason codes that make a latency number
+    // interpretable — and without the query text the old log did not carry
+    // either, which the type now makes impossible to add back.
+    build_retrieval_trace(
+        notebook_id,
+        &user_question,
+        reformulated_query.as_deref(),
+        &context_chunks,
+        &rag_timings,
+        llm_ttft_ms.unwrap_or(0),
+    )
+    .emit();
 
     // Extract citations: native (Anthropic Citations API) or regex-based [N] fallback.
     let citations = resolve_citations(
@@ -427,16 +425,7 @@ pub(super) async fn stream_llm_response(
             model: Some(model_name.to_string()),
             provider: Some(provider.name().to_string()),
         };
-        create_rag_log(rag_log_repo.as_ref(), &entry)
-            .await
-            .inspect_err(|e| {
-                tracing::warn!(
-                    error = %e,
-                    %notebook_id,
-                    "Failed to create RAG log"
-                );
-            })
-            .ok()
+        record_rag_log(rag_log_repo.as_ref(), &entry).await
     } else {
         None
     };
@@ -469,6 +458,123 @@ pub(super) async fn stream_llm_response(
     });
 
     Ok(())
+}
+
+// ============================================================================
+// Retrieval trace and interaction telemetry (US-004)
+// ============================================================================
+
+/// Describe one retrieval without its content.
+///
+/// Split out of the streaming function so it can be tested directly: the
+/// property that matters — that nothing here can carry source text or the user's
+/// question — is worth an assertion, and an assertion needs a seam.
+fn build_retrieval_trace(
+    notebook_id: Uuid,
+    query: &str,
+    reformulated: Option<&str>,
+    context_chunks: &[SearchResult],
+    timings: &PipelineTimings,
+    llm_ttft_ms: u128,
+) -> RetrievalTrace {
+    // Stuffing assigns every chunk the same score, so the ordering carries no
+    // ranking information; fusion produces a rank score. Recording which one
+    // applies is what keeps a later consumer from averaging the two (US-012).
+    let score_domain = if timings.stuffed {
+        ScoreDomain::StuffingUniform
+    } else {
+        ScoreDomain::RrfRank
+    };
+
+    let mut trace = RetrievalTrace::new(notebook_id, query, "chat", score_domain);
+    if let Some(reformulated) = reformulated {
+        trace = trace.with_reformulation(reformulated);
+    }
+
+    let selected = context_chunks.len();
+    let unique_parents = unique_parent_count(context_chunks);
+    trace.candidates = StageCounts {
+        selected,
+        deduplicated: unique_parents,
+        ..StageCounts::default()
+    };
+    trace.unique_parents = unique_parents;
+    trace.tokens.selected = context_chunks
+        .iter()
+        .map(|c| {
+            crate::llm::budget::estimate_tokens(c.parent_content.as_deref().unwrap_or(&c.content))
+        })
+        .sum();
+
+    let ms = |value: u128| u64::try_from(value).unwrap_or(u64::MAX);
+    trace.durations = StageDurations {
+        embed_ms: ms(timings.embed_ms),
+        search_ms: ms(timings.search_ms),
+        rerank_ms: ms(timings.rerank_ms),
+        stuffing_load_ms: ms(timings.stuffing_load_ms),
+        total_ms: ms(timings.embed_ms
+            + timings.search_ms
+            + timings.rerank_ms
+            + timings.stuffing_load_ms
+            + llm_ttft_ms),
+    };
+
+    if timings.stuffed {
+        trace.add_reason(ReasonCode::StuffingApplied);
+    }
+    if selected == 0 {
+        trace.add_reason(ReasonCode::NoCandidates);
+    }
+    if unique_parents < selected {
+        trace.add_reason(ReasonCode::DedupShortfall);
+    }
+    trace.finish();
+    trace
+}
+
+/// Distinct parent contexts in a selection.
+///
+/// Two children of one parent in one source are one context; the same text in
+/// two sources is two, because citation attribution differs.
+fn unique_parent_count(chunks: &[SearchResult]) -> usize {
+    let mut seen: Vec<(Uuid, &str)> = Vec::new();
+    let mut singletons = 0;
+    for chunk in chunks {
+        match chunk.parent_content.as_deref() {
+            Some(parent) => {
+                let key = (chunk.source_id, parent);
+                if !seen.contains(&key) {
+                    seen.push(key);
+                }
+            }
+            None => singletons += 1,
+        }
+    }
+    seen.len() + singletons
+}
+
+/// Write the interaction log, and survive its failure.
+///
+/// One attempt, no retry: the metrics repository being down must not turn one
+/// chat turn into a write storm, and the answer has already been streamed and
+/// saved by the time this runs. The failure is reported once, as a reason code
+/// with no query text and no source content.
+async fn record_rag_log(repo: &dyn RagLogRepository, entry: &RagLogEntry) -> Option<Uuid> {
+    match create_rag_log(repo, entry).await {
+        Ok(id) => Some(id),
+        Err(e) => {
+            tracing::warn!(
+                notebook_id = %entry.notebook_id,
+                // The same vocabulary the retrieval trace uses, so an operator
+                // alerts on one set of reason codes rather than two.
+                telemetry_failure = ReasonCode::TelemetryWriteFailed.as_str(),
+                chunks_logged = entry.chunks_retrieved.len(),
+                error_kind = chat_error_type(&e),
+                "RAG interaction telemetry was not recorded; the exchange itself succeeded"
+            );
+            None
+        }
+    }
 }
 
 /// Categorize a failed chat exchange for the domain event.
@@ -1402,5 +1508,278 @@ mod tests {
             Ok(Some(_)) => panic!("Stream should not produce items after cancellation"),
             Err(_) => panic!("Stream did not end within 50ms after cancellation"),
         }
+    }
+
+    // ========================================================================
+    // Retrieval trace and interaction telemetry (US-004)
+    // ========================================================================
+
+    fn chunk(source_id: Uuid, parent: Option<&str>, content: &str) -> SearchResult {
+        SearchResult {
+            chunk_id: Uuid::new_v4(),
+            source_id,
+            source_title: "Runbook".to_owned(),
+            chunk_index: 0,
+            content: content.to_owned(),
+            parent_content: parent.map(str::to_owned),
+            relevance_score: 0.8,
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn the_trace_records_every_field_the_prd_names() {
+        let notebook = Uuid::new_v4();
+        let source = Uuid::new_v4();
+        let trace = build_retrieval_trace(
+            notebook,
+            "how long are interaction logs kept",
+            Some("interaction log retention window"),
+            &[
+                chunk(source, Some("parent A"), "child one"),
+                chunk(source, Some("parent A"), "child two"),
+                chunk(source, Some("parent B"), "child three"),
+            ],
+            &PipelineTimings {
+                embed_ms: 12,
+                search_ms: 30,
+                rerank_ms: 40,
+                stuffed: false,
+                stuffing_load_ms: 0,
+                cache_hit: false,
+            },
+            100,
+        );
+
+        assert_eq!(trace.notebook_id, notebook);
+        assert_eq!(trace.mode, "chat");
+        assert_eq!(trace.score_domain, ScoreDomain::RrfRank);
+        assert_eq!(trace.candidates.selected, 3);
+        assert_eq!(trace.unique_parents, 2, "two children share one parent");
+        assert!(trace.tokens.selected > 0);
+        assert_eq!(trace.durations.embed_ms, 12);
+        assert_eq!(trace.durations.search_ms, 30);
+        assert_eq!(trace.durations.rerank_ms, 40);
+        assert_eq!(
+            trace.durations.total_ms, 182,
+            "stage times plus first token"
+        );
+        assert!(trace.reformulated_query_hash.is_some());
+        assert!(trace.reasons.contains(&ReasonCode::DedupShortfall));
+    }
+
+    #[test]
+    fn the_trace_carries_neither_the_question_nor_the_evidence() {
+        let trace = build_retrieval_trace(
+            Uuid::new_v4(),
+            "what did the postmortem say about the deleted chunks",
+            Some("postmortem deleted chunks root cause"),
+            &[chunk(
+                Uuid::new_v4(),
+                Some("the parent passage"),
+                "the child passage",
+            )],
+            &PipelineTimings::default(),
+            0,
+        );
+        let rendered = serde_json::to_string(&trace).expect("trace serializes");
+        for leaked in [
+            "postmortem",
+            "deleted",
+            "root cause",
+            "parent passage",
+            "child passage",
+        ] {
+            assert!(
+                !rendered.contains(leaked),
+                "trace leaked `{leaked}`: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn stuffing_is_recorded_as_its_own_score_domain() {
+        let trace = build_retrieval_trace(
+            Uuid::new_v4(),
+            "anything",
+            None,
+            &[chunk(Uuid::new_v4(), None, "a")],
+            &PipelineTimings {
+                stuffed: true,
+                stuffing_load_ms: 7,
+                ..PipelineTimings::default()
+            },
+            0,
+        );
+        assert_eq!(
+            trace.score_domain,
+            ScoreDomain::StuffingUniform,
+            "a uniform score must not be reported as a rank score"
+        );
+        assert!(trace.reasons.contains(&ReasonCode::StuffingApplied));
+        assert_eq!(trace.durations.stuffing_load_ms, 7);
+    }
+
+    #[test]
+    fn an_empty_selection_is_recorded_as_such() {
+        let trace = build_retrieval_trace(
+            Uuid::new_v4(),
+            "anything",
+            None,
+            &[],
+            &PipelineTimings::default(),
+            0,
+        );
+        assert_eq!(trace.candidates.selected, 0);
+        assert_eq!(trace.unique_parents, 0);
+        assert!(trace.reasons.contains(&ReasonCode::NoCandidates));
+    }
+
+    /// A metrics repository that is down, and counts how often it was asked.
+    struct FailingRagLogRepo {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FailingRagLogRepo {
+        fn new() -> Self {
+            Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RagLogRepository for FailingRagLogRepo {
+        async fn create(&self, _entry: &RagLogEntry) -> crate::repositories::RepoResult<Uuid> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(AppError::Internal("metrics store unavailable".to_owned()))
+        }
+
+        async fn get_by_id(
+            &self,
+            _id: Uuid,
+        ) -> crate::repositories::RepoResult<Option<crate::entities::rag_log::Model>> {
+            Ok(None)
+        }
+
+        async fn get_for_user(
+            &self,
+            _id: Uuid,
+            _user_id: Uuid,
+        ) -> crate::repositories::RepoResult<crate::entities::rag_log::Model> {
+            Err(AppError::NotFound("rag log".to_owned()))
+        }
+
+        async fn update_metrics(
+            &self,
+            _log_id: Uuid,
+            _metrics: &crate::services::rag::rag_log::RagMetrics,
+        ) -> crate::repositories::RepoResult<()> {
+            Ok(())
+        }
+
+        async fn update_feedback(
+            &self,
+            _log_id: Uuid,
+            _user_id: Uuid,
+            _feedback: &str,
+        ) -> crate::repositories::RepoResult<()> {
+            Ok(())
+        }
+
+        async fn get_notebook_metrics(
+            &self,
+            _notebook_id: Uuid,
+            _days: i32,
+        ) -> crate::repositories::RepoResult<crate::services::rag::rag_log::AggregatedMetrics>
+        {
+            Err(AppError::Internal("unavailable".to_owned()))
+        }
+
+        async fn get_user_metrics(
+            &self,
+            _user_id: Uuid,
+            _days: i32,
+        ) -> crate::repositories::RepoResult<crate::services::rag::rag_log::AggregatedMetrics>
+        {
+            Err(AppError::Internal("unavailable".to_owned()))
+        }
+
+        async fn get_rag_log_ids_for_messages(
+            &self,
+            _message_ids: &[Uuid],
+        ) -> crate::repositories::RepoResult<std::collections::HashMap<Uuid, (Uuid, Option<String>)>>
+        {
+            Ok(std::collections::HashMap::new())
+        }
+
+        async fn get_by_response_id(
+            &self,
+            _response_id: Uuid,
+        ) -> crate::repositories::RepoResult<Option<crate::entities::rag_log::Model>> {
+            Ok(None)
+        }
+
+        async fn purge_old_logs(
+            &self,
+            _retention_days: i32,
+        ) -> crate::repositories::RepoResult<u64> {
+            Ok(0)
+        }
+
+        async fn get_preferred_source_ids(
+            &self,
+            _notebook_id: Uuid,
+        ) -> crate::repositories::RepoResult<Vec<Uuid>> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn log_entry() -> RagLogEntry {
+        RagLogEntry {
+            notebook_id: Uuid::new_v4(),
+            user_id: Uuid::new_v4(),
+            query: "what is the retry budget".to_owned(),
+            reformulated_query: None,
+            hyde_document: None,
+            chunks_retrieved: vec![ChunkLogEntry {
+                chunk_id: Uuid::new_v4(),
+                source_id: Uuid::new_v4(),
+                chunk_index: 0,
+                relevance_score: 0.9,
+            }],
+            response_id: Some(Uuid::new_v4()),
+            retrieval_score_avg: Some(0.9),
+            context_relevance: Some(0.9),
+            model: Some("mock-1".to_owned()),
+            provider: Some("mock".to_owned()),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unavailable_metrics_store_is_tried_once_and_does_not_fail_the_exchange() {
+        let repo = FailingRagLogRepo::new();
+        let recorded = record_rag_log(&repo, &log_entry()).await;
+
+        assert!(recorded.is_none(), "the caller continues without a log id");
+        assert_eq!(
+            repo.calls(),
+            1,
+            "one attempt: a down metrics store must not become a write storm"
+        );
+    }
+
+    #[test]
+    fn the_telemetry_failure_reason_is_stable() {
+        // Dashboards and alerts key on this string, and it is the same code the
+        // retrieval trace emits.
+        assert_eq!(
+            ReasonCode::TelemetryWriteFailed.as_str(),
+            "telemetry_write_failed"
+        );
     }
 }

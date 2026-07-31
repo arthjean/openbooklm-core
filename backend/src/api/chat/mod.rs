@@ -96,7 +96,7 @@ pub async fn send_message_handler(
     .await;
     out.emit(ChatEvent::thinking(ThinkingStage::RetrievingContext))
         .await;
-    let (context_chunks, rag_timings) = retrieve_rag_context(&RagContextParams {
+    let retrieved = retrieve_rag_context(&RagContextParams {
         search_repo: state.repos.search.as_ref(),
         config: &state.config,
         notebook_id,
@@ -114,6 +114,9 @@ pub async fn send_message_handler(
         preference_boost,
     })
     .await;
+    let context_chunks = retrieved.chunks;
+    let rag_timings = retrieved.timings;
+    let reformulated_query = retrieved.reformulated_query;
 
     // 5. Build system prompt
     out.emit(ChatEvent::thinking(ThinkingStage::Generating))
@@ -221,6 +224,7 @@ pub async fn send_message_handler(
         user_question: req.message,
         locale: payload.locale.as_deref().unwrap_or("en").to_owned(),
         rag_timings,
+        reformulated_query,
         memory_enabled: req.memory_enabled,
         embeddings: state.clients.embeddings.clone(),
         memory_repo: state.repos.memory.clone(),

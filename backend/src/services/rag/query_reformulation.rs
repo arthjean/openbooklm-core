@@ -12,6 +12,7 @@ use crate::clients::{
     AnthropicMessagesClient, ClientMetrics, MessagesRequest, MessagesRequestMessage,
 };
 use crate::error::AppError;
+use crate::services::rag::eval::trace::query_hash;
 
 // ============================================================================
 // Constants
@@ -100,7 +101,7 @@ impl QueryReformulator {
             Err(e) => {
                 tracing::warn!(
                     error = %e,
-                    query,
+                    query_hash = %query_hash(query),
                     "Query reformulation failed, using original query"
                 );
                 ReformulationResult {
@@ -150,8 +151,8 @@ impl QueryReformulator {
 
         if was_reformulated {
             tracing::debug!(
-                original = query,
-                reformulated = %reformulated,
+                query_hash = %query_hash(query),
+                reformulated_query_hash = %query_hash(&reformulated),
                 "Query reformulated"
             );
         }

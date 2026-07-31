@@ -19,6 +19,7 @@ use crate::error::AppError;
 use crate::llm::{LlmMessage, LlmProvider, TeachingMode, build_system_prompt};
 use crate::repositories::{MemoryRepository, RagLogRepository, SearchRepository};
 use crate::services::memory::{format_memory_for_prompt, select_core_memories};
+use crate::services::rag::eval::trace::query_hash;
 use crate::services::rag::query_reformulation::ChatTurn;
 use crate::services::rag::search::{
     CorrectiveRetrievalParams, PipelineTimings, PreferenceBoost, RetrievalParams,
@@ -52,6 +53,31 @@ pub(crate) struct ChatHistory {
     pub raw: Vec<chat_message::Model>,
     /// LLM-formatted messages (all loaded, not yet truncated).
     pub all_messages: Vec<LlmMessage>,
+}
+
+/// What retrieval produced for one chat turn.
+///
+/// Replaces the `(chunks, timings)` pair so that the reformulated query can
+/// reach the retrieval trace. It travels as text and is hashed at the trace
+/// boundary: the caller needs the value to decide whether reformulation
+/// happened, and the log needs never to see it.
+pub(crate) struct RetrievedContext {
+    pub chunks: Vec<SearchResult>,
+    pub timings: PipelineTimings,
+    /// The standalone query retrieval actually used, when it differs from what
+    /// the user typed.
+    pub reformulated_query: Option<String>,
+}
+
+impl RetrievedContext {
+    /// Retrieval failed or was skipped. Chat continues without evidence.
+    pub(crate) fn empty() -> Self {
+        Self {
+            chunks: Vec::new(),
+            timings: PipelineTimings::default(),
+            reformulated_query: None,
+        }
+    }
 }
 
 /// Parameters for RAG context retrieval.
@@ -407,10 +433,7 @@ pub(crate) async fn build_preference_boost(
 ///
 /// Emits typed thinking and warning events as retrieval progresses.
 /// Falls back to an empty context on any error.
-/// Returns `(chunks, pipeline_timings)`.
-pub(crate) async fn retrieve_rag_context(
-    params: &RagContextParams<'_>,
-) -> (Vec<SearchResult>, PipelineTimings) {
+pub(crate) async fn retrieve_rag_context(params: &RagContextParams<'_>) -> RetrievedContext {
     let RagContextParams {
         search_repo,
         config,
@@ -448,10 +471,12 @@ pub(crate) async fn retrieve_rag_context(
             if !chat_turns.is_empty() && needs_proactive_reformulation(query) {
                 let result = reformulator.reformulate(query, &chat_turns).await;
                 if result.was_reformulated {
+                    // Hashes, not text: a retrieval log must never carry the
+                    // question a user typed (US-004).
                     tracing::info!(
                         %notebook_id,
-                        original = query,
-                        reformulated = %result.query,
+                        query_hash = %query_hash(query),
+                        reformulated_query_hash = %query_hash(&result.query),
                         "Proactive query reformulation for follow-up"
                     );
                     events
@@ -490,7 +515,7 @@ pub(crate) async fn retrieve_rag_context(
                     avg_relevance = corrective.avg_relevance,
                     was_corrected = corrective.was_corrected,
                     low_quality = corrective.low_quality_warning,
-                    effective_query = %corrective.effective_query,
+                    effective_query_hash = %query_hash(&corrective.effective_query),
                     "Corrective RAG retrieval"
                 );
 
@@ -506,11 +531,18 @@ pub(crate) async fn retrieve_rag_context(
                         .await;
                 }
 
-                (corrective.results, timings)
+                let reformulated_query = (corrective.effective_query != *query)
+                    .then(|| corrective.effective_query.clone());
+
+                RetrievedContext {
+                    chunks: corrective.results,
+                    timings,
+                    reformulated_query,
+                }
             }
             Err(e) => {
                 tracing::warn!(%notebook_id, error = %e, "Corrective RAG failed, proceeding without context");
-                (Vec::new(), PipelineTimings::default())
+                RetrievedContext::empty()
             }
         }
     } else {
@@ -537,11 +569,15 @@ pub(crate) async fn retrieve_rag_context(
                     top_score = chunks.first().map(|c| c.relevance_score),
                     "Retrieved context chunks for RAG"
                 );
-                (chunks, timings)
+                RetrievedContext {
+                    chunks,
+                    timings,
+                    reformulated_query: None,
+                }
             }
             Err(e) => {
                 tracing::warn!(%notebook_id, error = %e, "Failed to retrieve context, proceeding without");
-                (Vec::new(), PipelineTimings::default())
+                RetrievedContext::empty()
             }
         }
     }

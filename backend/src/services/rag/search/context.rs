@@ -13,6 +13,7 @@ use crate::core::providers::{EmbeddingProvider, Reranker};
 use crate::error::AppError;
 use crate::repositories::SearchRepository;
 use crate::services::rag::embedding_cache::EmbeddingCache;
+use crate::services::rag::eval::trace::query_hash;
 use crate::services::rag::hyde::HydeService;
 use crate::services::rag::query_reformulation::{ChatTurn, QueryReformulator};
 
@@ -416,7 +417,7 @@ pub async fn retrieve_context_corrective(
 
     tracing::debug!(
         notebook_id = %params.notebook_id,
-        query = params.query,
+        query_hash = %query_hash(params.query),
         avg_relevance = avg,
         threshold = CORRECTIVE_RAG_THRESHOLD,
         result_count = results.len(),
@@ -479,8 +480,8 @@ pub async fn retrieve_context_corrective(
 
     tracing::debug!(
         notebook_id = %params.notebook_id,
-        original_query = params.query,
-        reformulated_query = %reformulation.query,
+        query_hash = %query_hash(params.query),
+        reformulated_query_hash = %query_hash(&reformulation.query),
         original_avg = avg,
         corrected_avg = corrected_avg,
         "Corrective retrieval completed"

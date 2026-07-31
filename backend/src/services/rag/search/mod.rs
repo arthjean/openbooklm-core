@@ -30,6 +30,7 @@ use crate::error::AppError;
 use crate::repositories::SearchRepository;
 use crate::services::embeddings;
 use crate::services::rag::embedding_cache::EmbeddingCache;
+use crate::services::rag::eval::trace::query_hash;
 use crate::services::rag::hyde::HydeService;
 
 // ============================================================================
@@ -174,7 +175,7 @@ pub async fn semantic_search_with_hyde(
             if let Some(hyde_result) = hyde_svc.generate(query).await {
                 tracing::debug!(
                     %notebook_id,
-                    query,
+                    query_hash = %query_hash(query),
                     hyde_doc_len = hyde_result.document.len(),
                     "Using HyDE-generated document for embedding"
                 );
@@ -213,7 +214,7 @@ pub async fn semantic_search_with_hyde(
 
     tracing::debug!(
         %notebook_id,
-        query,
+        query_hash = %query_hash(query),
         count = results.len(),
         used_hyde = hyde.is_some(),
         embed_ms,
@@ -241,7 +242,7 @@ pub async fn lexical_search(
 
     tracing::debug!(
         %notebook_id,
-        query,
+        query_hash = %query_hash(query),
         count = results.len(),
         "Lexical search completed"
     );
@@ -311,7 +312,7 @@ pub async fn hybrid_search(
 
     tracing::debug!(
         %notebook_id,
-        query,
+        query_hash = %query_hash(query),
         dense = dense_results.len(),
         lexical = lexical_results.len(),
         fused = results.len(),

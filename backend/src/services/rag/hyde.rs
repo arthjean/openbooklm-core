@@ -19,6 +19,7 @@ use crate::clients::{
     AnthropicMessagesClient, ClientMetrics, MessagesRequest, MessagesRequestMessage,
 };
 use crate::error::AppError;
+use crate::services::rag::eval::trace::query_hash;
 
 // ============================================================================
 // Constants
@@ -97,7 +98,7 @@ impl HydeService {
         match self.call_llm(query).await {
             Ok(result) => {
                 tracing::debug!(
-                    query,
+                    query_hash = %query_hash(query),
                     doc_len = result.document.len(),
                     input_tokens = result.input_tokens,
                     output_tokens = result.output_tokens,
@@ -106,7 +107,11 @@ impl HydeService {
                 Some(result)
             }
             Err(e) => {
-                tracing::warn!(error = %e, query, "HyDE generation failed, using original query");
+                tracing::warn!(
+                    error = %e,
+                    query_hash = %query_hash(query),
+                    "HyDE generation failed, using original query"
+                );
                 None
             }
         }

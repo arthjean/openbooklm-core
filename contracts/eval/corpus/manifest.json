@@ -1,0 +1,13 @@
+{
+  "corpus_version": "1.0.0",
+  "rationale": "The first versioned relevance corpus for OpenbookLM core (EP-001, US-001). It exists to make retrieval, grounding and citation changes measurable instead of anecdotal. Every notebook, source, chunk and query is synthetic and written for this repository; nothing here is derived from a production account, conversation or document. Coverage is stratified over the eight failure modes the PRD names, and a locked holdout split keeps two cases per category out of reach of tuning work.",
+  "changelog": [
+    {
+      "version": "1.0.0",
+      "date": "2026-07-31",
+      "summary": "Initial corpus: 3 notebooks, 14 sources, 41 chunks, 40 labeled queries, 5 per category, 24 train and 16 holdout. Tenant-isolation probes point at the nb-legal sources so that a cross-notebook retrieval is a labeled failure rather than an unnoticed one."
+    }
+  ],
+  "min_cases_per_category": 5,
+  "min_total_queries": 40
+}

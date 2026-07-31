@@ -25,10 +25,13 @@
 //! | Module | Story | Owns |
 //! |---|---|---|
 //! | [`corpus`] | US-001 | Fixture schema, loading, validation |
+//! | [`trace`] | US-004 | Redacted per-retrieval trace |
 
 pub mod corpus;
+pub mod trace;
 
 pub use corpus::{
     CORPUS_RELATIVE_PATH, CorpusError, CorpusViolation, EvalCorpus, EvalQuery, QueryCategory,
     Split, synthetic_uuid,
 };
+pub use trace::{ReasonCode, RetrievalTrace, ScoreDomain};

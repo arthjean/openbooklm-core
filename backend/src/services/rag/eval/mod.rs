@@ -16,26 +16,30 @@
 //! # Offline by construction
 //!
 //! Nothing here opens a socket. The corpus is a checked-in fixture, retrieval
-//! runs against an in-memory index, and embeddings come from the deterministic
-//! in-process provider. That is a hard requirement (FR-20), not a convenience:
-//! a release gate that needs a commercial key is a gate nobody runs.
+//! runs against an in-memory index ([`index::CorpusIndex`]), and embeddings come
+//! from the deterministic in-process provider. That is a hard requirement
+//! (FR-20), not a convenience: a release gate that needs a commercial key is a
+//! gate nobody runs.
 //!
 //! # What each submodule owns
 //!
 //! | Module | Story | Owns |
 //! |---|---|---|
 //! | [`corpus`] | US-001 | Fixture schema, loading, validation |
-//! | [`grounding`] | US-003 | Claim coverage, citation precision/coverage, abstention |
 //! | [`index`] | US-002 | In-memory [`SearchRepository`](crate::repositories::SearchRepository) over the corpus |
 //! | [`retrieval`] | US-002 | Recall/MRR/nDCG/fill/latency over the corpus |
+//! | [`grounding`] | US-003 | Claim coverage, citation precision/coverage, abstention |
 //! | [`trace`] | US-004 | Redacted per-retrieval trace |
+//! | [`baseline`] | US-004 | Baseline artifact and the regression gate |
 
+pub mod baseline;
 pub mod corpus;
 pub mod grounding;
 pub mod index;
 pub mod retrieval;
 pub mod trace;
 
+pub use baseline::{Baseline, ComparisonReport, Enforcement, REGRESSION_TOLERANCE};
 pub use corpus::{
     CORPUS_RELATIVE_PATH, CorpusError, CorpusViolation, EvalCorpus, EvalQuery, QueryCategory,
     Split, synthetic_uuid,

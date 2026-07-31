@@ -25,13 +25,19 @@
 //! | Module | Story | Owns |
 //! |---|---|---|
 //! | [`corpus`] | US-001 | Fixture schema, loading, validation |
+//! | [`index`] | US-002 | In-memory [`SearchRepository`](crate::repositories::SearchRepository) over the corpus |
+//! | [`retrieval`] | US-002 | Recall/MRR/nDCG/fill/latency over the corpus |
 //! | [`trace`] | US-004 | Redacted per-retrieval trace |
 
 pub mod corpus;
+pub mod index;
+pub mod retrieval;
 pub mod trace;
 
 pub use corpus::{
     CORPUS_RELATIVE_PATH, CorpusError, CorpusViolation, EvalCorpus, EvalQuery, QueryCategory,
     Split, synthetic_uuid,
 };
+pub use index::CorpusIndex;
+pub use retrieval::{RetrievalMode, RetrievalReport, run_retrieval_eval};
 pub use trace::{ReasonCode, RetrievalTrace, ScoreDomain};

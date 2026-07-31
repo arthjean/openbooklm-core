@@ -249,7 +249,7 @@ pub async fn retrieve_context(
 
     let (mut results, embed_ms, search_ms) = search(
         *search_repo,
-        config,
+        &config.hybrid_search,
         notebook_id,
         &request,
         *embeddings,

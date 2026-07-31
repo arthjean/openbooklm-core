@@ -24,7 +24,7 @@ pub mod types;
 
 use uuid::Uuid;
 
-use crate::core::config::CoreConfig;
+use crate::core::config::HybridSearchConfig;
 use crate::core::providers::EmbeddingProvider;
 use crate::error::AppError;
 use crate::repositories::SearchRepository;
@@ -66,10 +66,15 @@ use fusion::filter_and_convert;
 ///
 /// Returns `(results, embed_ms, search_ms)` — timings are populated for Dense/Hybrid
 /// modes and `(0, 0)` for Lexical (no embedding involved).
+///
+/// Takes [`HybridSearchConfig`] rather than the whole [`CoreConfig`](crate::core::config::CoreConfig):
+/// fusion weights are the only configuration this layer reads, and narrowing the
+/// parameter is what lets the offline evaluator (EP-001) drive the real
+/// orchestration without fabricating a server configuration.
 #[tracing::instrument(skip(search_repo, config, request, embeddings, hyde, embedding_cache), fields(%notebook_id))]
 pub async fn search(
     search_repo: &dyn SearchRepository,
-    config: &CoreConfig,
+    config: &HybridSearchConfig,
     notebook_id: Uuid,
     request: &SearchRequest,
     embeddings: &dyn EmbeddingProvider,
@@ -94,7 +99,6 @@ pub async fn search(
         SearchMode::Dense => {
             semantic_search_with_hyde(
                 search_repo,
-                config,
                 notebook_id,
                 request,
                 embeddings,
@@ -115,10 +119,9 @@ pub async fn search(
 /// When a [`HydeService`] is provided and the query is short (< 20 words),
 /// HyDE generates a hypothetical document and uses its embedding for search,
 /// which bridges the query-document embedding gap.
-#[tracing::instrument(skip(search_repo, config, request, embeddings, hyde, embedding_cache), fields(%notebook_id))]
+#[tracing::instrument(skip(search_repo, request, embeddings, hyde, embedding_cache), fields(%notebook_id))]
 pub async fn semantic_search(
     search_repo: &dyn SearchRepository,
-    config: &CoreConfig,
     notebook_id: Uuid,
     request: &SearchRequest,
     embeddings: &dyn EmbeddingProvider,
@@ -127,7 +130,6 @@ pub async fn semantic_search(
 ) -> Result<Vec<SearchResult>, AppError> {
     let (results, _, _) = semantic_search_with_hyde(
         search_repo,
-        config,
         notebook_id,
         request,
         embeddings,
@@ -142,10 +144,9 @@ pub async fn semantic_search(
 ///
 /// Returns `(results, embed_ms, search_ms)` where `embed_ms` is the time spent
 /// generating the query embedding and `search_ms` is the time spent in the DB search.
-#[tracing::instrument(skip(search_repo, _config, request, embeddings, hyde, embedding_cache), fields(%notebook_id))]
+#[tracing::instrument(skip(search_repo, request, embeddings, hyde, embedding_cache), fields(%notebook_id))]
 pub async fn semantic_search_with_hyde(
     search_repo: &dyn SearchRepository,
-    _config: &CoreConfig,
     notebook_id: Uuid,
     request: &SearchRequest,
     embeddings: &dyn EmbeddingProvider,
@@ -255,7 +256,7 @@ pub async fn lexical_search(
 #[tracing::instrument(skip(search_repo, config, request, embeddings, hyde, embedding_cache), fields(%notebook_id))]
 pub async fn hybrid_search(
     search_repo: &dyn SearchRepository,
-    config: &CoreConfig,
+    config: &HybridSearchConfig,
     notebook_id: Uuid,
     request: &SearchRequest,
     embeddings: &dyn EmbeddingProvider,
@@ -276,7 +277,6 @@ pub async fn hybrid_search(
     let (dense_res, lexical_res) = tokio::join!(
         semantic_search_with_hyde(
             search_repo,
-            config,
             notebook_id,
             &dense_req,
             embeddings,
@@ -293,13 +293,12 @@ pub async fn hybrid_search(
     });
 
     // Fuse results using RRF
-    let hybrid = &config.hybrid_search;
     let fused = reciprocal_rank_fusion(
         &dense_results,
         &lexical_results,
-        hybrid.rrf_k,
-        hybrid.dense_weight,
-        hybrid.sparse_weight,
+        config.rrf_k,
+        config.dense_weight,
+        config.sparse_weight,
     );
 
     // Apply limit and min_relevance filter
@@ -329,8 +328,8 @@ pub async fn hybrid_search(
 // ============================================================================
 
 /// Determine effective search mode based on config.
-const fn effective_mode(config: &CoreConfig, requested: SearchMode) -> SearchMode {
-    if config.hybrid_search.enabled {
+const fn effective_mode(config: &HybridSearchConfig, requested: SearchMode) -> SearchMode {
+    if config.enabled {
         requested
     } else {
         match requested {

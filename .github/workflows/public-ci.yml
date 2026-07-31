@@ -66,6 +66,26 @@ jobs:
       - name: Test (core only)
         run: cargo test --no-default-features
 
+      # EP-001: the evaluation corpus gates retrieval and answer quality, so it
+      # has to be valid before anything is measured against it. Offline: no
+      # credential is read and no socket is opened.
+      - name: RAG evaluation corpus is valid
+        run: cargo run --no-default-features --bin rag-eval -- validate
+
+      # The regression gate. Reports unmet absolute targets without blocking on
+      # them: those are month-6 goals for a real embedding provider, while this
+      # runs against the deterministic one. A regression, a tenant-isolation
+      # failure or a missing metric does block.
+      - name: RAG quality has not regressed against the approved baseline
+        run: |
+          set -euo pipefail
+          cargo run --no-default-features --bin rag-eval -- baseline \
+            --out "${RUNNER_TEMP}/candidate.json" \
+            --revision corpus-v1-deterministic
+          cargo run --no-default-features --bin rag-eval -- compare \
+            --baseline ../contracts/eval/baseline/hybrid-train.json \
+            --candidate "${RUNNER_TEMP}/candidate.json"
+
   dependencies:
     name: Licenses and advisories
     runs-on: ubuntu-latest

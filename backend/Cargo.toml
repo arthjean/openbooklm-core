@@ -45,6 +45,11 @@ path = "src/bin/openbooklm-server.rs"
 name = "contracts"
 path = "src/bin/contracts.rs"
 
+# Offline RAG evaluation (EP-001). Needs no credential and opens no socket.
+[[bin]]
+name = "rag-eval"
+path = "src/bin/rag-eval.rs"
+
 
 [dependencies]
 # The public core schema. The private SaaS migration track is a separate

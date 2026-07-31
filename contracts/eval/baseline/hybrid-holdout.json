@@ -1,0 +1,338 @@
+{
+  "schema": "rag-eval-baseline/1",
+  "generated_at": "unspecified",
+  "corpus_version": "1.0.0",
+  "corpus_generation": "gen-corpus-v1",
+  "chunking_version": "eval-corpus-chunking/1",
+  "code_revision": "corpus-v1-deterministic",
+  "embedding_fingerprint": "deterministic/deterministic-hash-v1/1024",
+  "reranker_fingerprint": "none",
+  "retrieval": {
+    "mode": "hybrid",
+    "split": "holdout",
+    "requested_limit": 10,
+    "fusion": {
+      "enabled": true,
+      "rrf_k": 60.0,
+      "dense_weight": 1.0,
+      "sparse_weight": 0.25
+    },
+    "overall": {
+      "queries": 16,
+      "judged_queries": 13,
+      "recall_at_5": 0.653846,
+      "recall_at_10": 0.730769,
+      "recall_at_20": 0.730769,
+      "mrr": 0.539316,
+      "ndcg_at_10": 0.579864,
+      "source_recall": 1.0,
+      "duplicate_parent_rate": 0.0375,
+      "top_k_fill_rate": 1.0,
+      "isolation_failures": 0,
+      "reasons": {
+        "dedup_shortfall": 6,
+        "ok": 10
+      }
+    },
+    "by_category": {
+      "conflicting_sources": {
+        "queries": 2,
+        "judged_queries": 2,
+        "recall_at_5": 0.5,
+        "recall_at_10": 0.5,
+        "recall_at_20": 0.5,
+        "mrr": 0.5,
+        "ndcg_at_10": 0.459861,
+        "source_recall": 1.0,
+        "duplicate_parent_rate": 0.0,
+        "top_k_fill_rate": 1.0,
+        "isolation_failures": 0,
+        "reasons": {
+          "ok": 2
+        }
+      },
+      "exact_identifier": {
+        "queries": 2,
+        "judged_queries": 2,
+        "recall_at_5": 0.5,
+        "recall_at_10": 1.0,
+        "recall_at_20": 1.0,
+        "mrr": 0.555556,
+        "ndcg_at_10": 0.650515,
+        "source_recall": 1.0,
+        "duplicate_parent_rate": 0.05,
+        "top_k_fill_rate": 1.0,
+        "isolation_failures": 0,
+        "reasons": {
+          "dedup_shortfall": 1,
+          "ok": 1
+        }
+      },
+      "hostile_instructions": {
+        "queries": 2,
+        "judged_queries": 1,
+        "recall_at_5": 1.0,
+        "recall_at_10": 1.0,
+        "recall_at_20": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_10": 1.0,
+        "source_recall": 1.0,
+        "duplicate_parent_rate": 0.0,
+        "top_k_fill_rate": 1.0,
+        "isolation_failures": 0,
+        "reasons": {
+          "ok": 2
+        }
+      },
+      "long_document": {
+        "queries": 2,
+        "judged_queries": 2,
+        "recall_at_5": 1.0,
+        "recall_at_10": 1.0,
+        "recall_at_20": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_10": 1.0,
+        "source_recall": 1.0,
+        "duplicate_parent_rate": 0.05,
+        "top_k_fill_rate": 1.0,
+        "isolation_failures": 0,
+        "reasons": {
+          "dedup_shortfall": 1,
+          "ok": 1
+        }
+      },
+      "multi_hop": {
+        "queries": 2,
+        "judged_queries": 2,
+        "recall_at_5": 0.75,
+        "recall_at_10": 0.75,
+        "recall_at_20": 0.75,
+        "mrr": 0.35,
+        "ndcg_at_10": 0.465312,
+        "source_recall": 1.0,
+        "duplicate_parent_rate": 0.1,
+        "top_k_fill_rate": 1.0,
+        "isolation_failures": 0,
+        "reasons": {
+          "dedup_shortfall": 2
+        }
+      },
+      "semantic_paraphrase": {
+        "queries": 2,
+        "judged_queries": 2,
+        "recall_at_5": 0.5,
+        "recall_at_10": 0.5,
+        "recall_at_20": 0.5,
+        "mrr": 0.5,
+        "ndcg_at_10": 0.5,
+        "source_recall": 1.0,
+        "duplicate_parent_rate": 0.0,
+        "top_k_fill_rate": 1.0,
+        "isolation_failures": 0,
+        "reasons": {
+          "ok": 2
+        }
+      },
+      "tables_and_code": {
+        "queries": 2,
+        "judged_queries": 2,
+        "recall_at_5": 0.5,
+        "recall_at_10": 0.5,
+        "recall_at_20": 0.5,
+        "mrr": 0.1,
+        "ndcg_at_10": 0.193427,
+        "source_recall": 1.0,
+        "duplicate_parent_rate": 0.05,
+        "top_k_fill_rate": 1.0,
+        "isolation_failures": 0,
+        "reasons": {
+          "dedup_shortfall": 1,
+          "ok": 1
+        }
+      },
+      "unanswerable": {
+        "queries": 2,
+        "judged_queries": 0,
+        "recall_at_5": 0.0,
+        "recall_at_10": 0.0,
+        "recall_at_20": 0.0,
+        "mrr": 0.0,
+        "ndcg_at_10": 0.0,
+        "source_recall": 0.0,
+        "duplicate_parent_rate": 0.05,
+        "top_k_fill_rate": 1.0,
+        "isolation_failures": 0,
+        "reasons": {
+          "dedup_shortfall": 1,
+          "ok": 1
+        }
+      }
+    }
+  },
+  "grounding": {
+    "split": "holdout",
+    "overall": {
+      "cases": 16,
+      "expected_claim_coverage": 0.4,
+      "citation_precision": 0.375,
+      "citation_coverage": 1.0,
+      "abstention_accuracy": 0.625,
+      "unsupported_claims": 0,
+      "citations_emitted": 16,
+      "citations_correct": 6,
+      "citation_verdicts": {
+        "correct": 6,
+        "unrelated_to_claim": 10
+      },
+      "classifications": {
+        "missing_abstention": 6,
+        "ok": 10
+      }
+    },
+    "by_category": {
+      "conflicting_sources": {
+        "cases": 2,
+        "expected_claim_coverage": 0.5,
+        "citation_precision": 0.5,
+        "citation_coverage": 1.0,
+        "abstention_accuracy": 0.5,
+        "unsupported_claims": 0,
+        "citations_emitted": 2,
+        "citations_correct": 1,
+        "citation_verdicts": {
+          "correct": 1,
+          "unrelated_to_claim": 1
+        },
+        "classifications": {
+          "missing_abstention": 1,
+          "ok": 1
+        }
+      },
+      "exact_identifier": {
+        "cases": 2,
+        "expected_claim_coverage": 0.5,
+        "citation_precision": 0.5,
+        "citation_coverage": 1.0,
+        "abstention_accuracy": 1.0,
+        "unsupported_claims": 0,
+        "citations_emitted": 2,
+        "citations_correct": 1,
+        "citation_verdicts": {
+          "correct": 1,
+          "unrelated_to_claim": 1
+        },
+        "classifications": {
+          "ok": 2
+        }
+      },
+      "hostile_instructions": {
+        "cases": 2,
+        "expected_claim_coverage": 1.0,
+        "citation_precision": 0.5,
+        "citation_coverage": 1.0,
+        "abstention_accuracy": 0.5,
+        "unsupported_claims": 0,
+        "citations_emitted": 2,
+        "citations_correct": 1,
+        "citation_verdicts": {
+          "correct": 1,
+          "unrelated_to_claim": 1
+        },
+        "classifications": {
+          "missing_abstention": 1,
+          "ok": 1
+        }
+      },
+      "long_document": {
+        "cases": 2,
+        "expected_claim_coverage": 1.0,
+        "citation_precision": 1.0,
+        "citation_coverage": 1.0,
+        "abstention_accuracy": 1.0,
+        "unsupported_claims": 0,
+        "citations_emitted": 2,
+        "citations_correct": 2,
+        "citation_verdicts": {
+          "correct": 2
+        },
+        "classifications": {
+          "ok": 2
+        }
+      },
+      "multi_hop": {
+        "cases": 2,
+        "expected_claim_coverage": 0.0,
+        "citation_precision": 0.0,
+        "citation_coverage": 0.0,
+        "abstention_accuracy": 1.0,
+        "unsupported_claims": 0,
+        "citations_emitted": 2,
+        "citations_correct": 0,
+        "citation_verdicts": {
+          "unrelated_to_claim": 2
+        },
+        "classifications": {
+          "ok": 2
+        }
+      },
+      "semantic_paraphrase": {
+        "cases": 2,
+        "expected_claim_coverage": 0.5,
+        "citation_precision": 0.5,
+        "citation_coverage": 1.0,
+        "abstention_accuracy": 0.5,
+        "unsupported_claims": 0,
+        "citations_emitted": 2,
+        "citations_correct": 1,
+        "citation_verdicts": {
+          "correct": 1,
+          "unrelated_to_claim": 1
+        },
+        "classifications": {
+          "missing_abstention": 1,
+          "ok": 1
+        }
+      },
+      "tables_and_code": {
+        "cases": 2,
+        "expected_claim_coverage": 0.0,
+        "citation_precision": 0.0,
+        "citation_coverage": 0.0,
+        "abstention_accuracy": 0.5,
+        "unsupported_claims": 0,
+        "citations_emitted": 2,
+        "citations_correct": 0,
+        "citation_verdicts": {
+          "unrelated_to_claim": 2
+        },
+        "classifications": {
+          "missing_abstention": 1,
+          "ok": 1
+        }
+      },
+      "unanswerable": {
+        "cases": 2,
+        "expected_claim_coverage": 0.0,
+        "citation_precision": 0.0,
+        "citation_coverage": 0.0,
+        "abstention_accuracy": 0.0,
+        "unsupported_claims": 0,
+        "citations_emitted": 2,
+        "citations_correct": 0,
+        "citation_verdicts": {
+          "unrelated_to_claim": 2
+        },
+        "classifications": {
+          "missing_abstention": 2
+        }
+      }
+    }
+  },
+  "notes": [
+    "Embeddings come from the deterministic in-process hashing provider. Semantic categories score low by construction; the PRD's absolute targets assume a real embedding model.",
+    "Lexical scores come from a BM25-shaped in-memory scorer, not from PostgreSQL ts_rank_cd. They are comparable across revisions of this repository and not against a database.",
+    "Fused results are re-sorted by (score desc, chunk id asc) before scoring. Reciprocal rank fusion leaves ties in hash order, which would make this report unstable; US-013 owns moving the tie-breaker into the production path.",
+    "Claim assertion is decided by the corpus's literal answer markers, never by a model. A judge, when configured, only adds diagnostics.",
+    "A citation counts only when its chunk resolves, belongs to the active generation and the query's notebook, and its quoted span supports an asserted claim."
+  ]
+}

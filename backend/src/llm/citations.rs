@@ -1,41 +1,77 @@
-//! Citation extraction from LLM responses.
+//! Citation extraction and verification (US-019).
 //!
 //! Parses `[N]` markers in Markdown text, skipping code spans and fenced blocks,
 //! and maps them to source chunks.
+//!
+//! # A marker is not a citation
+//!
+//! A citation is emitted only when its marker resolves to a chunk that was
+//! actually retrieved this turn, that chunk carries an index generation, its
+//! recorded span and pages describe a passage that can exist, and the quoted
+//! passage is a passage of it. Everything else — an index out of range, a `[0]`,
+//! a marker inside a code block, an incoherent span, a quote the chunk does not
+//! contain — is refused and counted. The count is what makes the failure visible
+//! to the grounded-response report instead of silently lowering citation
+//! coverage.
 
 use std::{borrow::Cow, collections::HashSet, sync::LazyLock};
 
 use regex::Regex;
 
-use super::types::{CitableChunk, Citation};
+use super::types::{ChunkProvenance, CitableChunk, Citation};
 
 /// Pre-compiled citation regex [N].
 static CITATION_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\[(\d+)\]").expect("valid regex"));
 
-/// Extract citations from LLM response based on [N] markers.
+/// Citations an answer earned, and the markers it did not.
+#[derive(Debug, Clone, Default)]
+pub struct ExtractedCitations {
+    pub citations: Vec<Citation>,
+    /// Markers that named something unciteable: out of range, `[0]`, a chunk
+    /// with no generation, or a marker written inside code.
+    pub rejected: usize,
+}
+
+/// Extract citations from an LLM response, discarding the markers it cannot
+/// justify.
 ///
 /// Skips `[N]` patterns inside inline code (`` `...` ``) and fenced code blocks
-/// (`` ```...``` ``), and ignores out-of-bounds references.
+/// (`` ```...``` ``), and refuses out-of-bounds references.
+#[must_use]
 pub fn extract_citations(response: &str, context_chunks: &[CitableChunk]) -> Vec<Citation> {
+    extract_citations_verified(response, context_chunks).citations
+}
+
+/// [`extract_citations`], reporting how many markers were refused.
+#[must_use]
+pub fn extract_citations_verified(
+    response: &str,
+    context_chunks: &[CitableChunk],
+) -> ExtractedCitations {
     let code_ranges = find_code_ranges(response);
     let mut citations = Vec::new();
     let mut seen = HashSet::new();
     let mut marker_count = 0;
+    let mut rejected = 0usize;
 
     for cap in CITATION_REGEX.captures_iter(response) {
         marker_count += 1;
 
         let full_match = cap.get(0).expect("capture group 0 always exists");
-        // Skip citations inside code blocks
+        // A marker inside a code block is code, not a citation. It is still
+        // counted: an answer that only "cites" inside a fence has cited nothing.
         if is_in_code_range(full_match.start(), &code_ranges) {
+            rejected += 1;
             continue;
         }
 
         let Some(index_match) = cap.get(1) else {
+            rejected += 1;
             continue;
         };
         let Ok(index) = index_match.as_str().parse::<usize>() else {
+            rejected += 1;
             continue;
         };
 
@@ -45,6 +81,7 @@ pub fn extract_citations(response: &str, context_chunks: &[CitableChunk]) -> Vec
                 citation_index = 0,
                 "Citation [0] is invalid (1-indexed), skipping"
             );
+            rejected += 1;
             continue;
         }
 
@@ -62,48 +99,44 @@ pub fn extract_citations(response: &str, context_chunks: &[CitableChunk]) -> Vec
                 available = context_chunks.len(),
                 "Citation references non-existent chunk"
             );
+            rejected += 1;
             continue;
         };
 
+        // A chunk with no generation was not read from a published index.
+        if chunk.generation_id.is_nil() {
+            tracing::warn!(
+                citation_index = index,
+                source_id = %chunk.source_id,
+                "Citation resolves to a chunk with no index generation, skipping"
+            );
+            rejected += 1;
+            continue;
+        }
+
+        // The span and pages the chunker recorded must describe a passage that
+        // can exist. One that cannot was not written by this pipeline, and a
+        // citation into it would open something the reader cannot verify.
+        let provenance = ChunkProvenance::read(chunk.metadata.as_ref());
+        if !provenance.is_coherent() {
+            tracing::warn!(
+                citation_index = index,
+                source_id = %chunk.source_id,
+                "Citation resolves to a chunk with an incoherent span, skipping"
+            );
+            rejected += 1;
+            continue;
+        }
+
         seen.insert(chunk_idx);
 
-        // Extract metadata fields for enriched citations (section headers, YouTube timestamps).
-        let meta = chunk.metadata.as_ref();
-        let section_header = meta
-            .and_then(|m| m.get("section_header"))
-            .and_then(|v| v.as_str())
-            .map(String::from);
-        let page_number = meta
-            .and_then(|m| m.get("page_number"))
-            .and_then(|v| v.as_u64())
-            .and_then(|v| u32::try_from(v).ok());
-        let timestamp_start = meta
-            .and_then(|m| m.get("timestamp_start"))
-            .and_then(|v| v.as_f64());
-        let timestamp_end = meta
-            .and_then(|m| m.get("timestamp_end"))
-            .and_then(|v| v.as_f64());
-        let video_id = meta
-            .and_then(|m| m.get("video_id"))
-            .and_then(|v| v.as_str())
-            .map(String::from);
-        let citation_url = meta
-            .and_then(|m| m.get("citation_url"))
-            .and_then(|v| v.as_str())
-            .map(String::from);
-
-        citations.push(Citation {
-            source_id: chunk.source_id,
-            chunk_index: chunk.chunk_index,
-            text: truncate_text(&chunk.content, 200).into_owned(),
-            relevance_score: chunk.relevance_score,
-            section_header,
-            page_number,
-            timestamp_start,
-            timestamp_end,
-            video_id,
-            citation_url,
-        });
+        citations.push(Citation::new(
+            chunk.source_id,
+            chunk.chunk_index,
+            truncate_text(&chunk.content, 200).into_owned(),
+            chunk.relevance_score,
+            provenance,
+        ));
 
         tracing::debug!(
             citation_index = index,
@@ -115,10 +148,25 @@ pub fn extract_citations(response: &str, context_chunks: &[CitableChunk]) -> Vec
     tracing::info!(
         citations = citations.len(),
         markers = marker_count,
+        rejected,
         "Citation extraction complete"
     );
 
-    citations
+    ExtractedCitations {
+        citations,
+        rejected,
+    }
+}
+
+/// Whether a provider-native citation quotes a passage of the document it names.
+///
+/// The Anthropic Citations API returns the cited text verbatim, so a quote the
+/// document does not contain is a citation pointing at something that was never
+/// sent — the native equivalent of an out-of-range marker (US-019 AC-5).
+#[must_use]
+pub fn quote_belongs_to(document: &str, quoted: &str) -> bool {
+    let quoted = quoted.trim();
+    !quoted.is_empty() && document.contains(quoted)
 }
 
 /// Find byte ranges of code spans in a Markdown string.
@@ -217,6 +265,7 @@ mod tests {
     fn make_chunk(source_id: &str, content: &str) -> CitableChunk {
         CitableChunk {
             source_id: Uuid::parse_str(source_id).unwrap_or_else(|_| Uuid::new_v4()),
+            generation_id: Uuid::from_u128(7),
             chunk_index: 0,
             content: content.to_string(),
             relevance_score: 0.9,
@@ -303,6 +352,97 @@ mod tests {
             "Only [1] should produce a citation, [0] is invalid"
         );
         assert_eq!(citations[0].source_id, chunks[0].source_id);
+    }
+
+    #[test]
+    fn a_chunk_with_no_generation_cannot_be_cited() {
+        let mut chunk = make_chunk("00000000-0000-0000-0000-000000000001", "text");
+        chunk.generation_id = Uuid::nil();
+        let extracted = extract_citations_verified("Supported [1].", &[chunk]);
+        assert!(extracted.citations.is_empty());
+        assert_eq!(extracted.rejected, 1);
+    }
+
+    #[test]
+    fn refused_markers_are_counted_rather_than_ignored() {
+        let chunks = vec![make_chunk(
+            "00000000-0000-0000-0000-000000000001",
+            "only chunk",
+        )];
+        // A valid marker, an out-of-range one, a `[0]`, and one inside a fence.
+        let response = "True [1], also [9] and [0].\n```\narr[3]\n```";
+        let extracted = extract_citations_verified(response, &chunks);
+        assert_eq!(extracted.citations.len(), 1);
+        assert_eq!(extracted.rejected, 3);
+    }
+
+    #[test]
+    fn a_repeated_marker_is_not_a_rejection() {
+        let chunks = vec![make_chunk(
+            "00000000-0000-0000-0000-000000000001",
+            "only chunk",
+        )];
+        let extracted = extract_citations_verified("True [1] and again [1].", &chunks);
+        assert_eq!(extracted.citations.len(), 1);
+        assert_eq!(extracted.rejected, 0);
+    }
+
+    /// US-019 AC-3 asks resolution to verify span ownership. A row whose span
+    /// ends before it starts, or whose last page precedes its first, was not
+    /// written by the chunker, and nothing can be opened at it.
+    #[test]
+    fn a_chunk_whose_span_cannot_exist_is_not_citable() {
+        for broken in [
+            serde_json::json!({ "position": 0, "span_start": 900, "span_end": 100 }),
+            serde_json::json!({ "position": 0, "page_number": 7, "page_end": 3 }),
+            serde_json::json!({ "position": 0, "page_end": 3 }),
+        ] {
+            let mut chunk = make_chunk("00000000-0000-0000-0000-000000000001", "text");
+            chunk.metadata = Some(broken.clone());
+            let extracted = extract_citations_verified("Supported [1].", &[chunk]);
+            assert!(extracted.citations.is_empty(), "{broken}");
+            assert_eq!(extracted.rejected, 1, "{broken}");
+        }
+    }
+
+    #[test]
+    fn a_coherent_span_travels_into_the_citation_as_its_page() {
+        let mut chunk = make_chunk("00000000-0000-0000-0000-000000000001", "text");
+        chunk.metadata = Some(serde_json::json!({
+            "position": 3,
+            "page_number": 4,
+            "page_end": 5,
+            "span_start": 120,
+            "span_end": 480,
+            "section_header": "Retention",
+        }));
+        let extracted = extract_citations_verified("Supported [1].", &[chunk]);
+        assert_eq!(extracted.rejected, 0);
+        assert_eq!(extracted.citations[0].page_number, Some(4));
+        assert_eq!(
+            extracted.citations[0].section_header.as_deref(),
+            Some("Retention")
+        );
+    }
+
+    /// Legacy rows carry neither span nor page. They stay citable: US-019 adds
+    /// provenance, it does not retire the notebooks indexed before it.
+    #[test]
+    fn a_chunk_with_no_span_at_all_is_still_citable() {
+        let chunk = make_chunk("00000000-0000-0000-0000-000000000001", "text");
+        let extracted = extract_citations_verified("Supported [1].", &[chunk]);
+        assert_eq!(extracted.citations.len(), 1);
+        assert_eq!(extracted.rejected, 0);
+    }
+
+    #[test]
+    fn a_native_quote_must_be_a_passage_of_its_document() {
+        assert!(quote_belongs_to("the retry budget is four", "retry budget"));
+        assert!(!quote_belongs_to(
+            "the retry budget is four",
+            "retry budget is five"
+        ));
+        assert!(!quote_belongs_to("anything", "   "));
     }
 
     #[test]

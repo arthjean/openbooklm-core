@@ -25,7 +25,7 @@
 mod extraction;
 mod indexing;
 
-pub use extraction::merge_ocr_text;
+pub use extraction::merge_ocr_pages;
 pub(crate) use extraction::validate_pdf_magic_bytes;
 
 use sea_orm::DatabaseConnection;

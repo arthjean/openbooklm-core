@@ -1,11 +1,13 @@
-//! RAG chunking service for document processing.
+//! RAG chunking: text becomes parents, children, pages and spans.
 //!
-//! Handles document chunking for the RAG pipeline using text-splitter
-//! with tiktoken for accurate token counting.
+//! Two passes, using text-splitter with tiktoken for token counting. Pass one
+//! splits the source into parent passages, pass two splits each parent into the
+//! children that are embedded and retrieved. The parent is what the model reads,
+//! the child is what the citation points at.
 //!
-//! ## Parent-Child Chunk Sizes (small-to-big retrieval)
+//! ## Parent-child chunk sizes (small-to-big retrieval)
 //!
-//! | Type       | Parent (tokens) | Child (tokens) | Child Overlap |
+//! | Type       | Parent (tokens) | Child (tokens) | Child overlap |
 //! |------------|-----------------|----------------|---------------|
 //! | PDF        | 1024            | 256            | 25            |
 //! | Web        | 1024            | 256            | 25            |
@@ -13,20 +15,25 @@
 //! | Text       | 1024            | 256            | 25            |
 //! | DOCX/EPUB  | 2048 (section)  | 256            | 25            |
 //!
-//! ## Legacy Single-Level Sizes (fallback)
+//! ## Pages come from the extractor, not from a character count (US-019)
 //!
-//! | Type       | Tokens | Overlap |
-//! |------------|--------|---------|
-//! | PDF        | 512    | 50      |
-//! | Web        | 1024   | 100     |
-//! | Markdown   | 1500   | 150     |
-//! | Text       | 2048   | 200     |
-//! | DOCX/EPUB  | 1500   | 150     |
+//! A paginated source arrives as [`SourceText::paginated`], one string per
+//! authoritative page, and cleaning happens *per page* so that joining the
+//! cleaned pages yields both the text to split and the exact byte offset where
+//! each page starts. A chunk's page is then the page containing its first byte.
 //!
-//! ## Streaming Support
+//! This replaces a heuristic that divided a character offset by 3,000 and called
+//! the quotient a page number. On a source with short pages it drifted by a page
+//! every few pages, and a citation that opens the wrong page is worse than one
+//! that opens none: the reader checks the wrong paragraph and believes it.
 //!
-//! For large documents, use `ChunkIterator` or `chunk_content_batched`
-//! to avoid loading all chunks into memory at once.
+//! ## Spans are exact, and they are recorded before overlap matters
+//!
+//! Both passes ask the splitter for `chunk_indices`, so every parent and every
+//! child carries the byte range it occupies in the cleaned source text. Parents
+//! do not overlap, so their ranges partition the source; children overlap by
+//! design, and each still carries its own exact range rather than inheriting an
+//! approximate one.
 
 use text_splitter::{ChunkConfig, MarkdownSplitter, TextSplitter};
 
@@ -36,19 +43,6 @@ use crate::types::{ChunkMetadata, SourceType};
 // ============================================================================
 // Constants
 // ============================================================================
-
-/// Default batch size for streaming chunk processing.
-pub const DEFAULT_CHUNK_BATCH_SIZE: usize = 50;
-
-// Chunk parameters per source type (from CLAUDE.md)
-const PDF_CHUNK_SIZE: usize = 512;
-const PDF_OVERLAP: usize = 50;
-const WEB_CHUNK_SIZE: usize = 1024;
-const WEB_OVERLAP: usize = 100;
-const MARKDOWN_CHUNK_SIZE: usize = 1500;
-const MARKDOWN_OVERLAP: usize = 150;
-const TEXT_CHUNK_SIZE: usize = 2048;
-const TEXT_OVERLAP: usize = 200;
 
 // Parent chunk sizes for parent-child architecture
 const PARENT_PDF_CHUNK_SIZE: usize = 1024;
@@ -63,6 +57,12 @@ pub const CHILD_OVERLAP: usize = 25;
 /// Parent chunks do not overlap — overlap would embed cross-parent content in children.
 const PARENT_OVERLAP: usize = 0;
 
+/// Separator between authoritative pages in the joined source text.
+///
+/// Two blank lines, as before, so the splitter sees a paragraph boundary where a
+/// page ends.
+const PAGE_SEPARATOR: &str = "\n\n";
+
 // Compile-time invariant: every parent size must exceed CHILD_CHUNK_SIZE
 const _: () = assert!(PARENT_PDF_CHUNK_SIZE > CHILD_CHUNK_SIZE);
 const _: () = assert!(PARENT_WEB_CHUNK_SIZE > CHILD_CHUNK_SIZE);
@@ -70,58 +70,119 @@ const _: () = assert!(PARENT_MARKDOWN_CHUNK_SIZE > CHILD_CHUNK_SIZE);
 const _: () = assert!(PARENT_TEXT_CHUNK_SIZE > CHILD_CHUNK_SIZE);
 
 // ============================================================================
-// Types
+// Source text
 // ============================================================================
 
-/// Chunk configuration parameters for one splitting pass.
+/// The text to index, with its authoritative page boundaries when it has any.
 ///
-/// Parent-child chunking runs two passes, so it builds two of these; the parent
-/// geometry itself comes from [`parent_chunk_size`], which is its only
-/// definition.
-#[derive(Debug, Clone, Copy)]
-struct ChunkParams {
-    size: usize,
-    overlap: usize,
+/// A non-paginated source is one page. That is not a special case in the
+/// chunker: a single page produces a single page range covering the whole text,
+/// and nothing downstream branches on the distinction.
+#[derive(Debug, Clone)]
+pub struct SourceText {
+    pages: Vec<String>,
+    paginated: bool,
 }
 
-impl ChunkParams {
-    /// Legacy single-level chunk parameters (fallback when parent-child is disabled).
-    const fn for_source_type(source_type: SourceType) -> Self {
-        match source_type {
-            SourceType::Pdf => Self {
-                size: PDF_CHUNK_SIZE,
-                overlap: PDF_OVERLAP,
-            },
-            SourceType::Web => Self {
-                size: WEB_CHUNK_SIZE,
-                overlap: WEB_OVERLAP,
-            },
-            // DOCX/EPUB: use markdown-like params since we extract structured content
-            SourceType::Markdown | SourceType::Docx | SourceType::Epub => Self {
-                size: MARKDOWN_CHUNK_SIZE,
-                overlap: MARKDOWN_OVERLAP,
-            },
-            SourceType::Text => Self {
-                size: TEXT_CHUNK_SIZE,
-                overlap: TEXT_OVERLAP,
-            },
-            // YouTube: markdown-like params (transcript formatted as timestamped Markdown)
-            SourceType::Youtube => Self {
-                size: MARKDOWN_CHUNK_SIZE,
-                overlap: MARKDOWN_OVERLAP,
-            },
+impl SourceText {
+    /// Text with no page structure: web, text, Markdown, DOCX, EPUB, YouTube.
+    #[must_use]
+    pub fn single(text: impl Into<String>) -> Self {
+        Self {
+            pages: vec![text.into()],
+            paginated: false,
         }
     }
 
-    /// Child (retrieval) chunk parameters for small-to-big retrieval.
+    /// Text whose pages the extractor resolved, in order, page 1 first.
     ///
-    /// The same for every source type: only the parent geometry varies, and
-    /// that lives in [`parent_chunk_size`].
-    const fn child_params() -> Self {
+    /// Empty pages are kept: dropping one would shift every page number after
+    /// it, which is exactly the failure this type exists to prevent.
+    #[must_use]
+    pub fn paginated(pages: Vec<String>) -> Self {
         Self {
-            size: CHILD_CHUNK_SIZE,
-            overlap: CHILD_OVERLAP,
+            pages,
+            paginated: true,
         }
+    }
+
+    /// Number of pages the extractor reported.
+    #[must_use]
+    pub fn page_count(&self) -> usize {
+        self.pages.len()
+    }
+
+    /// The full text, pages joined, exactly as it is indexed.
+    ///
+    /// The only consumer is content-limit validation, which measures what the
+    /// user submitted rather than what survives cleaning.
+    #[must_use]
+    pub fn joined(&self) -> String {
+        self.pages.join(PAGE_SEPARATOR)
+    }
+}
+
+// ============================================================================
+// Layout: cleaned text plus page offsets
+// ============================================================================
+
+/// The cleaned text the splitter sees, and where each page begins in it.
+struct SourceLayout {
+    text: String,
+    /// Byte offset where page `i + 1` starts. Always starts with 0.
+    page_starts: Vec<usize>,
+    paginated: bool,
+}
+
+impl SourceLayout {
+    /// Clean each page, then join. Cleaning per page is what makes the offsets
+    /// exact: cleaning the joined text instead would move bytes the page map
+    /// had already been computed against.
+    fn build(source: &SourceText, source_type: SourceType) -> Self {
+        let markdown = uses_markdown_splitter(source_type);
+        let mut text = String::new();
+        let mut page_starts = Vec::with_capacity(source.pages.len());
+
+        for page in &source.pages {
+            let cleaned = if markdown {
+                clean_content_markdown(page)
+            } else {
+                clean_content(page)
+            };
+            if !text.is_empty() {
+                text.push_str(PAGE_SEPARATOR);
+            }
+            page_starts.push(text.len());
+            text.push_str(&cleaned);
+        }
+
+        Self {
+            text,
+            page_starts,
+            paginated: source.paginated,
+        }
+    }
+
+    /// The 1-based page containing `offset`, for a paginated source.
+    fn page_for(&self, offset: usize) -> Option<u32> {
+        if !self.paginated {
+            return None;
+        }
+        // The last page whose start is at or before the offset.
+        let index = self.page_starts.partition_point(|start| *start <= offset);
+        u32::try_from(index.max(1)).ok()
+    }
+
+    /// The pages a byte range covers, first and last.
+    ///
+    /// Both, because a range that crosses a page break covers both pages and
+    /// naming only the first is a claim the text does not support. `end` is
+    /// exclusive, so the last byte is what decides the final page.
+    fn pages_for(&self, start: usize, end: usize) -> (Option<u32>, Option<u32>) {
+        (
+            self.page_for(start),
+            self.page_for(end.saturating_sub(1).max(start)),
+        )
     }
 }
 
@@ -151,136 +212,74 @@ pub const fn parent_chunk_size(source_type: SourceType) -> usize {
     }
 }
 
-/// Chunk content based on source type.
-///
-/// Uses tiktoken-rs for accurate token counting (GPT-4 compatible).
-/// Markdown sources use [`MarkdownSplitter`] which respects headers,
-/// code blocks, and list boundaries.
-pub fn chunk_content(content: &str, source_type: SourceType) -> Result<Vec<String>, RagError> {
-    let params = ChunkParams::for_source_type(source_type);
-
-    let chunks = match source_type {
-        SourceType::Markdown | SourceType::Docx | SourceType::Epub | SourceType::Youtube => {
-            do_chunk_markdown(content, params)?
-        }
-        _ => do_chunk(content, params)?,
-    };
-
-    tracing::debug!(
-        source_type = ?source_type,
-        chunk_count = chunks.len(),
-        "Content chunked"
-    );
-
-    Ok(chunks)
+/// One retrieval unit: the text that is embedded, and where it came from.
+#[derive(Debug, Clone)]
+pub struct ChildChunk {
+    pub text: String,
+    /// Page, section header and exact byte span within the source text.
+    pub metadata: ChunkMetadata,
 }
 
-/// Chunk content with explicit parameters (for testing or custom use).
-pub fn chunk_content_with_params(
-    content: &str,
-    chunk_size: usize,
-    overlap: usize,
-) -> Result<Vec<String>, RagError> {
-    do_chunk(
-        content,
-        ChunkParams {
-            size: chunk_size,
-            overlap,
-        },
-    )
-}
-
-/// Chunk content and return batches for memory-efficient processing.
-///
-/// Useful when processing chunks in batches (e.g., for embedding API calls
-/// that have a maximum batch size).
-pub fn chunk_content_batched(
-    content: &str,
-    source_type: SourceType,
-    batch_size: usize,
-) -> Result<Vec<Vec<String>>, RagError> {
-    let chunks = chunk_content(content, source_type)?;
-
-    if chunks.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let batches: Vec<Vec<String>> = chunks.chunks(batch_size).map(<[String]>::to_vec).collect();
-
-    tracing::debug!(
-        source_type = ?source_type,
-        total_chunks = chunks.len(),
-        batch_count = batches.len(),
-        batch_size,
-        "Content batched"
-    );
-
-    Ok(batches)
-}
-
-/// Chunk content and extract structured metadata for each chunk.
-///
-/// Metadata includes:
-/// - `section_header`: Closest parent heading (for Markdown/structured docs)
-/// - `page_number`: Estimated page (for PDFs, ~3000 chars/page heuristic)
-/// - `position`: Sequential index within the source
-pub fn chunk_content_with_metadata(
-    content: &str,
-    source_type: SourceType,
-) -> Result<Vec<(String, ChunkMetadata)>, RagError> {
-    let chunks = chunk_content(content, source_type)?;
-    Ok(attach_metadata(content, chunks, source_type))
+/// One context unit: the passage the model reads, and its children.
+#[derive(Debug, Clone)]
+pub struct ParentChunk {
+    pub text: String,
+    pub children: Vec<ChildChunk>,
+    pub metadata: ChunkMetadata,
 }
 
 /// Two-pass parent-child chunking for small-to-big retrieval.
 ///
-/// Pass 1: Split content into parent chunks using larger sizes per source type.
-/// Pass 2: Split each parent into child chunks at [`CHILD_CHUNK_SIZE`] tokens
-/// with [`CHILD_OVERLAP`] token overlap.
+/// Pass 1 splits the cleaned source into parent chunks at the per-type parent
+/// size, with no overlap. Pass 2 splits each parent into children at
+/// [`CHILD_CHUNK_SIZE`] tokens with [`CHILD_OVERLAP`] token overlap.
 ///
-/// Returns `(parent_text, child_texts, parent_metadata)` tuples.
-/// If a parent fits within [`CHILD_CHUNK_SIZE`], it produces a single child
-/// equal to the cleaned parent text — no special handling is needed.
+/// Every returned chunk carries its exact byte span in the cleaned source text,
+/// and its page when the source is paginated.
 ///
-/// **Important:** Children are substrings of the *cleaned* parent text (after
-/// `clean_content`/`clean_content_markdown`), not of `parent_text` as returned.
-/// To verify containment, compare against `clean_content(parent_text)`.
-pub fn chunk_content_with_parents(
-    content: &str,
+/// # Errors
+/// Returns [`RagError::InvalidChunkConfig`] when a splitter configuration is
+/// rejected, which can only happen if the constants above are edited into an
+/// inconsistent state.
+pub fn chunk_source(
+    source: &SourceText,
     source_type: SourceType,
-) -> Result<Vec<(String, Vec<String>, ChunkMetadata)>, RagError> {
-    let parent_params = ChunkParams {
-        size: parent_chunk_size(source_type),
-        overlap: PARENT_OVERLAP,
-    };
-    let child_params = ChunkParams::child_params();
-
-    // Pass 1: Split into parent chunks
-    let parent_chunks = match source_type {
-        SourceType::Markdown | SourceType::Docx | SourceType::Epub | SourceType::Youtube => {
-            do_chunk_markdown(content, parent_params)?
-        }
-        _ => do_chunk(content, parent_params)?,
-    };
-
-    if parent_chunks.is_empty() {
+) -> Result<Vec<ParentChunk>, RagError> {
+    let layout = SourceLayout::build(source, source_type);
+    if layout.text.is_empty() {
         return Ok(Vec::new());
     }
 
-    // Attach metadata to parent chunks
-    let parents_with_meta = attach_metadata(content, parent_chunks, source_type);
+    let markdown = uses_markdown_splitter(source_type);
+    let parents = split_indices(
+        &layout.text,
+        parent_chunk_size(source_type),
+        PARENT_OVERLAP,
+        markdown,
+    )?;
 
-    // Pass 2: Split each parent into child chunks
-    let mut result = Vec::new();
+    let mut result = Vec::with_capacity(parents.len());
+    let mut headers = HeaderScanner::default();
     let mut skipped_parents = 0u32;
-    for (parent_text, parent_meta) in parents_with_meta {
-        let children = match source_type {
-            SourceType::Markdown | SourceType::Docx | SourceType::Epub | SourceType::Youtube => {
-                do_chunk_markdown(&parent_text, child_params)?
-            }
-            _ => do_chunk(&parent_text, child_params)?,
+
+    for (parent_offset, parent_text) in parents {
+        let section_header = headers.header_at(&layout.text, parent_offset, parent_text);
+        let parent_end = parent_offset + parent_text.len();
+        let (first_page, last_page) = layout.pages_for(parent_offset, parent_end);
+        let parent_meta = ChunkMetadata {
+            section_header: section_header.clone(),
+            page_number: first_page,
+            page_end: last_page,
+            position: u32::try_from(result.len()).unwrap_or(u32::MAX),
+            span_start: to_u32(parent_offset),
+            span_end: to_u32(parent_end),
+            ..ChunkMetadata::default()
         };
 
+        // The parent slice is already cleaned, so the child pass splits it as
+        // it stands: re-cleaning would shift the offsets the parent's own span
+        // was computed against.
+        let children = split_indices(parent_text, CHILD_CHUNK_SIZE, CHILD_OVERLAP, markdown)?;
         if children.is_empty() {
             tracing::warn!(
                 parent_len = parent_text.len(),
@@ -290,285 +289,136 @@ pub fn chunk_content_with_parents(
             continue;
         }
 
-        result.push((parent_text, children, parent_meta));
+        let children = children
+            .into_iter()
+            .map(|(child_offset, child_text)| {
+                let absolute = parent_offset + child_offset;
+                let (first, last) = layout.pages_for(absolute, absolute + child_text.len());
+                ChildChunk {
+                    text: child_text.to_owned(),
+                    metadata: ChunkMetadata {
+                        section_header: section_header.clone(),
+                        page_number: first,
+                        page_end: last,
+                        // Overwritten with the flat index when the pipeline
+                        // flattens the hierarchy; the parent-relative order is
+                        // what matters here.
+                        position: 0,
+                        span_start: to_u32(absolute),
+                        span_end: to_u32(absolute + child_text.len()),
+                        ..ChunkMetadata::default()
+                    },
+                }
+            })
+            .collect();
+
+        result.push(ParentChunk {
+            text: parent_text.to_owned(),
+            children,
+            metadata: parent_meta,
+        });
     }
 
     tracing::debug!(
         source_type = ?source_type,
         parent_count = result.len(),
         skipped_parents,
-        total_children = result.iter().map(|(_, c, _)| c.len()).sum::<usize>(),
+        pages = source.page_count(),
+        total_children = result.iter().map(|p| p.children.len()).sum::<usize>(),
         "Content chunked with parent-child hierarchy"
     );
 
     Ok(result)
 }
 
-/// Process content in streaming batches with a callback.
-///
-/// Most memory-efficient option for very large documents.
-/// Processes each batch immediately via the provided callback.
-///
-/// # Returns
-/// Total number of chunks processed, or first error encountered.
-pub fn process_chunks_streaming<F, E>(
-    content: &str,
-    source_type: SourceType,
-    batch_size: usize,
-    mut processor: F,
-) -> Result<usize, RagError>
-where
-    F: FnMut(Vec<String>, usize) -> Result<(), E>,
-    E: std::fmt::Display,
-{
-    let chunks = chunk_content(content, source_type)?;
-
-    if chunks.is_empty() {
-        return Ok(0);
-    }
-
-    let total = chunks.len();
-
-    for (batch_idx, batch) in chunks.chunks(batch_size).enumerate() {
-        processor(batch.to_vec(), batch_idx).map_err(|e| {
-            tracing::error!(batch_index = batch_idx, error = %e, "Batch processing failed");
-            RagError::ChunkingFailed {
-                reason: format!("Batch {batch_idx} failed: {e}"),
-            }
-        })?;
-    }
-
-    tracing::debug!(
-        source_type = ?source_type,
-        total_processed = total,
-        batch_count = total.div_ceil(batch_size),
-        "Streaming processing complete"
-    );
-
-    Ok(total)
-}
-
-// ============================================================================
-// Iterator
-// ============================================================================
-
-/// Yields chunks from a pre-computed vector. Useful for consuming chunks one
-/// at a time without exposing the internal `Vec`.
-///
-/// # Example
-/// ```ignore
-/// let iter = ChunkIterator::new(content, SourceType::Pdf)?;
-/// for chunk in iter {
-///     process_chunk(chunk);
-/// }
-/// ```
-pub struct ChunkIterator {
-    chunks: std::vec::IntoIter<String>,
-    total: usize,
-}
-
-impl ChunkIterator {
-    /// Create a new chunk iterator for the given content.
-    pub fn new(content: &str, source_type: SourceType) -> Result<Self, RagError> {
-        let chunks = chunk_content(content, source_type)?;
-        let total = chunks.len();
-        Ok(Self {
-            chunks: chunks.into_iter(),
-            total,
-        })
-    }
-
-    /// Get the total number of chunks.
-    #[must_use]
-    pub const fn total_chunks(&self) -> usize {
-        self.total
-    }
-}
-
-impl Iterator for ChunkIterator {
-    type Item = String;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.chunks.next()
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.chunks.size_hint()
-    }
-}
-
-impl ExactSizeIterator for ChunkIterator {}
-
 // ============================================================================
 // Internal helpers
 // ============================================================================
 
-/// Snap a byte offset to the nearest valid UTF-8 char boundary at or before `offset`.
-fn snap_to_char_boundary(s: &str, offset: usize) -> usize {
-    let offset = offset.min(s.len());
-    // Walk backwards (up to 4 bytes for the longest UTF-8 sequence) to find a char boundary.
-    let mut pos = offset;
-    while pos > 0 && !s.is_char_boundary(pos) {
-        pos -= 1;
-    }
-    pos
+const fn uses_markdown_splitter(source_type: SourceType) -> bool {
+    matches!(
+        source_type,
+        SourceType::Markdown | SourceType::Docx | SourceType::Epub | SourceType::Youtube
+    )
 }
 
-/// Attach positional metadata to chunks based on source type.
-///
-/// Shared helper used by both `chunk_content_with_metadata` (single-level)
-/// and `chunk_content_with_parents` (parent-level metadata).
-fn attach_metadata(
-    original_content: &str,
-    chunks: Vec<String>,
-    source_type: SourceType,
-) -> Vec<(String, ChunkMetadata)> {
-    match source_type {
-        SourceType::Markdown | SourceType::Docx | SourceType::Epub => {
-            let mut last_header: Option<String> = None;
-            let mut search_pos = 0usize;
-
-            chunks
-                .into_iter()
-                .enumerate()
-                .map(|(i, chunk)| {
-                    let safe_search_pos = snap_to_char_boundary(original_content, search_pos);
-                    if let Some(pos) = original_content[safe_search_pos..]
-                        .find(chunk.split('\n').next().unwrap_or(&chunk))
-                    {
-                        let abs_pos = safe_search_pos + pos;
-                        for line in original_content[safe_search_pos..abs_pos].lines() {
-                            let trimmed = line.trim();
-                            if trimmed.starts_with("# ")
-                                || trimmed.starts_with("## ")
-                                || trimmed.starts_with("### ")
-                                || trimmed.starts_with("#### ")
-                            {
-                                last_header =
-                                    Some(trimmed.trim_start_matches('#').trim().to_string());
-                            }
-                        }
-                        if let Some(first_line) = chunk.lines().next() {
-                            let trimmed = first_line.trim();
-                            if trimmed.starts_with("# ")
-                                || trimmed.starts_with("## ")
-                                || trimmed.starts_with("### ")
-                                || trimmed.starts_with("#### ")
-                            {
-                                last_header =
-                                    Some(trimmed.trim_start_matches('#').trim().to_string());
-                            }
-                        }
-                        // Advance past the matched first line (char-boundary safe)
-                        let first_line = chunk.split('\n').next().unwrap_or(&chunk);
-                        search_pos = abs_pos + first_line.len();
-                    }
-
-                    let meta = ChunkMetadata {
-                        section_header: last_header.clone(),
-                        position: u32::try_from(i).unwrap_or(u32::MAX),
-                        ..ChunkMetadata::default()
-                    };
-                    (chunk, meta)
-                })
-                .collect()
-        }
-        SourceType::Pdf => {
-            const CHARS_PER_PAGE: usize = 3000;
-            let mut char_offset = 0usize;
-
-            chunks
-                .into_iter()
-                .enumerate()
-                .map(|(i, chunk)| {
-                    let search_from = snap_to_char_boundary(original_content, char_offset);
-                    if let Some(pos) = original_content[search_from..]
-                        .find(chunk.split('\n').next().unwrap_or(&chunk))
-                    {
-                        char_offset = search_from + pos;
-                    }
-                    let page = u32::try_from(char_offset / CHARS_PER_PAGE)
-                        .unwrap_or(u32::MAX)
-                        .saturating_add(1);
-
-                    let meta = ChunkMetadata {
-                        page_number: Some(page),
-                        position: u32::try_from(i).unwrap_or(u32::MAX),
-                        ..ChunkMetadata::default()
-                    };
-                    char_offset =
-                        snap_to_char_boundary(original_content, char_offset + chunk.len());
-                    (chunk, meta)
-                })
-                .collect()
-        }
-        _ => chunks
-            .into_iter()
-            .enumerate()
-            .map(|(i, chunk)| {
-                let meta = ChunkMetadata {
-                    position: u32::try_from(i).unwrap_or(u32::MAX),
-                    ..ChunkMetadata::default()
-                };
-                (chunk, meta)
-            })
-            .collect(),
-    }
+fn to_u32(value: usize) -> Option<u32> {
+    u32::try_from(value).ok()
 }
 
-/// Markdown-aware chunking using [`MarkdownSplitter`].
-///
-/// Respects CommonMark structure: headers as section delimiters,
-/// code blocks kept intact, lists grouped when possible.
-fn do_chunk_markdown(content: &str, params: ChunkParams) -> Result<Vec<String>, RagError> {
-    let cleaned = clean_content_markdown(content);
-
-    if cleaned.is_empty() {
+/// Split already-cleaned text, returning each chunk with its byte offset.
+fn split_indices(
+    text: &str,
+    size: usize,
+    overlap: usize,
+    markdown: bool,
+) -> Result<Vec<(usize, &str)>, RagError> {
+    if text.is_empty() {
         return Ok(Vec::new());
     }
 
-    let config = ChunkConfig::new(params.size)
-        .with_overlap(params.overlap)
-        .map_err(|e| {
-            tracing::error!(chunk_size = params.size, overlap = params.overlap, error = %e, "Invalid markdown chunk config");
-            RagError::InvalidChunkConfig { chunk_size: params.size, overlap: params.overlap }
-        })?;
+    let config = ChunkConfig::new(size).with_overlap(overlap).map_err(|e| {
+        tracing::error!(chunk_size = size, overlap, error = %e, "Invalid chunk config");
+        RagError::InvalidChunkConfig {
+            chunk_size: size,
+            overlap,
+        }
+    })?;
 
-    let splitter = MarkdownSplitter::new(config);
-    Ok(splitter.chunks(&cleaned).map(String::from).collect())
+    Ok(if markdown {
+        MarkdownSplitter::new(config).chunk_indices(text).collect()
+    } else {
+        TextSplitter::new(config).chunk_indices(text).collect()
+    })
 }
 
-/// Core chunking logic.
-fn do_chunk(content: &str, params: ChunkParams) -> Result<Vec<String>, RagError> {
-    let cleaned = clean_content(content);
+/// The closest Markdown heading at or before a chunk, scanned once.
+///
+/// Parents arrive in document order, so the scan only ever moves forward.
+#[derive(Default)]
+struct HeaderScanner {
+    cursor: usize,
+    last: Option<String>,
+}
 
-    if cleaned.is_empty() {
-        return Ok(Vec::new());
+impl HeaderScanner {
+    fn header_at(&mut self, text: &str, offset: usize, chunk: &str) -> Option<String> {
+        if offset > self.cursor {
+            for line in text[self.cursor..offset].lines() {
+                if let Some(header) = heading_text(line) {
+                    self.last = Some(header);
+                }
+            }
+            self.cursor = offset;
+        }
+        // A chunk that opens with its own heading owns it.
+        if let Some(header) = chunk.lines().next().and_then(heading_text) {
+            self.last = Some(header);
+        }
+        self.last.clone()
     }
+}
 
-    let config = ChunkConfig::new(params.size)
-        .with_overlap(params.overlap)
-        .map_err(|e| {
-            tracing::error!(chunk_size = params.size, overlap = params.overlap, error = %e, "Invalid chunk config");
-            RagError::InvalidChunkConfig { chunk_size: params.size, overlap: params.overlap }
-        })?;
-
-    let splitter = TextSplitter::new(config);
-    Ok(splitter.chunks(&cleaned).map(String::from).collect())
+/// The text of a Markdown ATX heading line, levels 1 to 4.
+fn heading_text(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    let hashes = trimmed.len() - trimmed.trim_start_matches('#').len();
+    if (1..=4).contains(&hashes) && trimmed.as_bytes().get(hashes) == Some(&b' ') {
+        Some(trimmed[hashes..].trim().to_owned())
+    } else {
+        None
+    }
 }
 
 /// Clean Markdown content before chunking, preserving indentation.
 ///
-/// - Removes null bytes
+/// - Removes null bytes and page-break controls
 /// - Normalizes line endings
 /// - Collapses 3+ consecutive blank lines to 2
 /// - Strips trailing whitespace per line
 /// - PRESERVES leading whitespace (critical for code blocks)
 fn clean_content_markdown(content: &str) -> String {
-    let normalized = content
-        .replace('\0', "")
-        .replace("\r\n", "\n")
-        .replace('\r', "\n");
+    let normalized = normalize(content);
 
     let mut result = String::with_capacity(normalized.len());
     let mut consecutive_empty = 0u32;
@@ -594,15 +444,11 @@ fn clean_content_markdown(content: &str) -> String {
 
 /// Clean content before chunking.
 ///
-/// - Removes null bytes
+/// - Removes null bytes and page-break controls
 /// - Normalizes line endings
 /// - Collapses excessive whitespace while preserving paragraph structure
 fn clean_content(content: &str) -> String {
-    // Remove null bytes and normalize line endings
-    let normalized = content
-        .replace('\0', "")
-        .replace("\r\n", "\n")
-        .replace('\r', "\n");
+    let normalized = normalize(content);
 
     // Collapse consecutive empty lines into one
     let mut result = String::with_capacity(normalized.len());
@@ -627,6 +473,19 @@ fn clean_content(content: &str) -> String {
     result.trim().to_owned()
 }
 
+/// Strip control characters that would corrupt the text or the page map, and
+/// normalize line endings.
+///
+/// The form feed is removed rather than kept as whitespace: it is the page
+/// separator the OCR cache uses, and a stray one inside a page would split that
+/// page in two on the way back out.
+fn normalize(content: &str) -> String {
+    content
+        .replace(['\0', '\u{000C}'], "")
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -635,429 +494,298 @@ fn clean_content(content: &str) -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn chunk_params_for_types() {
-        // NOTE: These are legacy single-level sizes, only used by the fallback
-        // `chunk_content()` path. The active pipeline uses `chunk_content_with_parents()`
-        // which uses `parent_chunk_size()` and `child_params()` instead.
-        // For Text, the legacy size (2048) exceeds the parent-child parent size (1024)
-        // — this is intentional: the legacy path produced larger, single-level chunks
-        // while the new architecture uses smaller parents + even smaller children.
-        let pdf = ChunkParams::for_source_type(SourceType::Pdf);
-        assert_eq!(pdf.size, 512);
-        assert_eq!(pdf.overlap, 50);
-
-        let web = ChunkParams::for_source_type(SourceType::Web);
-        assert_eq!(web.size, 1024);
-        assert_eq!(web.overlap, 100);
-
-        let md = ChunkParams::for_source_type(SourceType::Markdown);
-        assert_eq!(md.size, 1500);
-        assert_eq!(md.overlap, 150);
-
-        let text = ChunkParams::for_source_type(SourceType::Text);
-        assert_eq!(text.size, 2048);
-        assert_eq!(text.overlap, 200);
-
-        let docx = ChunkParams::for_source_type(SourceType::Docx);
-        assert_eq!(docx.size, 1500);
-        assert_eq!(docx.overlap, 150);
-
-        let epub = ChunkParams::for_source_type(SourceType::Epub);
-        assert_eq!(epub.size, 1500);
-        assert_eq!(epub.overlap, 150);
+    fn parents(text: &str, source_type: SourceType) -> Vec<ParentChunk> {
+        chunk_source(&SourceText::single(text), source_type).expect("chunking succeeds")
     }
 
     #[test]
-    fn parent_child_params_for_types() {
-        // The child pass is identical for every source type; only the parent
-        // geometry varies, and `parent_chunk_size` is its only definition.
-        let child = ChunkParams::child_params();
-        assert_eq!(child.size, 256);
-        assert_eq!(child.overlap, 25);
-
+    fn parent_sizes_per_source_type() {
         assert_eq!(parent_chunk_size(SourceType::Pdf), 1024);
         assert_eq!(parent_chunk_size(SourceType::Web), 1024);
-        assert_eq!(parent_chunk_size(SourceType::Markdown), 2048);
         assert_eq!(parent_chunk_size(SourceType::Text), 1024);
+        assert_eq!(parent_chunk_size(SourceType::Markdown), 2048);
         assert_eq!(parent_chunk_size(SourceType::Docx), 2048);
         assert_eq!(parent_chunk_size(SourceType::Epub), 2048);
         assert_eq!(parent_chunk_size(SourceType::Youtube), 2048);
     }
 
     #[test]
-    fn clean_content_removes_nulls() {
-        let input = "hello\0world";
-        assert_eq!(clean_content(input), "helloworld");
-
-        let input_with_newline = "hello\0\nworld";
-        assert_eq!(clean_content(input_with_newline), "hello\nworld");
-    }
-
-    #[test]
-    fn clean_content_normalizes_line_endings() {
-        let input = "line1\r\nline2\rline3";
-        assert_eq!(clean_content(input), "line1\nline2\nline3");
-    }
-
-    #[test]
-    fn clean_content_collapses_empty_lines() {
-        let input = "para1\n\n\n\npara2";
-        assert_eq!(clean_content(input), "para1\npara2");
-    }
-
-    #[test]
-    fn chunk_empty_content() {
-        let result = chunk_content("", SourceType::Text).unwrap();
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn chunk_iterator_count() {
-        let content = "word ".repeat(100);
-        let iter = ChunkIterator::new(&content, SourceType::Text).unwrap();
-        assert_eq!(iter.len(), iter.total_chunks());
-    }
-
-    #[test]
-    fn chunk_batched() {
-        let content = "word ".repeat(1000);
-        let batches = chunk_content_batched(&content, SourceType::Text, 2).unwrap();
-
-        // All batches except possibly the last should have batch_size elements
-        for batch in batches.iter().take(batches.len().saturating_sub(1)) {
-            assert_eq!(batch.len(), 2);
-        }
-    }
-
-    #[test]
-    fn markdown_chunks_at_header_boundaries() {
-        let content = format!(
-            "# Section One\n\n{}\n\n# Section Two\n\n{}",
-            "First section content. ".repeat(50),
-            "Second section content. ".repeat(50),
-        );
-
-        let chunks = chunk_content(&content, SourceType::Markdown).unwrap();
-        assert!(
-            chunks.len() >= 2,
-            "Should produce at least 2 chunks for 2 sections"
-        );
-
-        // At least one chunk should start with a header
-        let has_header_chunk = chunks.iter().any(|c| c.trim_start().starts_with("# "));
-        assert!(
-            has_header_chunk,
-            "At least one chunk should preserve a Markdown header"
-        );
-    }
-
-    #[test]
-    fn markdown_preserves_code_blocks() {
-        let code_block = "```rust\nfn main() {\n    println!(\"Hello, world!\");\n}\n```";
-        // Pad with enough text to force chunking
-        let content = format!(
-            "# Introduction\n\n{}\n\n{code_block}\n\n# Conclusion\n\n{}",
-            "Intro text. ".repeat(80),
-            "Conclusion text. ".repeat(80),
-        );
-
-        let chunks = chunk_content(&content, SourceType::Markdown).unwrap();
-
-        // The code block should appear intact in one of the chunks
-        let code_preserved = chunks
-            .iter()
-            .any(|c| c.contains("fn main()") && c.contains("println!"));
-        assert!(
-            code_preserved,
-            "Code block should be preserved intact in a single chunk"
-        );
-    }
-
-    #[test]
-    fn chunk_with_metadata_markdown_headers() {
-        let content = format!(
-            "# Introduction\n\n{}\n\n## Methods\n\n{}\n\n### Sub-method\n\n{}",
-            "Intro paragraph content here. ".repeat(50),
-            "Methods section content here. ".repeat(50),
-            "Sub-method details here. ".repeat(50),
-        );
-
-        let result = chunk_content_with_metadata(&content, SourceType::Markdown).unwrap();
-        assert!(!result.is_empty());
-
-        // At least one chunk should have a section_header
-        let has_header = result.iter().any(|(_, meta)| meta.section_header.is_some());
-        assert!(
-            has_header,
-            "At least one chunk should have a section_header"
-        );
-
-        // All chunks should have sequential positions
-        for (i, (_, meta)) in result.iter().enumerate() {
-            assert_eq!(meta.position, i as u32);
-        }
-    }
-
-    #[test]
-    fn chunk_with_metadata_pdf_pages() {
-        // Create content that spans multiple "pages" (~3000 chars each)
-        let content = "A".repeat(9000); // ~3 pages
-
-        let result = chunk_content_with_metadata(&content, SourceType::Pdf).unwrap();
-        assert!(!result.is_empty());
-
-        // At least one chunk should have a page_number
-        let has_page = result.iter().any(|(_, meta)| meta.page_number.is_some());
-        assert!(has_page, "PDF chunks should have page_number");
-
-        // No chunk should have section_header for PDFs
-        let has_header = result.iter().any(|(_, meta)| meta.section_header.is_some());
-        assert!(!has_header, "PDF chunks should not have section_header");
-    }
-
-    #[test]
-    fn chunk_with_metadata_text_has_positions() {
-        let content = "word ".repeat(500);
-        let result = chunk_content_with_metadata(&content, SourceType::Text).unwrap();
-
-        for (i, (_, meta)) in result.iter().enumerate() {
-            assert_eq!(meta.position, i as u32);
-            assert!(meta.section_header.is_none());
-            assert!(meta.page_number.is_none());
-        }
-    }
-
-    #[test]
-    fn clean_content_markdown_preserves_indentation() {
-        let input = "# Code Example\n\n```python\ndef hello():\n    print(\"hello\")\n    if True:\n        return 42\n```\n\n\n\n\nMore text here.";
-        let cleaned = clean_content_markdown(input);
-        // Leading whitespace in code block must be preserved
-        assert!(
-            cleaned.contains("    print(\"hello\")"),
-            "4-space indentation must be preserved: {cleaned}"
-        );
-        assert!(
-            cleaned.contains("        return 42"),
-            "8-space indentation must be preserved: {cleaned}"
-        );
-        // 5 consecutive blank lines collapsed to 2
-        assert!(
-            !cleaned.contains("\n\n\n"),
-            "3+ blank lines should be collapsed to 2: {cleaned}"
-        );
-    }
-
-    #[test]
-    fn markdown_chunk_preserves_code_indentation() {
-        let content =
-            "# Example\n\n```rust\nfn main() {\n    let x = 42;\n    println!(\"{x}\");\n}\n```";
-        let chunks = chunk_content(content, SourceType::Markdown).unwrap();
-        let all = chunks.join("\n");
-        assert!(
-            all.contains("    let x = 42;"),
-            "Markdown chunking must preserve code indentation: {all}"
-        );
-    }
-
-    #[test]
-    fn markdown_uses_markdown_splitter() {
-        // Verify Markdown uses different chunking than plain text
-        let content = "# Header\n\nParagraph content here.";
-        let md_chunks = chunk_content(content, SourceType::Markdown).unwrap();
-        let text_chunks = chunk_content(content, SourceType::Text).unwrap();
-
-        // Both should produce at least 1 chunk for this small content
-        assert!(!md_chunks.is_empty());
-        assert!(!text_chunks.is_empty());
-    }
-
-    // ── Parent-child chunking tests ─────────────────────────────────────
-
-    #[test]
-    fn parent_child_3000_token_text_produces_hierarchy() {
-        // ~3000 tokens of text should produce multiple parents (at 1024 each)
-        // and multiple children (at 256 each) per parent
-        let content =
-            "The quick brown fox jumps over the lazy dog near the river bank. ".repeat(500);
-
-        let result = chunk_content_with_parents(&content, SourceType::Text).unwrap();
-
-        // Should produce multiple parents (3000 tokens / 1024 ≈ 3 parents)
-        assert!(
-            result.len() >= 2,
-            "3000-token text should produce at least 2 parents, got {}",
-            result.len()
-        );
-
-        // Each parent with enough content should have multiple children
-        let multi_child_parents = result
-            .iter()
-            .filter(|(_, children, _)| children.len() > 1)
-            .count();
-        assert!(
-            multi_child_parents >= 1,
-            "At least one parent should have multiple children"
-        );
-
-        // Verify structure: each tuple has (parent_text, children, metadata)
-        for (parent_text, children, meta) in &result {
-            assert!(!parent_text.is_empty(), "Parent text should not be empty");
-            assert!(!children.is_empty(), "Children should not be empty");
-            // Position should be sequential
-            assert!(meta.position < result.len() as u32);
-        }
-
-        // Total children should be more than total parents
-        let total_children: usize = result.iter().map(|(_, c, _)| c.len()).sum();
-        assert!(
-            total_children > result.len(),
-            "Total children ({total_children}) should exceed parent count ({})",
-            result.len()
-        );
-    }
-
-    #[test]
-    fn parent_child_children_are_substrings_of_parent() {
-        let content =
-            "This is a comprehensive document about software engineering practices. ".repeat(400);
-
-        let result = chunk_content_with_parents(&content, SourceType::Text).unwrap();
-        assert!(!result.is_empty());
-
-        for (parent_text, children, _) in &result {
-            // The cleaned parent text should contain each child
-            let cleaned_parent = clean_content(parent_text);
-            for child in children {
-                assert!(
-                    cleaned_parent.contains(child.as_str()),
-                    "Child should be a substring of its parent.\nChild: {}\nParent: {}",
-                    &child[..child.len().min(80)],
-                    &cleaned_parent[..cleaned_parent.len().min(200)]
-                );
-            }
-
-            // First child should start at the beginning of the parent
-            if let Some(first_child) = children.first() {
-                assert!(
-                    cleaned_parent
-                        .starts_with(first_child.split('\n').next().unwrap_or(first_child)),
-                    "First child should start at the beginning of the parent"
-                );
-            }
-
-            // Last child should end at the end of the parent
-            if let Some(last_child) = children.last() {
-                let last_line = last_child.split('\n').next_back().unwrap_or(last_child);
-                assert!(
-                    cleaned_parent.ends_with(last_line),
-                    "Last child should end at the end of the parent.\nLast child ends: {:?}\nParent ends: {:?}",
-                    &last_child[last_child.len().saturating_sub(60)..],
-                    &cleaned_parent[cleaned_parent.len().saturating_sub(60)..]
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn parent_child_small_parent_not_subsplit() {
-        // Content well under CHILD_CHUNK_SIZE (256 tokens) → should not be sub-split
-        let content = "Short text. ".repeat(15); // ~15 tokens, well under 256
-
-        let result = chunk_content_with_parents(&content, SourceType::Text).unwrap();
-        assert_eq!(result.len(), 1, "Small content should produce 1 parent");
-
-        let (parent_text, children, _) = &result[0];
-        assert_eq!(children.len(), 1, "Small parent should not be sub-split");
-        // The single child should be the cleaned version of the parent
-        let cleaned_parent = clean_content(parent_text);
+    fn clean_content_removes_control_characters() {
+        assert_eq!(clean_content("a\0b\u{000C}c"), "abc");
         assert_eq!(
-            children[0], cleaned_parent,
-            "Single child should equal cleaned parent text"
+            clean_content("line1\r\nline2\rline3"),
+            "line1\nline2\nline3"
         );
+        assert_eq!(clean_content("a\n\n\n\n\nb"), "a\nb");
     }
 
     #[test]
-    fn parent_child_empty_content() {
-        let result = chunk_content_with_parents("", SourceType::Text).unwrap();
-        assert!(result.is_empty());
+    fn empty_content_produces_no_chunks() {
+        assert!(parents("", SourceType::Text).is_empty());
+        assert!(parents("   \n\n  ", SourceType::Text).is_empty());
     }
 
     #[test]
-    fn parent_child_pdf_inherits_page_metadata() {
-        // Create content spanning multiple pages (~3000 chars per page)
-        let content = "A".repeat(9000);
-
-        let result = chunk_content_with_parents(&content, SourceType::Pdf).unwrap();
-        assert!(!result.is_empty());
-
-        // PDF parent metadata should have page numbers
-        let has_page = result.iter().any(|(_, _, meta)| meta.page_number.is_some());
-        assert!(has_page, "PDF parents should have page_number metadata");
+    fn markdown_keeps_code_block_indentation() {
+        let text = "# Example\n\n```rust\nfn main() {\n    let x = 42;\n}\n```";
+        let result = parents(text, SourceType::Markdown);
+        let joined: String = result.iter().map(|p| p.text.clone()).collect();
+        assert!(joined.contains("    let x = 42;"), "{joined}");
     }
 
+    // ====================================================================
+    // US-019: spans are exact
+    // ====================================================================
+
+    /// Every parent's recorded span is the slice it was cut from. This is the
+    /// property every citation ultimately rests on.
     #[test]
-    fn parent_child_markdown_inherits_section_header() {
-        let content = format!(
-            "# Introduction\n\n{}\n\n## Methods\n\n{}\n\n## Results\n\n{}",
-            "Introduction content with detailed text. ".repeat(100),
-            "Methods section describing approaches. ".repeat(100),
-            "Results section with findings. ".repeat(100),
-        );
+    fn every_parent_span_indexes_back_to_its_own_text() {
+        let text: String = (0..400)
+            .map(|i| format!("Sentence {i} about retention policy and retries. "))
+            .collect();
+        let source = SourceText::single(&text);
+        let layout = SourceLayout::build(&source, SourceType::Text);
+        let result = chunk_source(&source, SourceType::Text).expect("chunking");
 
-        let result = chunk_content_with_parents(&content, SourceType::Markdown).unwrap();
-        assert!(!result.is_empty());
-
-        // At least one parent should have section_header metadata
-        let has_header = result
-            .iter()
-            .any(|(_, _, meta)| meta.section_header.is_some());
-        assert!(
-            has_header,
-            "Markdown parents should have section_header metadata"
-        );
-    }
-
-    #[test]
-    fn parent_child_parent_sizes_correct() {
-        // Every parent must be strictly larger than a child, or the second pass
-        // could not split it.
-        for source_type in [
-            SourceType::Pdf,
-            SourceType::Web,
-            SourceType::Markdown,
-            SourceType::Text,
-            SourceType::Docx,
-            SourceType::Epub,
-            SourceType::Youtube,
-        ] {
-            assert!(
-                parent_chunk_size(source_type) > CHILD_CHUNK_SIZE,
-                "{source_type:?} parent is not larger than a child"
+        assert!(result.len() > 1, "the fixture must produce several parents");
+        for parent in &result {
+            let start = parent.metadata.span_start.expect("a parent has a span") as usize;
+            let end = parent.metadata.span_end.expect("a parent has a span") as usize;
+            assert_eq!(
+                &layout.text[start..end],
+                parent.text,
+                "the span must slice back to the parent"
             );
         }
     }
 
     #[test]
-    fn parent_child_web_type_produces_hierarchy() {
-        // Web source type uses the same non-markdown code path as Text/PDF
-        // but with its own parent size (1024). Verify it produces hierarchy.
-        let content =
-            "The quick brown fox jumps over the lazy dog near the river bank. ".repeat(500);
+    fn every_child_span_indexes_back_to_its_own_text() {
+        let text: String = (0..400)
+            .map(|i| format!("Sentence {i} about retention policy and retries. "))
+            .collect();
+        let source = SourceText::single(&text);
+        let layout = SourceLayout::build(&source, SourceType::Text);
+        let result = chunk_source(&source, SourceType::Text).expect("chunking");
 
-        let result = chunk_content_with_parents(&content, SourceType::Web).unwrap();
+        for parent in &result {
+            for child in &parent.children {
+                let start = child.metadata.span_start.expect("a child has a span") as usize;
+                let end = child.metadata.span_end.expect("a child has a span") as usize;
+                assert_eq!(&layout.text[start..end], child.text);
+                // And it lies inside its parent's range.
+                assert!(start >= parent.metadata.span_start.expect("parent span") as usize);
+                assert!(end <= parent.metadata.span_end.expect("parent span") as usize);
+            }
+        }
+    }
 
+    #[test]
+    fn parent_spans_do_not_overlap() {
+        let text: String = (0..400)
+            .map(|i| format!("Paragraph {i} discusses one topic in some detail. "))
+            .collect();
+        let result = parents(&text, SourceType::Text);
+        let mut previous_end = 0u32;
+        for parent in &result {
+            let start = parent.metadata.span_start.expect("span");
+            assert!(
+                start >= previous_end,
+                "parents must partition the source, got {start} after {previous_end}"
+            );
+            previous_end = parent.metadata.span_end.expect("span");
+        }
+    }
+
+    // ====================================================================
+    // US-019: pages come from the extractor
+    // ====================================================================
+
+    /// The defect this replaces: a page number computed as
+    /// `character_offset / 3000`. With short pages it is wrong from page two
+    /// onwards.
+    #[test]
+    fn a_chunk_reports_the_page_it_was_extracted_from() {
+        let pages = vec![
+            "ALPHA content on the first page. ".repeat(60),
+            "BRAVO content on the second page. ".repeat(60),
+            "CHARLIE content on the third page. ".repeat(60),
+        ];
+        let source = SourceText::paginated(pages);
+        let result = chunk_source(&source, SourceType::Pdf).expect("chunking");
+
+        for (needle, expected) in [("ALPHA", 1), ("BRAVO", 2), ("CHARLIE", 3)] {
+            // Every chunk that mentions the marker, so a chunk straddling a
+            // page break cannot make the assertion accidentally true.
+            let ranges: Vec<(u32, u32)> = result
+                .iter()
+                .flat_map(|p| p.children.iter())
+                .filter(|c| c.text.contains(needle))
+                .filter_map(|c| Some((c.metadata.page_number?, c.metadata.page_end?)))
+                .collect();
+            assert!(!ranges.is_empty(), "no chunk carried {needle}");
+            assert!(
+                ranges
+                    .iter()
+                    .all(|(first, last)| (*first..=*last).contains(&expected)),
+                "{needle} is on page {expected}, chunks reported {ranges:?}"
+            );
+        }
+    }
+
+    /// The page map itself, at the boundaries. A chunk that starts one byte
+    /// before a page break belongs to the page it started on.
+    #[test]
+    fn the_page_map_resolves_every_offset_to_its_own_page() {
+        let pages: Vec<String> = (1..=6).map(|i| format!("Page {i} body.")).collect();
+        let source = SourceText::paginated(pages);
+        let layout = SourceLayout::build(&source, SourceType::Pdf);
+
+        assert_eq!(layout.page_starts.len(), 6);
+        for (index, start) in layout.page_starts.iter().enumerate() {
+            let page = u32::try_from(index + 1).expect("page");
+            assert_eq!(layout.page_for(*start), Some(page), "at the page start");
+            assert_eq!(
+                layout.page_for(start + 1),
+                Some(page),
+                "one byte into the page"
+            );
+            if index > 0 {
+                assert_eq!(
+                    layout.page_for(start - 1),
+                    Some(page - 1),
+                    "one byte before the page start still belongs to the previous page"
+                );
+            }
+        }
+        assert_eq!(layout.page_for(layout.text.len()), Some(6));
+    }
+
+    /// A chunk that crosses a page break reports both pages rather than
+    /// claiming the one it happens to start on.
+    #[test]
+    fn a_range_that_crosses_a_break_reports_both_pages() {
+        let pages: Vec<String> = (1..=3).map(|i| format!("Page {i} body.")).collect();
+        let source = SourceText::paginated(pages);
+        let layout = SourceLayout::build(&source, SourceType::Pdf);
+
+        assert_eq!(layout.pages_for(0, layout.text.len()), (Some(1), Some(3)));
+        let second = layout.page_starts[1];
+        assert_eq!(layout.pages_for(second, second + 4), (Some(2), Some(2)));
+    }
+
+    /// An empty page still consumes its number in the map. Skipping it would
+    /// shift every page after it by one, which is how the old heuristic
+    /// drifted.
+    #[test]
+    fn an_empty_page_keeps_its_number_in_the_map() {
+        let pages = vec![
+            "First page text.".to_owned(),
+            String::new(),
+            "Third page text with MARKER.".to_owned(),
+        ];
+        let source = SourceText::paginated(pages);
+        let layout = SourceLayout::build(&source, SourceType::Pdf);
+        let marker = layout.text.find("MARKER").expect("marker present");
+        assert_eq!(layout.page_for(marker), Some(3));
+    }
+
+    #[test]
+    fn a_non_paginated_source_reports_no_page() {
+        let result = parents(&"Some text without pages. ".repeat(50), SourceType::Text);
         assert!(
-            result.len() >= 2,
-            "Web: 3000-token text should produce at least 2 parents, got {}",
-            result.len()
+            result.iter().all(|p| p.metadata.page_number.is_none()
+                && p.children.iter().all(|c| c.metadata.page_number.is_none())),
+            "a text source has no authoritative pages to report"
         );
+    }
 
-        let total_children: usize = result.iter().map(|(_, c, _)| c.len()).sum();
-        assert!(
-            total_children > result.len(),
-            "Web: total children ({total_children}) should exceed parent count ({})",
-            result.len()
+    // ====================================================================
+    // Section headers
+    // ====================================================================
+
+    #[test]
+    fn a_chunk_inherits_the_heading_above_it() {
+        let text = format!(
+            "# Introduction\n\n{}\n\n## Retention\n\n{}",
+            "Intro body sentence. ".repeat(200),
+            "Retention body sentence MARKER. ".repeat(200)
         );
+        let result = parents(&text, SourceType::Markdown);
+        let header = result
+            .iter()
+            .find(|p| p.text.contains("MARKER"))
+            .and_then(|p| p.metadata.section_header.clone())
+            .expect("a header");
+        assert_eq!(header, "Retention");
+    }
+
+    #[test]
+    fn children_inherit_their_parents_heading() {
+        let text = format!("## Policy\n\n{}", "Body sentence. ".repeat(300));
+        let result = parents(&text, SourceType::Markdown);
+        for parent in &result {
+            for child in &parent.children {
+                assert_eq!(
+                    child.metadata.section_header,
+                    parent.metadata.section_header
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn heading_text_accepts_only_atx_levels_one_to_four() {
+        assert_eq!(heading_text("# Title"), Some("Title".to_owned()));
+        assert_eq!(heading_text("#### Deep"), Some("Deep".to_owned()));
+        assert_eq!(heading_text("##### Too deep"), None);
+        assert_eq!(heading_text("#NoSpace"), None);
+        assert_eq!(heading_text("plain line"), None);
+    }
+
+    // ====================================================================
+    // Hierarchy shape
+    // ====================================================================
+
+    #[test]
+    fn a_large_source_produces_several_parents_each_with_several_children() {
+        let text: String = (0..500)
+            .map(|i| format!("Sentence number {i} discusses topic {}. ", i % 7))
+            .collect();
+        let result = parents(&text, SourceType::Text);
+
+        assert!(result.len() > 1);
+        assert!(result.iter().any(|p| p.children.len() > 1));
+        for parent in &result {
+            for child in &parent.children {
+                assert!(
+                    parent.text.contains(&child.text),
+                    "a child must be a substring of its parent"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_parent_smaller_than_a_child_is_not_subsplit() {
+        let result = parents("A short document.", SourceType::Text);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].children.len(), 1);
+        assert_eq!(result[0].children[0].text, "A short document.");
+    }
+
+    #[test]
+    fn parents_are_positioned_in_document_order() {
+        let text: String = (0..400)
+            .map(|i| format!("Line {i} of the body. "))
+            .collect();
+        let result = parents(&text, SourceType::Text);
+        for (i, parent) in result.iter().enumerate() {
+            assert_eq!(
+                parent.metadata.position,
+                u32::try_from(i).expect("position")
+            );
+        }
     }
 }

@@ -961,6 +961,7 @@ fn citation_extraction_baseline() {
     let chunks = vec![
         CitableChunk {
             source_id: uuid(SOURCE_ID),
+            generation_id: uuid(SOURCE_ID),
             chunk_index: 0,
             content: "The first synthetic passage.".into(),
             relevance_score: 0.91,
@@ -968,6 +969,7 @@ fn citation_extraction_baseline() {
         },
         CitableChunk {
             source_id: uuid(SOURCE_ID),
+            generation_id: uuid(SOURCE_ID),
             chunk_index: 1,
             content: "The second synthetic passage.".into(),
             relevance_score: 0.55,

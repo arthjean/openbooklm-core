@@ -22,6 +22,7 @@ use crate::entities::source::SourceStatus;
 use crate::error::AppError;
 use crate::repositories::ChunkRepository;
 use crate::services::ingestion_tasks::IngestionTasks;
+use crate::services::rag::chunking::ParentChunk;
 use crate::services::rag::provenance::ChunkingProvenance;
 use crate::services::sources::update_source_status;
 use crate::types::ChunkWithContext;
@@ -106,11 +107,12 @@ pub(super) async fn build_chunks(
 /// Two-pass chunking, flattened, with source-type-specific enrichment applied.
 fn chunk_and_enrich(extracted: &Extracted) -> Result<Vec<ChunkWithContext>, PipelineFailure> {
     // Pass 1 splits into parents, pass 2 into children. Children are the
-    // retrieval/embedding unit; parents provide LLM context.
+    // retrieval/embedding unit; parents provide LLM context. Both carry their
+    // page and their exact byte span (US-019).
     //
     // Contextualization (the former stage 3) is disabled to control cost. See
     // IMPORTANT_FUTUR.md at the repo root to re-enable it.
-    let parents = crate::services::rag::chunking::chunk_content_with_parents(
+    let parents = crate::services::rag::chunking::chunk_source(
         &extracted.text,
         extracted.chunking_source_type,
     )
@@ -400,12 +402,11 @@ fn split_reused(
 
 /// Flatten a parent/child chunk hierarchy into a flat `Vec<ChunkWithContext>`.
 ///
-/// Each child chunk gets a sequential global position and a reference to its
-/// parent text (for LLM context). Errors when the total exceeds [`MAX_CHUNKS`].
-fn flatten_parent_child_chunks(
-    parents: &[(String, Vec<String>, crate::types::ChunkMetadata)],
-) -> Result<Vec<ChunkWithContext>, AppError> {
-    let total_children: usize = parents.iter().map(|(_, children, _)| children.len()).sum();
+/// Each child keeps the page and span the chunker resolved for it, and gains
+/// its sequential position in the source. Errors when the total exceeds
+/// [`MAX_CHUNKS`].
+fn flatten_parent_child_chunks(parents: &[ParentChunk]) -> Result<Vec<ChunkWithContext>, AppError> {
+    let total_children: usize = parents.iter().map(|p| p.children.len()).sum();
     if total_children > MAX_CHUNKS {
         return Err(AppError::Validation(format!(
             "Document produced too many chunks ({total_children}), maximum is {MAX_CHUNKS}"
@@ -413,18 +414,16 @@ fn flatten_parent_child_chunks(
     }
 
     let mut chunks: Vec<ChunkWithContext> = Vec::with_capacity(total_children);
-    for (parent_text, children, parent_meta) in parents {
-        let shared_parent: Arc<str> = Arc::from(parent_text.as_str());
-        for child_text in children {
-            let content_hash = crate::services::rag::utils::compute_content_hash(child_text);
+    for parent in parents {
+        let shared_parent: Arc<str> = Arc::from(parent.text.as_str());
+        for child in &parent.children {
+            let content_hash = crate::services::rag::utils::compute_content_hash(&child.text);
             let metadata = crate::types::ChunkMetadata {
-                section_header: parent_meta.section_header.clone(),
-                page_number: parent_meta.page_number,
                 position: u32::try_from(chunks.len()).unwrap_or(u32::MAX),
-                ..crate::types::ChunkMetadata::default()
+                ..child.metadata.clone()
             };
             chunks.push(ChunkWithContext {
-                content: child_text.to_string(),
+                content: child.text.clone(),
                 context_prefix: None,
                 parent_content: Some(Arc::clone(&shared_parent)),
                 metadata,
@@ -468,18 +467,23 @@ mod tests {
     use super::*;
     use crate::types::SourceType;
 
+    fn chunked(content: &str, source_type: SourceType) -> Vec<ParentChunk> {
+        crate::services::rag::chunking::chunk_source(
+            &crate::services::rag::chunking::SourceText::single(content),
+            source_type,
+        )
+        .expect("chunking should work")
+    }
+
     #[test]
     fn parent_child_flattening_produces_correct_chunk_with_context() {
-        use crate::services::rag::chunking::chunk_content_with_parents;
-
         // Large enough to produce multiple parents and children.
         let content =
             "The quick brown fox jumps over the lazy dog near the river bank. ".repeat(500);
-        let parents =
-            chunk_content_with_parents(&content, SourceType::Text).expect("chunking should work");
+        let parents = chunked(&content, SourceType::Text);
         assert!(!parents.is_empty(), "Should produce at least one parent");
 
-        let total_children: usize = parents.iter().map(|(_, c, _)| c.len()).sum();
+        let total_children: usize = parents.iter().map(|p| p.children.len()).sum();
         let chunks = flatten_parent_child_chunks(&parents).expect("flattening should work");
 
         assert_eq!(chunks.len(), total_children);
@@ -508,10 +512,45 @@ mod tests {
         }
     }
 
+    /// Flattening renumbers positions and keeps everything else the chunker
+    /// resolved. A span rewritten on the way to storage would point a citation
+    /// at the wrong passage (US-019).
+    #[test]
+    fn flattening_preserves_the_span_the_chunker_resolved() {
+        let pages: Vec<String> = (1..=4)
+            .map(|i| format!("Page {i} body text about retention. ").repeat(30))
+            .collect();
+        let parents = crate::services::rag::chunking::chunk_source(
+            &crate::services::rag::chunking::SourceText::paginated(pages),
+            SourceType::Pdf,
+        )
+        .expect("chunking");
+
+        let expected: Vec<(Option<u32>, Option<u32>, Option<u32>)> = parents
+            .iter()
+            .flat_map(|p| p.children.iter())
+            .map(|c| {
+                (
+                    c.metadata.page_number,
+                    c.metadata.span_start,
+                    c.metadata.span_end,
+                )
+            })
+            .collect();
+
+        let chunks = flatten_parent_child_chunks(&parents).expect("flattening");
+        assert_eq!(chunks.len(), expected.len());
+        for (chunk, (page, start, end)) in chunks.iter().zip(expected) {
+            assert_eq!(chunk.metadata.page_number, page);
+            assert_eq!(chunk.metadata.span_start, start);
+            assert_eq!(chunk.metadata.span_end, end);
+            assert!(page.is_some(), "a PDF chunk reports its page");
+            assert!(start.is_some(), "a chunk reports its span");
+        }
+    }
+
     #[test]
     fn parent_child_flattening_child_content_differs_from_parent() {
-        use crate::services::rag::chunking::chunk_content_with_parents;
-
         // Varied content so overlap doesn't produce identical children.
         let content: String = (0..500)
             .map(|i| {
@@ -522,27 +561,25 @@ mod tests {
             })
             .collect();
 
-        let parents =
-            chunk_content_with_parents(&content, SourceType::Pdf).expect("chunking should work");
-
-        let (parent_text, children, _) = parents
+        let parents = chunked(&content, SourceType::Pdf);
+        let parent = parents
             .iter()
-            .find(|(_, children, _)| children.len() > 1)
+            .find(|p| p.children.len() > 1)
             .expect("Should have at least one parent with multiple children");
 
-        for child in children {
+        for child in &parent.children {
             assert!(
-                child.len() < parent_text.len(),
+                child.text.len() < parent.text.len(),
                 "Child ({} bytes) should be shorter than parent ({} bytes)",
-                child.len(),
-                parent_text.len()
+                child.text.len(),
+                parent.text.len()
             );
         }
 
-        for i in 0..children.len() {
-            for j in (i + 1)..children.len() {
+        for i in 0..parent.children.len() {
+            for j in (i + 1)..parent.children.len() {
                 assert_ne!(
-                    children[i], children[j],
+                    parent.children[i].text, parent.children[j].text,
                     "Children {i} and {j} should not be identical"
                 );
             }

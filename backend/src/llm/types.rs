@@ -244,6 +244,105 @@ pub struct Citation {
     pub citation_url: Option<String>,
 }
 
+impl Citation {
+    /// Assemble a citation from its anchor and the cited chunk's provenance.
+    ///
+    /// The one place the public citation shape is filled in, so the regex path
+    /// and the provider-native path cannot enrich a citation differently.
+    #[must_use]
+    pub fn new(
+        source_id: Uuid,
+        chunk_index: i32,
+        text: String,
+        relevance_score: f32,
+        provenance: ChunkProvenance,
+    ) -> Self {
+        Self {
+            source_id,
+            chunk_index,
+            text,
+            relevance_score,
+            section_header: provenance.section_header,
+            page_number: provenance.page_number,
+            timestamp_start: provenance.timestamp_start,
+            timestamp_end: provenance.timestamp_end,
+            video_id: provenance.video_id,
+            citation_url: provenance.citation_url,
+        }
+    }
+}
+
+/// The provenance a citation is built from, read once from a chunk's metadata.
+///
+/// Chunk metadata travels as JSON because it crosses the database, but
+/// [`ChunkMetadata`](crate::types::ChunkMetadata) is its type. Reading it here,
+/// typed and once, is what replaced the same six `get("…").and_then(as_str)`
+/// probes copied across the regex path, the native-citation path and the
+/// evidence renderer: adding a provenance field used to mean adding a seventh
+/// probe to each of the three.
+///
+/// Malformed or absent metadata yields an empty provenance rather than an
+/// error. A chunk whose extra fields cannot be parsed is still citable by
+/// `(source, chunk_index)`; what it loses is enrichment, not identity.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ChunkProvenance {
+    pub section_header: Option<String>,
+    pub page_number: Option<u32>,
+    /// Last page the chunk covers, when it runs past its first one (US-019).
+    pub page_end: Option<u32>,
+    /// Byte range within the source's extracted text. `None` on chunks written
+    /// before US-019.
+    pub span: Option<(u32, u32)>,
+    pub timestamp_start: Option<f64>,
+    pub timestamp_end: Option<f64>,
+    pub video_id: Option<String>,
+    pub citation_url: Option<String>,
+}
+
+impl ChunkProvenance {
+    /// Read provenance out of a chunk's stored metadata.
+    #[must_use]
+    pub fn read(metadata: Option<&serde_json::Value>) -> Self {
+        let Some(parsed) = metadata
+            .cloned()
+            .and_then(|value| serde_json::from_value::<crate::types::ChunkMetadata>(value).ok())
+        else {
+            return Self::default();
+        };
+
+        Self {
+            section_header: parsed.section_header,
+            page_number: parsed.page_number,
+            page_end: parsed.page_end,
+            span: parsed.span_start.zip(parsed.span_end),
+            timestamp_start: parsed.timestamp_start,
+            timestamp_end: parsed.timestamp_end,
+            video_id: parsed.video_id,
+            citation_url: parsed.citation_url,
+        }
+    }
+
+    /// Whether the recorded span and pages describe a passage that can exist.
+    ///
+    /// A span must be non-empty and end after it starts; a last page must not
+    /// precede the first. Both are written by the chunker in one pass, so a
+    /// violation means the row was not produced by it — a hand-edited index, a
+    /// truncated write, or a generation from another schema. US-019 AC-3 asks
+    /// citation resolution to verify span ownership, and this is the part of
+    /// that claim the stored provenance can actually answer.
+    #[must_use]
+    pub fn is_coherent(&self) -> bool {
+        let span_ok = self.span.is_none_or(|(start, end)| start < end);
+        let pages_ok = match (self.page_number, self.page_end) {
+            (Some(first), Some(last)) => first <= last,
+            // A last page with no first page is a page claim with no anchor.
+            (None, Some(_)) => false,
+            _ => true,
+        };
+        span_ok && pages_ok
+    }
+}
+
 /// Lightweight chunk type for citation extraction.
 ///
 /// Decouples the `llm` module from the services layer (`SearchResult`).
@@ -252,6 +351,13 @@ pub struct Citation {
 #[derive(Debug, Clone)]
 pub struct CitableChunk {
     pub source_id: Uuid,
+    /// The index generation this chunk was read from.
+    ///
+    /// Carried so citation resolution can refuse a chunk with no generation:
+    /// every retrieval path joins `sources.active_generation_id`, so a nil
+    /// generation here means the chunk did not come from a published index and
+    /// must not be presented as evidence (US-019 AC-3).
+    pub generation_id: Uuid,
     pub chunk_index: i32,
     pub content: String,
     pub relevance_score: f32,

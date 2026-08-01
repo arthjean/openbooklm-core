@@ -17,6 +17,7 @@ use crate::core::entitlements::{AuthorizationRequest, Operation, Permit};
 use crate::entities::source;
 use crate::error::AppError;
 use crate::services::ingestion_tasks::IngestionTasks;
+use crate::services::rag::chunking::SourceText;
 use crate::services::source_events::SourceEventBroadcaster;
 use crate::types::SourceType;
 
@@ -27,7 +28,9 @@ const PDF_MAGIC_BYTES: &[u8] = b"%PDF-";
 
 /// What extraction produces, whatever the source type was.
 pub(super) struct Extracted {
-    pub text: String,
+    /// The text to index, carrying its authoritative page boundaries when the
+    /// format has any (US-019).
+    pub text: SourceText,
     /// The type the content should be *chunked* as, which is not always the
     /// source's own: the PDF+OCR path produces Markdown and chunks accordingly.
     pub chunking_source_type: SourceType,
@@ -42,7 +45,14 @@ pub(super) struct Extracted {
 /// For each OCR page, replaces the corresponding native text segment with the
 /// OCR markdown. If an OCR page index exceeds the segment count, the segments
 /// vector is extended with empty strings to accommodate it.
-pub fn merge_ocr_text(page_segments: &[String], ocr_pages: &[crate::clients::OcrPage]) -> String {
+///
+/// Returns pages, not a joined string: the page a passage came from is the
+/// citation's anchor, and joining here is what used to destroy it before
+/// chunking could record it (US-019 AC-1).
+pub fn merge_ocr_pages(
+    page_segments: &[String],
+    ocr_pages: &[crate::clients::OcrPage],
+) -> Vec<String> {
     let mut segments: Vec<String> = page_segments.to_vec();
 
     for ocr_page in ocr_pages {
@@ -53,7 +63,50 @@ pub fn merge_ocr_text(page_segments: &[String], ocr_pages: &[crate::clients::Ocr
         segments[idx].clone_from(&ocr_page.markdown);
     }
 
-    segments.join("\n\n")
+    segments
+}
+
+/// Cache-payload schema, appended to the model key.
+///
+/// Entries written before US-019 hold one joined string with no page
+/// boundaries, and decoding one would report every passage as page 1 — the
+/// exact defect this story removes, made invisible by a cache hit. Versioning
+/// the key makes those entries unreachable instead: the affected documents are
+/// OCR'd once more, and their citations point at real pages afterwards.
+const OCR_CACHE_SCHEMA: &str = "pages-v1";
+
+/// The cache key for a model under the current payload schema.
+///
+/// `ocr_cache.model` is `VARCHAR(64)` and the suffix is 9 characters, so a model
+/// identifier up to 55 characters still fits. A longer one is rejected by the
+/// insert, which is a loud failure rather than a silent wrong-page citation.
+fn ocr_cache_key(model: &str) -> String {
+    format!("{model}#{OCR_CACHE_SCHEMA}")
+}
+
+/// Separator the OCR cache uses between pages.
+///
+/// A form feed is the ASCII page break, and [`crate::services::rag::chunking`]
+/// strips it from page text before indexing, so a page can never contain one
+/// and the round trip is exact. A cached entry written before US-019 has no
+/// form feed and decodes as a single page, which is what it was.
+const OCR_CACHE_PAGE_SEPARATOR: char = '\u{000C}';
+
+/// Encode OCR pages for the content-hash cache.
+fn encode_ocr_pages(pages: &[String]) -> String {
+    pages
+        .iter()
+        .map(|page| page.replace(OCR_CACHE_PAGE_SEPARATOR, ""))
+        .collect::<Vec<_>>()
+        .join(&OCR_CACHE_PAGE_SEPARATOR.to_string())
+}
+
+/// Decode a cached OCR payload back into pages.
+fn decode_ocr_pages(cached: &str) -> Vec<String> {
+    cached
+        .split(OCR_CACHE_PAGE_SEPARATOR)
+        .map(str::to_owned)
+        .collect()
 }
 
 /// Validate that decoded bytes start with the PDF magic header.
@@ -70,11 +123,15 @@ pub(crate) fn validate_pdf_magic_bytes(bytes: &[u8]) -> Result<(), AppError> {
 ///
 /// User-facing messages are kept generic to avoid information disclosure;
 /// exact values are logged at `warn!` for operator visibility.
-pub(super) fn validate_content_limits(content: &str, config: &CoreConfig) -> Result<(), AppError> {
+pub(super) fn validate_content_limits(
+    content: &SourceText,
+    config: &CoreConfig,
+) -> Result<(), AppError> {
+    let text = content.joined();
     let max_size = config.security.max_source_size_bytes;
-    if content.len() > max_size {
+    if text.len() > max_size {
         warn!(
-            content_bytes = content.len(),
+            content_bytes = text.len(),
             max_bytes = max_size,
             "Source content exceeds size limit"
         );
@@ -84,7 +141,7 @@ pub(super) fn validate_content_limits(content: &str, config: &CoreConfig) -> Res
     }
 
     let max_words = config.security.max_source_words;
-    let word_count = content.split_whitespace().count();
+    let word_count = text.split_whitespace().count();
     if word_count > max_words {
         warn!(word_count, max_words, "Source exceeds word count limit");
         return Err(AppError::Validation(
@@ -116,10 +173,10 @@ pub(super) async fn extract_content(
             Ok(Extracted::plain(text, source_type))
         }
         SourceType::Pdf => {
-            let (text, chunking_source_type, degraded_services) =
+            let (pages, chunking_source_type, degraded_services) =
                 extract_pdf(&source, deps, tasks, source_id, notebook_id, broadcaster).await?;
             Ok(Extracted {
-                text,
+                text: SourceText::paginated(pages),
                 chunking_source_type,
                 degraded_services,
                 youtube_video_id: None,
@@ -139,7 +196,7 @@ pub(super) async fn extract_content(
         SourceType::Youtube => {
             let (text, video_id) = extract_youtube(deps, source, source_id).await?;
             Ok(Extracted {
-                text,
+                text: SourceText::single(text),
                 chunking_source_type: source_type,
                 degraded_services: Vec::new(),
                 youtube_video_id: Some(video_id),
@@ -152,7 +209,7 @@ impl Extracted {
     /// Text chunked as its own source type, with nothing degraded.
     fn plain(text: String, source_type: SourceType) -> Self {
         Self {
-            text,
+            text: SourceText::single(text),
             chunking_source_type: source_type,
             degraded_services: Vec::new(),
             youtube_video_id: None,
@@ -305,7 +362,9 @@ async fn extract_youtube(
 
 /// Process a PDF source: decode, extract text, handle OCR fallback, merge results.
 ///
-/// Returns `(extracted_content, effective_chunking_source_type, degraded_services)`.
+/// Returns `(pages, effective_chunking_source_type, degraded_services)`. Pages
+/// stay separate all the way out: page 1 of a PDF is page 1 of every citation
+/// into it, and the only place that fact exists is here (US-019 AC-1).
 async fn extract_pdf(
     source: &source::Model,
     deps: &ProcessingDeps,
@@ -313,7 +372,7 @@ async fn extract_pdf(
     source_id: Uuid,
     notebook_id: Uuid,
     broadcaster: &SourceEventBroadcaster,
-) -> Result<(String, SourceType, Vec<&'static str>), PipelineFailure> {
+) -> Result<(Vec<String>, SourceType, Vec<&'static str>), PipelineFailure> {
     let config = &deps.config;
     let mut degraded_services: Vec<&str> = Vec::new();
     let mut chunking_source_type = SourceType::Pdf;
@@ -373,11 +432,11 @@ async fn extract_pdf(
     let ocr_pages =
         crate::services::processor::detect_ocr_pages(&page_segments, config.ocr.min_text_threshold);
 
-    let native_text = page_segments.join("\n\n");
+    let native_is_empty = page_segments.iter().all(|p| p.trim().is_empty());
 
-    let content = if ocr_pages.is_empty() && !full_doc_ocr {
+    let content: Vec<String> = if ocr_pages.is_empty() && !full_doc_ocr {
         // All pages have sufficient text — no OCR needed.
-        native_text
+        page_segments
     } else if let Some(ocr) = deps.ocr.as_ref() {
         // Pages need OCR and client is available.
         if full_doc_ocr {
@@ -435,7 +494,7 @@ async fn extract_pdf(
 
         match ocr_permit {
             Err(e) => {
-                if native_text.trim().is_empty() {
+                if native_is_empty {
                     let user_msg = match &e {
                         AppError::Forbidden(_) => e.to_string(),
                         _ => {
@@ -450,16 +509,16 @@ async fn extract_pdf(
                     "OCR limit exceeded — proceeding with partial text"
                 );
                 degraded_services.push("ocr");
-                native_text
+                page_segments
             }
             Ok(ocr_permit) => {
                 // ── OCR cache check ─────────────────────────────────────
                 let pdf_content_hash = crate::services::rag::utils::compute_bytes_hash(&pdf_bytes);
-                let ocr_model = &config.ocr.model;
+                let ocr_model = ocr_cache_key(&config.ocr.model);
 
                 let cache_result = deps
                     .ocr_cache
-                    .find_by_hash(&pdf_content_hash, ocr_model)
+                    .find_by_hash(&pdf_content_hash, &ocr_model)
                     .await;
 
                 if let Err(ref e) = cache_result {
@@ -480,7 +539,7 @@ async fn extract_pdf(
                     );
                     broadcaster.broadcast_ocr_cache_hit(notebook_id, source_id);
                     chunking_source_type = SourceType::Markdown;
-                    cached_text
+                    decode_ocr_pages(&cached_text)
                 } else {
                     // Cache miss — call OCR API.
                     let ocr_page_selection = if full_doc_ocr { None } else { Some(ocr_pages) };
@@ -533,23 +592,28 @@ async fn extract_pdf(
                         );
                     }
 
-                    let merged_text = if full_doc_ocr {
+                    let merged_pages = if full_doc_ocr {
                         ocr_result
                             .pages
                             .iter()
-                            .map(|p| p.markdown.as_str())
+                            .map(|p| p.markdown.clone())
                             .collect::<Vec<_>>()
-                            .join("\n\n")
                     } else {
-                        merge_ocr_text(&page_segments, &ocr_result.pages)
+                        merge_ocr_pages(&page_segments, &ocr_result.pages)
                     };
+                    let merged_len = merged_pages.iter().map(|p| p.trim().len()).sum::<usize>();
 
                     // Store in cache only if OCR produced meaningful output.
-                    let cache_worthy = pages_processed > 0 && merged_text.trim().len() >= 10;
+                    let cache_worthy = pages_processed > 0 && merged_len >= 10;
                     if cache_worthy {
                         if let Err(e) = deps
                             .ocr_cache
-                            .store(&pdf_content_hash, ocr_model, &merged_text, pages_processed)
+                            .store(
+                                &pdf_content_hash,
+                                &ocr_model,
+                                &encode_ocr_pages(&merged_pages),
+                                pages_processed,
+                            )
                             .await
                         {
                             warn!(
@@ -562,7 +626,7 @@ async fn extract_pdf(
                         warn!(
                             source_id = %source_id,
                             pages_processed,
-                            merged_text_len = merged_text.trim().len(),
+                            merged_text_len = merged_len,
                             "Skipping OCR cache store — result too small or empty"
                         );
                     }
@@ -583,13 +647,13 @@ async fn extract_pdf(
                     broadcaster.broadcast_ocr_completed(notebook_id, source_id, clamped_pages);
 
                     chunking_source_type = SourceType::Markdown;
-                    merged_text
+                    merged_pages
                 }
             }
         }
     } else {
         // OCR needed but client not available.
-        if native_text.trim().is_empty() {
+        if native_is_empty {
             let msg = "This PDF contains scanned pages that require OCR. \
                 Upgrade to Pro to process scanned documents.";
             return Err(PipelineFailure::new(msg, AppError::Validation(msg.into())));
@@ -601,7 +665,7 @@ async fn extract_pdf(
             "Proceeding with partial text — OCR not available for scanned pages"
         );
         degraded_services.push("ocr");
-        native_text
+        page_segments
     };
 
     Ok((content, chunking_source_type, degraded_services))
@@ -610,6 +674,43 @@ async fn extract_pdf(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_cache_key_is_versioned_and_fits_the_column() {
+        let key = ocr_cache_key("mistral-ocr-latest");
+        assert_eq!(key, "mistral-ocr-latest#pages-v1");
+        assert!(key.len() <= 64, "ocr_cache.model is VARCHAR(64)");
+        assert_ne!(
+            key, "mistral-ocr-latest",
+            "a pre-US-019 entry must not be reachable under the new key"
+        );
+    }
+
+    #[test]
+    fn ocr_pages_survive_the_cache_round_trip() {
+        let pages = vec![
+            "# Page one\n\nBody of the first page.".to_owned(),
+            String::new(),
+            "# Page three\n\nBody of the third page.".to_owned(),
+        ];
+        assert_eq!(decode_ocr_pages(&encode_ocr_pages(&pages)), pages);
+    }
+
+    #[test]
+    fn a_stray_page_break_inside_a_page_cannot_split_it() {
+        let pages = vec!["before\u{000C}after".to_owned(), "second".to_owned()];
+        let decoded = decode_ocr_pages(&encode_ocr_pages(&pages));
+        assert_eq!(decoded.len(), 2, "the payload still holds two pages");
+        assert_eq!(decoded[0], "beforeafter");
+    }
+
+    /// The suffix has to leave room for a real model identifier, or every OCR
+    /// cache write would fail on the column width instead of on the content.
+    #[test]
+    fn the_key_leaves_room_for_a_realistic_model_identifier() {
+        let longest_that_fits = "m".repeat(64 - "#pages-v1".len());
+        assert_eq!(ocr_cache_key(&longest_that_fits).len(), 64);
+    }
 
     #[test]
     fn validate_pdf_magic_bytes_accepts_valid_pdf() {

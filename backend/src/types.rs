@@ -352,6 +352,7 @@ impl From<&SearchResult> for crate::llm::types::CitableChunk {
     fn from(sr: &SearchResult) -> Self {
         Self {
             source_id: sr.source_id,
+            generation_id: sr.generation_id,
             chunk_index: sr.chunk_index,
             // Uses child content (not parent_content) intentionally: citations are
             // precise navigational anchors. The LLM receives parent_content via
@@ -373,10 +374,37 @@ pub struct ChunkMetadata {
     /// Closest parent header (for Markdown/structured docs).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub section_header: Option<String>,
-    /// Page number (for PDFs).
+    /// Authoritative page, for paginated sources (US-019).
+    ///
+    /// Resolved from the page boundaries the extractor preserved, never from a
+    /// character count. `None` means the source has no pages, not that the page
+    /// is unknown.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub page_number: Option<u32>,
+    /// Last page this chunk covers, when it runs past its first one.
+    ///
+    /// Equal to `page_number` for the ordinary case. A child chunk is a few
+    /// hundred tokens, so it straddles a page break only on sources with very
+    /// short pages — and when it does, reporting one page would be a claim the
+    /// text does not support.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_end: Option<u32>,
+    /// Byte offset where this chunk begins in the source's extracted text.
+    ///
+    /// `None` on chunks written before US-019; those still resolve by
+    /// `(source, chunk_index)` and simply carry no span.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub span_start: Option<u32>,
+    /// Byte offset just past this chunk's last byte.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub span_end: Option<u32>,
     /// Position index within the source document.
+    ///
+    /// Defaulted on read so that a metadata blob written by an older schema
+    /// still parses: [`ChunkProvenance`](crate::llm::types::ChunkProvenance)
+    /// reads this type whole, and one missing field must not cost a citation
+    /// its page and section header.
+    #[serde(default)]
     pub position: u32,
     /// Start timestamp in seconds (for YouTube sources).
     #[serde(skip_serializing_if = "Option::is_none")]

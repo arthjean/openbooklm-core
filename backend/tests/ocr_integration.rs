@@ -28,7 +28,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use openbooklm::clients::{MistralOcrClient, OcrPage, ProviderMetrics};
 use openbooklm::repositories::{OcrCacheRepository, RepoResult};
 use openbooklm::services::processor::{detect_ocr_pages, get_pdf_page_count};
-use openbooklm::services::source_processing::merge_ocr_text;
+use openbooklm::services::source_processing::merge_ocr_pages;
 
 // ============================================================================
 // Helpers: Minimal PDF generation (lopdf)
@@ -79,6 +79,69 @@ fn minimal_text_pdf(text: &str) -> Vec<u8> {
             "Type" => "Pages",
             "Kids" => vec![page_id.into()],
             "Count" => 1,
+        }),
+    );
+
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    bytes
+}
+
+/// Create a PDF whose page `i` carries `pages[i]` as its only text.
+///
+/// Used to prove that a chunk's reported page is the page the extractor read it
+/// from (US-019 AC-4), so each page's text has to be distinguishable.
+fn paged_text_pdf(pages: &[&str]) -> Vec<u8> {
+    use lopdf::{
+        Document, Object, Stream,
+        content::{Content, Operation},
+    };
+
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica",
+    });
+
+    let mut page_ids = Vec::new();
+    for text in pages {
+        let content = Content {
+            operations: vec![
+                Operation::new("BT", vec![]),
+                Operation::new("Tf", vec!["F1".into(), 12.into()]),
+                Operation::new("Td", vec![72.into(), 720.into()]),
+                Operation::new("Tj", vec![Object::string_literal(*text)]),
+                Operation::new("ET", vec![]),
+            ],
+        };
+        let content_id = doc.add_object(Stream::new(dictionary! {}, content.encode().unwrap()));
+        page_ids.push(doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 595.into(), 842.into()],
+            "Contents" => content_id,
+            "Resources" => dictionary! {
+                "Font" => dictionary! { "F1" => font_id }
+            },
+        }));
+    }
+
+    let count = page_ids.len() as i64;
+    let kids: Vec<Object> = page_ids.into_iter().map(Object::from).collect();
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => kids,
+            "Count" => count,
         }),
     );
 
@@ -470,6 +533,100 @@ fn pdf_page_count_multi_page() {
     assert_eq!(count, 4, "4-page PDF should have count 4");
 }
 
+/// A native PDF's reported pages are the fixture's actual pages (US-019 AC-4).
+///
+/// The whole chain, offline: a five-page PDF is extracted page by page, the
+/// pages reach the chunker as pages, and every chunk reports the page its text
+/// was printed on. The heuristic this replaces divided a character offset by
+/// 3,000, which put all five markers on page 1.
+#[test]
+fn native_pdf_chunks_report_the_page_they_were_printed_on() {
+    use openbooklm::services::processor::extract_pdf_text_by_pages;
+    use openbooklm::services::rag::chunking::{SourceText, chunk_source};
+    use openbooklm::types::SourceType;
+
+    let bodies: Vec<String> = (1..=5)
+        .map(|i| format!("MARKER{i} is the only marker printed on this page."))
+        .collect();
+    let refs: Vec<&str> = bodies.iter().map(String::as_str).collect();
+    let pdf = paged_text_pdf(&refs);
+
+    let extracted = extract_pdf_text_by_pages(&pdf).expect("extraction succeeds");
+    assert_eq!(extracted.len(), 5, "one segment per page");
+
+    let parents = chunk_source(&SourceText::paginated(extracted), SourceType::Pdf)
+        .expect("chunking succeeds");
+    let children: Vec<_> = parents.iter().flat_map(|p| p.children.iter()).collect();
+
+    for i in 1..=5u32 {
+        let marker = format!("MARKER{i}");
+        let ranges: Vec<(u32, u32)> = children
+            .iter()
+            .filter(|c| c.text.contains(&marker))
+            .filter_map(|c| Some((c.metadata.page_number?, c.metadata.page_end?)))
+            .collect();
+        assert!(!ranges.is_empty(), "no chunk carried {marker}");
+        assert!(
+            ranges
+                .iter()
+                .all(|(first, last)| (*first..=*last).contains(&i)),
+            "{marker} was printed on page {i}, chunks reported {ranges:?}"
+        );
+    }
+}
+
+/// OCR normalization keeps page identity: the merged pages stay pages, and a
+/// chunk of the OCR text reports the page the OCR provider gave it.
+#[test]
+fn ocr_pages_keep_their_provenance_through_chunking() {
+    use openbooklm::services::rag::chunking::{SourceText, chunk_source};
+    use openbooklm::types::SourceType;
+
+    // Pages 1 and 3 are scanned (empty native text), pages 0, 2, 4 are native.
+    let native: Vec<String> = vec![
+        "Native page zero content.".into(),
+        String::new(),
+        "Native page two content.".into(),
+        String::new(),
+        "Native page four content.".into(),
+    ];
+    let ocr = vec![
+        OcrPage {
+            index: 1,
+            markdown: "# OCRMARKER1\r\n\r\nScanned page one body.".to_string(),
+        },
+        OcrPage {
+            index: 3,
+            markdown: "# OCRMARKER3\r\n\r\nScanned page three body.".to_string(),
+        },
+    ];
+
+    let merged = merge_ocr_pages(&native, &ocr);
+    let parents = chunk_source(&SourceText::paginated(merged), SourceType::Markdown)
+        .expect("chunking succeeds");
+    let children: Vec<_> = parents.iter().flat_map(|p| p.children.iter()).collect();
+
+    // Line endings were normalized away; the page number was not.
+    for (marker, expected) in [("OCRMARKER1", 2u32), ("OCRMARKER3", 4)] {
+        let ranges: Vec<(u32, u32)> = children
+            .iter()
+            .filter(|c| c.text.contains(marker))
+            .filter_map(|c| Some((c.metadata.page_number?, c.metadata.page_end?)))
+            .collect();
+        assert!(!ranges.is_empty(), "no chunk carried {marker}");
+        assert!(
+            ranges
+                .iter()
+                .all(|(first, last)| (*first..=*last).contains(&expected)),
+            "{marker} belongs to page {expected}, chunks reported {ranges:?}"
+        );
+    }
+    assert!(
+        children.iter().all(|c| !c.text.contains('\r')),
+        "normalization must remove carriage returns"
+    );
+}
+
 /// Invalid bytes → page count defaults to 0 (graceful fallback).
 #[test]
 fn pdf_page_count_invalid_bytes() {
@@ -679,7 +836,7 @@ async fn ocr_cache_miss_calls_api_and_caches_result() {
 
 /// Mixed PDF: native text + OCR markdown merged by page index.
 #[test]
-fn merge_ocr_text_replaces_sparse_pages() {
+fn merge_ocr_pages_replaces_sparse_pages() {
     // Per-page segments: pages 0,2,4 have text; pages 1,3 are sparse (empty).
     let segments: Vec<String> = vec![
         "Page 0 text".into(),
@@ -700,24 +857,21 @@ fn merge_ocr_text_replaces_sparse_pages() {
         },
     ];
 
-    let merged = merge_ocr_text(&segments, &ocr_pages);
+    let merged = merge_ocr_pages(&segments, &ocr_pages);
 
-    assert!(merged.contains("Page 0 text"), "Native page 0 preserved");
-    assert!(
-        merged.contains("# OCR Page 1"),
-        "OCR replaced sparse page 1"
-    );
-    assert!(merged.contains("Page 2 text"), "Native page 2 preserved");
-    assert!(
-        merged.contains("# OCR Page 3"),
-        "OCR replaced sparse page 3"
-    );
-    assert!(merged.contains("Page 4 text"), "Native page 4 preserved");
+    // Page identity survives the merge: index i of the result is page i + 1 of
+    // the document, which is what a citation resolves against (US-019).
+    assert_eq!(merged.len(), 5);
+    assert_eq!(merged[0], "Page 0 text", "Native page 0 preserved");
+    assert_eq!(merged[1], "# OCR Page 1", "OCR replaced sparse page 1");
+    assert_eq!(merged[2], "Page 2 text", "Native page 2 preserved");
+    assert_eq!(merged[3], "# OCR Page 3", "OCR replaced sparse page 3");
+    assert_eq!(merged[4], "Page 4 text", "Native page 4 preserved");
 }
 
 /// Fully scanned PDF: all pages replaced by OCR.
 #[test]
-fn merge_ocr_text_replaces_all_empty_pages() {
+fn merge_ocr_pages_replaces_all_empty_pages() {
     let segments: Vec<String> = vec![String::new(); 3];
 
     let ocr_pages = vec![
@@ -735,37 +889,35 @@ fn merge_ocr_text_replaces_all_empty_pages() {
         },
     ];
 
-    let merged = merge_ocr_text(&segments, &ocr_pages);
+    let merged = merge_ocr_pages(&segments, &ocr_pages);
 
-    assert!(merged.contains("# Page 0"));
-    assert!(merged.contains("# Page 1"));
-    assert!(merged.contains("# Page 2"));
+    assert_eq!(merged, vec!["# Page 0", "# Page 1", "# Page 2"]);
 }
 
 /// OCR page index beyond segment count extends the segments vector.
 #[test]
-fn merge_ocr_text_extends_for_out_of_range_pages() {
+fn merge_ocr_pages_extends_for_out_of_range_pages() {
     let segments: Vec<String> = vec!["Page 0 text".into()];
     let ocr_pages = vec![OcrPage {
         index: 2,
         markdown: "# OCR Page 2".to_string(),
     }];
 
-    let merged = merge_ocr_text(&segments, &ocr_pages);
-    assert!(merged.contains("Page 0 text"), "Native text preserved");
-    assert!(
-        merged.contains("# OCR Page 2"),
+    let merged = merge_ocr_pages(&segments, &ocr_pages);
+    assert_eq!(merged.len(), 3, "the gap keeps its page number");
+    assert_eq!(merged[0], "Page 0 text", "Native text preserved");
+    assert_eq!(merged[1], "", "the skipped page still exists");
+    assert_eq!(
+        merged[2], "# OCR Page 2",
         "Out-of-range page extended into segments"
     );
 }
 
 /// No OCR pages → native text unchanged.
 #[test]
-fn merge_ocr_text_no_ocr_preserves_native() {
+fn merge_ocr_pages_no_ocr_preserves_native() {
     let segments: Vec<String> = vec!["Page 0".into(), "Page 1".into()];
-    let merged = merge_ocr_text(&segments, &[]);
-    assert!(merged.contains("Page 0"));
-    assert!(merged.contains("Page 1"));
+    assert_eq!(merge_ocr_pages(&segments, &[]), segments);
 }
 
 // ============================================================================

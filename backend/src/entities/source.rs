@@ -91,6 +91,9 @@ pub struct Model {
     /// Number of chunks created from this source
     pub chunk_count: i32,
 
+    /// Published index generation used by every retrieval and citation read.
+    pub active_generation_id: Option<Uuid>,
+
     /// Processing status: "pending" | "processing" | "contextualizing" | "embedding" | "ready" | "error"
     pub status: String,
 

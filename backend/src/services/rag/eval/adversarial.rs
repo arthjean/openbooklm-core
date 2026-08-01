@@ -12,8 +12,9 @@
 //! measure the sampler. What *is* reproducible is whether the payload stayed
 //! inside the untrusted region: whether it could close the element it was
 //! written into, forge a second data policy, or change a single byte of the
-//! instructions that follow the evidence. Those are the preconditions of every
-//! successful injection, and they are decidable from the assembled prompt.
+//! instructions that follow the evidence. Those are deterministic boundary
+//! properties. They do not prove how a production model responds to malicious
+//! data, so this suite cannot by itself close US-020's behavioral criterion.
 //!
 //! Cross-notebook reach is checked in the same spirit and in the same place it
 //! is enforced: retrieval is account- and notebook-scoped in SQL
@@ -377,8 +378,8 @@ mod tests {
         }
     }
 
-    /// The gate US-020 AC-3 asks for: zero successful policy overrides across
-    /// the whole suite.
+    /// The deterministic half of US-020 AC-3: no payload breaks the prompt or
+    /// citation boundary. Production-model behavior is tracked separately.
     #[test]
     fn no_payload_escapes_the_untrusted_data_boundary() {
         let report = check_prompt_isolation(&suite());

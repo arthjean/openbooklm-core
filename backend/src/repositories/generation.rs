@@ -51,6 +51,16 @@ const FIND_BUILDING_SQL: &str = r"
     WHERE source_id = $1 AND state = 'building'
 ";
 
+/// Freeze the generation before inspecting any child row. Chunk writers hold
+/// `FOR SHARE` on the same row, so this lock waits for every admitted batch and
+/// prevents every later batch from entering once publication changes state.
+const LOCK_FOR_PUBLICATION_SQL: &str = r"
+    SELECT id
+    FROM source_index_generations
+    WHERE id = $1 AND source_id = $2 AND state = 'building'
+    FOR UPDATE
+";
+
 const RECORD_BUILD_PLAN_SQL: &str = r"
     UPDATE source_index_generations
        SET expected_chunk_count = $2,
@@ -450,6 +460,20 @@ async fn publish_in_txn(
     expected_dimension: usize,
 ) -> Result<PublicationOutcome, AppError> {
     let dimension = i32::try_from(expected_dimension).unwrap_or(i32::MAX);
+
+    let locked = txn
+        .query_one(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            LOCK_FOR_PUBLICATION_SQL,
+            [generation_id.into(), source_id.into()],
+        ))
+        .await?;
+    if locked.is_none() {
+        return Err(vector_error(
+            source_id,
+            "generation is not owned by this source or is no longer building",
+        ));
+    }
 
     // ── Vector validation ────────────────────────────────────────────────
     let rows = txn

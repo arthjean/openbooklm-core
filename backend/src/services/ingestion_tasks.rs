@@ -225,15 +225,10 @@ mod tests {
         assert_eq!(report.drained, 1);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn work_ignoring_cancellation_is_reported_as_abandoned() {
         let tasks = IngestionTasks::new(CancellationToken::new());
-        // Deliberately ignores the token. The sleep is an hour so the outcome
-        // does not depend on how fast the machine is: any deadline below that
-        // produces the same report.
-        tasks.spawn(async {
-            tokio::time::sleep(Duration::from_secs(3600)).await;
-        });
+        tasks.spawn(std::future::pending::<()>());
 
         let report = tasks.shutdown(Duration::from_millis(50)).await;
         assert!(!report.within_deadline, "{report:?}");
@@ -270,17 +265,12 @@ mod tests {
     #[tokio::test]
     async fn blocking_work_still_running_is_reported_not_claimed_cancelled() {
         let tasks = IngestionTasks::new(CancellationToken::new());
-        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let gate = Arc::clone(&release);
+        let (release, gate) = std::sync::mpsc::channel();
 
         // A blocking closure nothing can abort. The handle is deliberately not
         // awaited before the drain: this is the shape a timeout produces when it
         // drops the future waiting on `spawn_blocking`.
-        let handle = tasks.spawn_blocking(move || {
-            while !gate.load(Ordering::SeqCst) {
-                std::thread::sleep(Duration::from_millis(1));
-            }
-        });
+        let handle = tasks.spawn_blocking(move || gate.recv());
         // No wait for the closure to start: the count is taken when the closure
         // is handed to the pool, so the drain cannot observe a false zero even
         // if the pool has not dispatched it yet.
@@ -292,8 +282,11 @@ mod tests {
         );
         assert!(!report.is_clean(), "{report:?}");
 
-        release.store(true, Ordering::SeqCst);
-        handle.await.expect("blocking closure");
+        release.send(()).expect("release blocking closure");
+        handle
+            .await
+            .expect("blocking closure")
+            .expect("release signal");
     }
 
     #[tokio::test]
@@ -315,22 +308,20 @@ mod tests {
     #[tokio::test]
     async fn a_blocking_closure_counts_from_the_moment_it_is_handed_over() {
         let tasks = IngestionTasks::new(CancellationToken::new());
-        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let gate = Arc::clone(&release);
+        let (release, gate) = std::sync::mpsc::channel();
 
-        let handle = tasks.spawn_blocking(move || {
-            while !gate.load(Ordering::SeqCst) {
-                std::thread::sleep(Duration::from_millis(1));
-            }
-        });
+        let handle = tasks.spawn_blocking(move || gate.recv());
         assert_eq!(
             tasks.blocking_in_flight.load(Ordering::SeqCst),
             1,
             "the count must be taken at hand-over, not at first instruction"
         );
 
-        release.store(true, Ordering::SeqCst);
-        handle.await.expect("blocking closure");
+        release.send(()).expect("release blocking closure");
+        handle
+            .await
+            .expect("blocking closure")
+            .expect("release signal");
         let report = tasks.shutdown(DRAIN_DEADLINE).await;
         assert!(report.is_clean(), "{report:?}");
     }

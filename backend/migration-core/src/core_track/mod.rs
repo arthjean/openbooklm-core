@@ -15,6 +15,7 @@
 
 mod m20260729_000001_core_baseline;
 mod m20260801_000001_index_generations;
+mod m20260801_000002_rag_log_redaction;
 
 use sea_orm_migration::prelude::*;
 use sea_orm_migration::sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
@@ -34,6 +35,7 @@ impl MigratorTrait for CoreMigrator {
         vec![
             Box::new(m20260729_000001_core_baseline::Migration),
             Box::new(m20260801_000001_index_generations::Migration),
+            Box::new(m20260801_000002_rag_log_redaction::Migration),
         ]
     }
 

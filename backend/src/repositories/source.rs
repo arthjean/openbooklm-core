@@ -59,6 +59,7 @@ impl SourceRepository for SeaOrmSourceRepository {
             content: Set(content),
             metadata: Set(metadata.unwrap_or_else(|| json!({}))),
             chunk_count: Set(0),
+            active_generation_id: Set(None),
             status: Set(SourceStatus::Pending.into()),
             error_message: Set(None),
             created_at: Set(Utc::now().into()),
@@ -70,6 +71,15 @@ impl SourceRepository for SeaOrmSourceRepository {
     #[tracing::instrument(skip(self), fields(%source_id))]
     async fn get_by_id(&self, source_id: Uuid) -> RepoResult<Option<source::Model>> {
         Ok(Source::find_by_id(source_id).one(&self.db).await?)
+    }
+
+    #[tracing::instrument(skip(self), fields(%source_id, %generation_id))]
+    async fn generation_is_active(&self, source_id: Uuid, generation_id: Uuid) -> RepoResult<bool> {
+        Ok(Source::find_by_id(source_id)
+            .filter(source::Column::ActiveGenerationId.eq(generation_id))
+            .one(&self.db)
+            .await?
+            .is_some())
     }
 
     #[tracing::instrument(skip(self), fields(%source_id, %user_id))]

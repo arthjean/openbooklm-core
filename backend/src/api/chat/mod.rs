@@ -5,6 +5,7 @@
 //! - Rate limiting per user plan
 //! - Paginated chat history
 
+mod citation_resolution;
 pub(crate) mod fallback;
 pub(crate) mod sse_helpers;
 pub(crate) mod streaming;

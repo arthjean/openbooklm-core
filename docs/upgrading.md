@@ -62,16 +62,19 @@ The command prints what it found and what to do.
 ### 3. Stop the server, upgrade, start it
 
 ```bash
+docker compose -f docker/docker-compose.yml down
 docker compose -f docker/docker-compose.yml pull
 docker compose -f docker/docker-compose.yml up -d
 ```
 
 The server validates the migration state and applies pending core migrations on
-start, under a Postgres advisory lock. Two instances started by a rolling
-deploy serialise; they do not race.
+start, under a Postgres advisory lock. All old instances must be stopped before
+the new binary starts. The index-generation migration changes the chunk writer
+protocol and does not support a rolling deployment from the previous release.
 
-To apply migrations separately — the right choice when you want the schema
-change and the code change to be distinct steps:
+Do not apply `m20260801_000001_index_generations` separately while an older
+server is live. For later migrations, the release notes state whether a
+separate schema-first step is supported.
 
 ```bash
 openbooklm-migrate up -u "$DATABASE_URL"
@@ -101,11 +104,11 @@ database.
 4. Start the previous version.
 5. Confirm with `openbooklm-migrate validate`.
 
-Because migrations are additive, the previous binary usually runs against the
-*upgraded* schema too — new columns are simply unread. That is the fast path
-when the problem is in the code rather than the data, and it avoids losing
-anything written since the upgrade. Try it before restoring, and check the
-release notes: a release that says otherwise means the fast path is closed.
+Do not try a binary-only rollback across
+`m20260801_000001_index_generations`. The previous binary does not know that
+migration and its chunk writer omits the now-required generation identifier.
+Restore the pre-upgrade dump. Later additive migrations may reopen a fast path;
+the release notes must say so explicitly.
 
 ## Configuration changes
 

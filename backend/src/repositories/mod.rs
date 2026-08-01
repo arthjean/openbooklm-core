@@ -22,8 +22,8 @@ mod traits;
 pub use traits::{
     AccountRepository, AccountSettingsRepository, ChatRepository, ChunkRepository,
     ChunkSearchResult, ChunkWithContext, DEFAULT_CHAT_HISTORY_LIMIT, GenerationRepository,
-    MAX_CHAT_HISTORY_LIMIT, MemoryRepository, MemorySearchResult, NoteRepository,
-    NotebookRepository, NotebookScope, NotebookWithSourceCount, OcrCacheRepository,
+    HybridChunkSearchResult, MAX_CHAT_HISTORY_LIMIT, MemoryRepository, MemorySearchResult,
+    NoteRepository, NotebookRepository, NotebookScope, NotebookWithSourceCount, OcrCacheRepository,
     PaginatedChatHistory, PublicationOutcome, RagLogRepository, RepoResult, SearchRepository,
     SourceRepository,
 };

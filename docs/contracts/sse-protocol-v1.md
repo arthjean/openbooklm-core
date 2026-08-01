@@ -38,7 +38,7 @@ disconnected client starts a new exchange.
 | `system` | `{type}` — `history_truncated {kept}`, `history_summarized {dropped_count}` | 0..n, before the first `chunk` |
 | `warning` | `{type}` — `low_retrieval_quality` | 0..1, before the first `chunk` |
 | `chunk` | `{text}` | 0..n, in order; concatenating them yields the answer |
-| `citation` | `{index, source_id}` | 0..n, interleaved with `chunk` as markers appear |
+| `citation` | `{index, source_id}` | 0..n, after the last `chunk`, only after generation, span and claim validation |
 | `citations` | `{citations[]}` | 0..1, after the last `chunk` |
 | `metrics` | `{context_relevance}` | 0..1, after `citations` |
 | `follow_up_suggestions` | `{suggestions[]}` | 0..1, **before** `done` |
@@ -99,6 +99,11 @@ disconnected client starts a new exchange.
   which it is populated are narrower.
 - `done.rag_log_id` is `null` for the same reason: with no retrieved context
   there is no RAG log row for feedback to reference. The key is always present.
+- `citation` events are delayed until generation completes. The server rereads
+  each source's active generation and validates span ownership plus linkage to
+  the immediately preceding claim before exposing the marker as a citation.
+  A marker can therefore appear in streamed text without receiving a
+  corresponding `citation` event when it is stale or unsupported.
 - `citation.index` is 1-based and refers to the `[N]` marker in the answer text.
   For providers with native citations the marker is injected by the server, so
   clients see the same markers either way.

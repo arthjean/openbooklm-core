@@ -374,6 +374,32 @@ async fn a_reader_sees_the_old_generation_until_publication_commits() {
     f.cleanup().await;
 }
 
+/// Publication is an immutability boundary, not merely a pointer update.
+#[tokio::test]
+#[ignore = "Requires PostgreSQL with pgvector (TEST_DATABASE_URL)"]
+async fn a_published_generation_rejects_every_late_chunk_write() {
+    let f = fixture_or_skip!();
+    let source_id = f.create_source("published immutability").await;
+    let generation_id = f
+        .publish_generation(source_id, "original", 2, &provenance("model-a"))
+        .await;
+    let before = f.active_contents("generation").await;
+    let (chunks, embeddings) = synthetic_chunks("mutated", 2);
+
+    let error = f
+        .chunks
+        .store_chunks(generation_id, source_id, &chunks, &embeddings)
+        .await
+        .expect_err("a published generation must reject a retry");
+
+    assert!(
+        error.to_string().contains("no longer building"),
+        "the rejection must name the immutable state: {error}"
+    );
+    assert_eq!(f.active_contents("generation").await, before);
+    f.cleanup().await;
+}
+
 /// A failure at the publication boundary leaves the previous generation active
 /// and the source's readiness untouched.
 #[tokio::test]
@@ -540,6 +566,50 @@ async fn deleting_a_source_reclaims_its_generations_and_chunks() {
         0
     );
 
+    f.cleanup().await;
+}
+
+/// The compatibility trigger makes raw telemetry structurally impossible even
+/// when an older binary still writes the legacy columns.
+#[tokio::test]
+#[ignore = "Requires PostgreSQL with pgvector (TEST_DATABASE_URL)"]
+async fn rag_log_legacy_writes_are_redacted_before_storage() {
+    let f = fixture_or_skip!();
+    let log_id = Uuid::new_v4();
+    exec(
+        &f.db,
+        "INSERT INTO rag_logs (
+             id, notebook_id, user_id, query, reformulated_query, hyde_document
+         ) VALUES ($1, $2, $3, 'raw question', 'raw reformulation', 'raw hyde')",
+        [log_id.into(), f.notebook_id.into(), f.account_id.into()],
+    )
+    .await;
+
+    let row =
+        f.db.query_one(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT query, reformulated_query, hyde_document, query_hash
+             FROM rag_logs WHERE id = $1",
+            [log_id.into()],
+        ))
+        .await
+        .expect("read redacted log")
+        .expect("log exists");
+    assert_eq!(row.try_get::<String>("", "query").expect("query"), "");
+    assert_eq!(
+        row.try_get::<Option<String>>("", "reformulated_query")
+            .expect("reformulated query"),
+        None
+    );
+    assert_eq!(
+        row.try_get::<Option<String>>("", "hyde_document")
+            .expect("HyDE document"),
+        None
+    );
+    assert_eq!(
+        row.try_get::<String>("", "query_hash").expect("query hash"),
+        ""
+    );
     f.cleanup().await;
 }
 

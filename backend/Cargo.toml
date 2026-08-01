@@ -131,4 +131,5 @@ moka = { version = "0.12", features = ["future"] }
 utoipa = { version = "5.5.0", features = ["axum_extras", "uuid", "chrono"] }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 wiremock = "0.6"

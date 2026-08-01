@@ -724,7 +724,10 @@ fn baseline_chat_sse_events() {
             "warning",
             ChatEvent::warning(WarningKind::LowRetrievalQuality),
         ),
-        ("citation", ChatEvent::citation(1, source_id)),
+        (
+            "citation_after_validation",
+            ChatEvent::citation(1, source_id),
+        ),
         (
             "citations",
             ChatEvent::citations(vec![Citation {

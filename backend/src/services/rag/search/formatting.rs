@@ -76,6 +76,7 @@ pub fn build_rag_documents(results: &[SearchResult]) -> Vec<RagDocument> {
         .iter()
         .map(|r| RagDocument {
             source_id: r.source_id,
+            generation_id: r.generation_id,
             title: r.source_title.clone(),
             content: evidence_body(r).trim().to_string(),
             chunk_index: r.chunk_index,

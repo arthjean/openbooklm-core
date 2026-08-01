@@ -93,8 +93,10 @@ Core REST and SSE surfaces are contracts, not implementation details.
 - Schema evolution is additive: expand, backfill, then contract in a later release.
 - Column and table removals are a separate, later change after at least one
   compatible release window.
-- A migration must be safe to run twice and safe to run while an older binary is
-  still serving traffic.
+- A migration must be safe to run twice. It must also be safe while an older
+  binary serves traffic unless its release notes declare a coordinated
+  stop-first maintenance window and backup-only rollback. Never describe such a
+  migration as rolling-compatible.
 
 ## Quality gates
 

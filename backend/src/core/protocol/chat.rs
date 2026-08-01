@@ -28,7 +28,7 @@ pub struct ChatChunk {
     pub text: String,
 }
 
-/// An inline `[N]` citation marker, emitted as soon as it appears in the text.
+/// An inline `[N]` citation marker, emitted after final evidence validation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ChatCitationRef {
     pub index: usize,

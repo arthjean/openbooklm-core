@@ -187,87 +187,13 @@ pub async fn semantic_search_with_hyde(
     request: &SearchRequest,
     embedder: &QueryEmbedder<'_>,
 ) -> Result<SearchOutcome, AppError> {
-    let QueryEmbedder {
-        provider: embeddings,
-        hyde,
-        cache: embedding_cache,
-        kind,
-    } = *embedder;
     let query = request.validated_query()?;
-
-    // --- Embed stage (with cache check) ---
-    let embed_start = std::time::Instant::now();
-
-    // The vector space this lookup belongs to. Without it a provider change
-    // would keep serving the previous model's vectors until the TTL expired
-    // (US-011).
-    let fingerprint = EmbeddingProvenance::from_provider(embeddings).fingerprint();
-
-    // A HyDE-enabled search embeds a generated document, not the query. Both
-    // are keyed by the query text but live in different namespaces, so the
-    // lookup asks for each in turn rather than accepting whichever is there.
-    let mut cached = None;
-    let mut cached_kind = kind;
-    if let Some(cache) = embedding_cache {
-        for candidate in lookup_kinds(kind, hyde.is_some()).into_iter().flatten() {
-            if let Some(embedding) = cache.get(candidate, &fingerprint, query).await {
-                cached = Some(embedding);
-                cached_kind = candidate;
-                break;
-            }
-        }
-    }
-    let cache_hit = cached.is_some();
-    tracing::debug!(
-        cache_hit,
-        kind = cached_kind.as_str(),
-        "Embedding cache lookup"
-    );
-
-    let query_embedding = if let Some(embedding) = cached {
-        embedding
-    } else {
-        let (embedding, stored_kind) = if let Some(hyde_svc) = hyde {
-            if let Some(hyde_result) = hyde_svc.generate(query).await {
-                tracing::debug!(
-                    notebook_id = %scope.notebook_id,
-                    query_hash = %query_hash(query),
-                    hyde_doc_len = hyde_result.document.len(),
-                    "Using HyDE-generated document for embedding"
-                );
-                (
-                    embeddings::embed_query(embeddings, &hyde_result.document).await?,
-                    QueryEmbeddingKind::HydeDocument,
-                )
-            } else {
-                (embeddings::embed_query(embeddings, query).await?, kind)
-            }
-        } else {
-            (embeddings::embed_query(embeddings, query).await?, kind)
-        };
-
-        // Insert into cache on miss, under the namespace of what was actually
-        // embedded — not of what the caller asked for.
-        if let Some(cache) = embedding_cache {
-            cache
-                .insert(stored_kind, &fingerprint, query, embedding.clone())
-                .await;
-        }
-
-        embedding
-    };
-
-    let embed_ms = if cache_hit {
-        0
-    } else {
-        embed_start.elapsed().as_millis()
-    };
-    tracing::info!(embed_ms, cache_hit, notebook_id = %scope.notebook_id, "Embedding completed");
+    let embedded = embed_query(scope, query, embedder).await?;
 
     // --- Search stage ---
     let search_start = std::time::Instant::now();
     let chunks = search_repo
-        .search_similar_chunks(scope, &query_embedding, request.clamped_limit())
+        .search_similar_chunks(scope, &embedded.vector, request.clamped_limit())
         .await?;
     let search_ms = search_start.elapsed().as_millis();
     tracing::info!(search_ms, notebook_id = %scope.notebook_id, "Dense search completed");
@@ -286,8 +212,8 @@ pub async fn semantic_search_with_hyde(
         notebook_id = %scope.notebook_id,
         query_hash = %query_hash(query),
         count = results.len(),
-        used_hyde = hyde.is_some(),
-        embed_ms,
+        used_hyde = embedder.hyde.is_some(),
+        embed_ms = embedded.elapsed_ms,
         search_ms,
         "Semantic search completed"
     );
@@ -295,11 +221,11 @@ pub async fn semantic_search_with_hyde(
     Ok(SearchOutcome {
         dense_candidates: results.len(),
         results,
-        embed_ms,
+        embed_ms: embedded.elapsed_ms,
         search_ms,
         dropped_non_finite,
         lexical_candidates: 0,
-        cache_hit,
+        cache_hit: embedded.cache_hit,
     })
 }
 
@@ -344,7 +270,8 @@ pub async fn lexical_search(
 
 /// Perform hybrid search combining dense and sparse retrieval.
 ///
-/// Executes both searches in parallel, then fuses results using RRF. The fused
+/// Executes both database searches in one repeatable-read snapshot, then fuses
+/// results using RRF. The fused
 /// scores are [`ScoreDomain::RrfRank`] values, which are not comparable with
 /// the dense similarities or lexical ranks they were derived from (US-012).
 #[tracing::instrument(skip(search_repo, config, request, embedder), fields(notebook_id = %scope.notebook_id))]
@@ -357,30 +284,27 @@ pub async fn hybrid_search(
 ) -> Result<SearchOutcome, AppError> {
     let query = request.validated_query()?;
 
-    // Both sub-searches use the same limit; RRF fusion deduplicates and re-scores
-    let dense_req = SearchRequest::new(query)
-        .with_limit(request.limit)
-        .with_mode(SearchMode::Dense);
-    let lexical_req = SearchRequest::new(query)
-        .with_limit(request.limit)
-        .with_mode(SearchMode::Lexical);
-
-    // Execute both searches in parallel (dense returns timing info)
-    let (dense_res, lexical_res) = tokio::join!(
-        semantic_search_with_hyde(search_repo, scope, &dense_req, embedder),
-        lexical_search(search_repo, scope, &lexical_req)
+    let embedded = embed_query(scope, query, embedder).await?;
+    let search_start = std::time::Instant::now();
+    let rows = search_repo
+        .search_hybrid_chunks(scope, &embedded.vector, query, request.clamped_limit())
+        .await?;
+    let search_ms = search_start.elapsed().as_millis();
+    let (dense_results, dense_dropped) = filter_and_convert(
+        rows.dense,
+        request.min_relevance,
+        ScoreDomain::DenseSimilarity,
     );
-
-    let dense = dense_res?;
-    let lexical = lexical_res.unwrap_or_else(|e| {
-        tracing::warn!(error = %e, "Lexical search failed, using dense-only");
-        SearchOutcome::default()
-    });
+    let (lexical_results, lexical_dropped) = filter_and_convert(
+        rows.lexical,
+        request.min_relevance,
+        ScoreDomain::LexicalRank,
+    );
 
     // Fuse results using RRF
     let fused = reciprocal_rank_fusion(
-        &dense.results,
-        &lexical.results,
+        &dense_results,
+        &lexical_results,
         config.rrf_k,
         config.dense_weight,
         config.sparse_weight,
@@ -399,28 +323,107 @@ pub async fn hybrid_search(
     tracing::debug!(
         notebook_id = %scope.notebook_id,
         query_hash = %query_hash(query),
-        dense = dense.results.len(),
-        lexical = lexical.results.len(),
+        dense = dense_results.len(),
+        lexical = lexical_results.len(),
         fused = results.len(),
-        embed_ms = dense.embed_ms,
-        search_ms = dense.search_ms,
+        embed_ms = embedded.elapsed_ms,
+        search_ms,
         "Hybrid search completed"
     );
 
     Ok(SearchOutcome {
         results,
-        embed_ms: dense.embed_ms,
-        search_ms: dense.search_ms.max(lexical.search_ms),
-        dropped_non_finite: dense.dropped_non_finite + lexical.dropped_non_finite,
-        dense_candidates: dense.results.len(),
-        lexical_candidates: lexical.results.len(),
-        cache_hit: dense.cache_hit,
+        embed_ms: embedded.elapsed_ms,
+        search_ms,
+        dropped_non_finite: dense_dropped + lexical_dropped,
+        dense_candidates: dense_results.len(),
+        lexical_candidates: lexical_results.len(),
+        cache_hit: embedded.cache_hit,
     })
 }
 
 // ============================================================================
 // Internal helpers
 // ============================================================================
+
+struct EmbeddedQuery {
+    vector: Vec<f32>,
+    elapsed_ms: u128,
+    cache_hit: bool,
+}
+
+async fn embed_query(
+    scope: NotebookScope,
+    query: &str,
+    embedder: &QueryEmbedder<'_>,
+) -> Result<EmbeddedQuery, AppError> {
+    let QueryEmbedder {
+        provider,
+        hyde,
+        cache,
+        kind,
+    } = *embedder;
+    let started = std::time::Instant::now();
+    let fingerprint = EmbeddingProvenance::from_provider(provider).fingerprint();
+
+    let mut cached = None;
+    let mut cached_kind = kind;
+    if let Some(cache) = cache {
+        for candidate in lookup_kinds(kind, hyde.is_some()).into_iter().flatten() {
+            if let Some(embedding) = cache.get(candidate, &fingerprint, query).await {
+                cached = Some(embedding);
+                cached_kind = candidate;
+                break;
+            }
+        }
+    }
+    let cache_hit = cached.is_some();
+    tracing::debug!(
+        cache_hit,
+        kind = cached_kind.as_str(),
+        "Embedding cache lookup"
+    );
+
+    let vector = if let Some(embedding) = cached {
+        embedding
+    } else {
+        let (embedding, stored_kind) = if let Some(hyde_service) = hyde {
+            if let Some(hyde_result) = hyde_service.generate(query).await {
+                tracing::debug!(
+                    notebook_id = %scope.notebook_id,
+                    query_hash = %query_hash(query),
+                    hyde_doc_len = hyde_result.document.len(),
+                    "Using HyDE-generated document for embedding"
+                );
+                (
+                    embeddings::embed_query(provider, &hyde_result.document).await?,
+                    QueryEmbeddingKind::HydeDocument,
+                )
+            } else {
+                (embeddings::embed_query(provider, query).await?, kind)
+            }
+        } else {
+            (embeddings::embed_query(provider, query).await?, kind)
+        };
+        if let Some(cache) = cache {
+            cache
+                .insert(stored_kind, &fingerprint, query, embedding.clone())
+                .await;
+        }
+        embedding
+    };
+    let elapsed_ms = if cache_hit {
+        0
+    } else {
+        started.elapsed().as_millis()
+    };
+    tracing::info!(elapsed_ms, cache_hit, notebook_id = %scope.notebook_id, "Embedding completed");
+    Ok(EmbeddedQuery {
+        vector,
+        elapsed_ms,
+        cache_hit,
+    })
+}
 
 /// Determine effective search mode based on config.
 const fn effective_mode(config: &HybridSearchConfig, requested: SearchMode) -> SearchMode {
@@ -441,7 +444,10 @@ const fn effective_mode(config: &HybridSearchConfig, requested: SearchMode) -> S
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::RetrievalScore;
+    use crate::core::providers::DeterministicEmbedder;
+    use crate::repositories::{HybridChunkSearchResult, RepoResult};
+    use crate::types::{ChunkSearchResult, RetrievalScore};
+    use async_trait::async_trait;
     use types::MAX_LIMIT;
     use uuid::Uuid;
 
@@ -458,6 +464,101 @@ mod tests {
             metadata: None,
             collapsed_children: Vec::new(),
         }
+    }
+
+    struct SnapshotRepo {
+        old_generation: Uuid,
+        new_generation: Uuid,
+    }
+
+    impl SnapshotRepo {
+        fn row(generation_id: Uuid, marker: &str) -> ChunkSearchResult {
+            ChunkSearchResult {
+                id: Uuid::new_v4(),
+                generation_id,
+                source_id: Uuid::from_u128(42),
+                chunk_index: 0,
+                content: marker.to_owned(),
+                parent_content: None,
+                source_title: "Source".to_owned(),
+                relevance_score: 0.9,
+                metadata: None,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl SearchRepository for SnapshotRepo {
+        async fn search_similar_chunks(
+            &self,
+            _scope: NotebookScope,
+            _query_embedding: &[f32],
+            _limit: i32,
+        ) -> RepoResult<Vec<ChunkSearchResult>> {
+            Ok(vec![Self::row(self.new_generation, "new dense")])
+        }
+
+        async fn search_lexical_chunks(
+            &self,
+            _scope: NotebookScope,
+            _query: &str,
+            _limit: i32,
+        ) -> RepoResult<Vec<ChunkSearchResult>> {
+            Ok(vec![Self::row(self.old_generation, "old lexical")])
+        }
+
+        async fn search_hybrid_chunks(
+            &self,
+            _scope: NotebookScope,
+            _query_embedding: &[f32],
+            _query: &str,
+            _limit: i32,
+        ) -> RepoResult<HybridChunkSearchResult> {
+            Ok(HybridChunkSearchResult {
+                dense: vec![Self::row(self.new_generation, "new dense")],
+                lexical: vec![Self::row(self.new_generation, "new lexical")],
+            })
+        }
+
+        async fn count_chunks_for_notebook(&self, _scope: NotebookScope) -> RepoResult<i64> {
+            Ok(2)
+        }
+
+        async fn get_all_chunks_for_notebook(
+            &self,
+            _scope: NotebookScope,
+        ) -> RepoResult<Vec<ChunkSearchResult>> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn hybrid_search_uses_one_repository_snapshot() {
+        let old_generation = Uuid::from_u128(1);
+        let new_generation = Uuid::from_u128(2);
+        let repo = SnapshotRepo {
+            old_generation,
+            new_generation,
+        };
+        let embedder = DeterministicEmbedder::new();
+        let outcome = hybrid_search(
+            &repo,
+            &HybridSearchConfig::default(),
+            NotebookScope::new(Uuid::new_v4(), Uuid::new_v4()),
+            &SearchRequest::new("generation").with_limit(10),
+            &QueryEmbedder::direct(&embedder),
+        )
+        .await
+        .expect("hybrid search");
+
+        assert_eq!(outcome.results.len(), 2);
+        assert!(
+            outcome
+                .results
+                .iter()
+                .all(|result| result.generation_id == new_generation),
+            "RRF must receive both branches from one generation snapshot"
+        );
     }
 
     #[test]

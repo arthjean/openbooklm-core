@@ -159,6 +159,14 @@ pub trait SourceRepository: Send + Sync {
 
     async fn get_by_id(&self, source_id: Uuid) -> RepoResult<Option<source::Model>>;
 
+    /// Linearization check used immediately before a citation is emitted.
+    async fn generation_is_active(&self, source_id: Uuid, generation_id: Uuid) -> RepoResult<bool> {
+        Ok(self
+            .get_by_id(source_id)
+            .await?
+            .is_some_and(|source| source.active_generation_id == Some(generation_id)))
+    }
+
     /// Returns error if source doesn't exist or user doesn't own it.
     async fn get_for_user(&self, source_id: Uuid, user_id: Uuid) -> RepoResult<source::Model>;
 
@@ -413,6 +421,17 @@ pub struct NotebookScope {
     pub notebook_id: Uuid,
 }
 
+/// Dense and lexical candidates read from one database snapshot.
+///
+/// Hybrid retrieval is one logical read. Returning both branches from one
+/// repository operation prevents a publication between two independent SQL
+/// statements from feeding different generations into RRF.
+#[derive(Debug, Default)]
+pub struct HybridChunkSearchResult {
+    pub dense: Vec<ChunkSearchResult>,
+    pub lexical: Vec<ChunkSearchResult>,
+}
+
 impl NotebookScope {
     #[must_use]
     pub const fn new(account_id: Uuid, notebook_id: Uuid) -> Self {
@@ -440,6 +459,26 @@ pub trait SearchRepository: Send + Sync {
         query: &str,
         limit: i32,
     ) -> RepoResult<Vec<ChunkSearchResult>>;
+
+    /// Owner-scoped dense and lexical search over one logical snapshot.
+    ///
+    /// In-memory repositories have no concurrent publication boundary, so the
+    /// default implementation composes their two deterministic reads. Database
+    /// implementations must override this with a shared repeatable-read
+    /// transaction.
+    async fn search_hybrid_chunks(
+        &self,
+        scope: NotebookScope,
+        query_embedding: &[f32],
+        query: &str,
+        limit: i32,
+    ) -> RepoResult<HybridChunkSearchResult> {
+        let dense = self
+            .search_similar_chunks(scope, query_embedding, limit)
+            .await?;
+        let lexical = self.search_lexical_chunks(scope, query, limit).await?;
+        Ok(HybridChunkSearchResult { dense, lexical })
+    }
 
     /// Count the owner's active-generation chunks in a notebook.
     ///

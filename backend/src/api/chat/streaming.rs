@@ -23,8 +23,7 @@ use crate::core::events::{DomainEvent, SharedEventSink};
 use crate::core::principal::Principal;
 use crate::core::protocol::{ChatEvent, ChatEventStream};
 use crate::error::AppError;
-use crate::llm::citations::{extract_citations, extract_citations_verified};
-use crate::llm::types::ChunkProvenance;
+use crate::llm::citations::extract_citations;
 use crate::llm::{CitableChunk, LlmProvider, LlmStreamEvent, TeachingMode};
 use crate::repositories::{ChatRepository, MemoryRepository, RagLogRepository, SourceRepository};
 use crate::services::chat::{CreateMessageParams, create_message};
@@ -32,13 +31,15 @@ use crate::services::memory::{
     MIN_DROPPED_FOR_SUMMARY, apply_memory_actions, decay_memories, extract_memories,
     store_conversation_summary, summarize_truncated_history,
 };
-use crate::services::rag::eval::trace::{ReasonCode, RetrievalTrace, StageDurations, TokenCounts};
+use crate::services::rag::eval::trace::{
+    ReasonCode, RetrievalTrace, StageDurations, TokenCounts, query_hash,
+};
 use crate::services::rag::rag_log::{ChunkLogEntry, RagLogEntry, create_rag_log};
 use crate::services::rag::search::{PipelineOutcome, mean_relevance};
 use crate::types::MemoryDecayTracker;
 use crate::types::SearchResult;
 
-use super::sse_helpers::detect_new_citations;
+use super::citation_resolution::{CitationResolution, resolve_citations};
 
 // ============================================================================
 // Constants
@@ -199,7 +200,6 @@ pub(super) async fn stream_llm_response(
 
     let mut full_response = String::new();
     let model_name = model.as_deref().unwrap_or_else(|| provider.default_model());
-    let mut sent_citation_indices = HashSet::new();
     let mut message_counted = false;
     let mut llm_ttft_ms: Option<u128> = None;
     // Accumulate native citations from `NativeCitation` stream events.
@@ -210,6 +210,7 @@ pub(super) async fn stream_llm_response(
     let mut doc_citation_map: std::collections::HashMap<usize, usize> =
         std::collections::HashMap::new();
     let mut processed_native_count: usize = 0;
+    let mut native_marker_starts: Vec<usize> = Vec::new();
 
     // Process stream with cancellation and shutdown support
     'stream: loop {
@@ -286,25 +287,11 @@ pub(super) async fn stream_llm_response(
 
                                         // Inject [N] marker into response text and stream it
                                         let marker_start = full_response.len();
+                                        native_marker_starts.push(marker_start);
                                         write!(full_response, " [{number}]").expect("write to String");
                                         out.emit(ChatEvent::chunk(&full_response[marker_start..])).await;
 
-                                        // Send incremental citation event
-                                        if let Some(doc) = rag_documents.get(nc.document_index) {
-                                            sent_citation_indices.insert(number);
-                                            out.emit(ChatEvent::citation(number, doc.source_id)).await;
-                                        }
-
                                         processed_native_count += 1;
-                                    }
-                                } else {
-                                    // Prompt-based citations: detect [N] patterns via regex
-                                    let new_citations = detect_new_citations(&full_response, &mut sent_citation_indices);
-                                    for citation_idx in new_citations {
-                                        // Citations are 1-indexed, so citation_idx - 1 is the array index
-                                        if let Some(chunk) = context_chunks.get(citation_idx.saturating_sub(1)) {
-                                            out.emit(ChatEvent::citation(citation_idx, chunk.source_id)).await;
-                                        }
                                     }
                                 }
                             }
@@ -333,12 +320,17 @@ pub(super) async fn stream_llm_response(
     // Extract citations: native (Anthropic Citations API) or regex-based [N] fallback.
     let resolved = resolve_citations(
         out,
-        uses_native_citations,
-        &native_citations,
-        &rag_documents,
-        &context_chunks,
-        &full_response,
-        notebook_id,
+        &CitationResolution {
+            uses_native_citations,
+            native_citations: &native_citations,
+            native_marker_starts: &native_marker_starts,
+            doc_citation_map: &doc_citation_map,
+            rag_documents: &rag_documents,
+            context_chunks: &context_chunks,
+            full_response: &full_response,
+            notebook_id,
+        },
+        source_repo.as_ref(),
     )
     .await;
     let citations = resolved.citations;
@@ -387,20 +379,20 @@ pub(super) async fn stream_llm_response(
         && let Some(mistral_client) = mistral.clone()
         && let Some(embedder) = embeddings
     {
-        spawn_memory_tasks(
+        spawn_memory_tasks(MemoryTaskContext {
             mistral_client,
             embedder,
-            memory_repo.clone(),
-            source_repo.clone(),
-            memory_decay_tracker.clone(),
+            memory_repo: memory_repo.clone(),
+            source_repo: source_repo.clone(),
+            memory_decay_tracker: memory_decay_tracker.clone(),
             notebook_id,
-            user_question.clone(),
-            full_response.clone(),
-            entitlements.clone(),
-            principal.clone(),
+            user_question: user_question.clone(),
+            full_response: full_response.clone(),
+            entitlements: entitlements.clone(),
+            principal: principal.clone(),
             dropped_messages,
             conversation_turn,
-        );
+        });
     }
 
     // Create RAG log entry linked to the saved message
@@ -409,9 +401,8 @@ pub(super) async fn stream_llm_response(
         let entry = RagLogEntry {
             notebook_id,
             user_id: principal.account_id,
-            query: user_question.clone(),
-            reformulated_query: None,
-            hyde_document: None,
+            query_hash: query_hash(&user_question),
+            reformulated_query_hash: reformulated_query.as_deref().map(query_hash),
             chunks_retrieved: context_chunks
                 .iter()
                 .map(|c| ChunkLogEntry {
@@ -580,110 +571,7 @@ pub(super) fn chat_error_type(error: &AppError) -> &'static str {
 // Extracted helpers for stream_llm_response
 // ============================================================================
 
-/// Resolve citations from native (Anthropic Citations API) or regex-based extraction.
-///
-/// Both paths emit a citation only for evidence that was retrieved this turn,
-/// and both count what they refuse (US-019 AC-5).
-async fn resolve_citations(
-    out: &ChatEventStream,
-    uses_native_citations: bool,
-    native_citations: &[crate::llm::NativeCitation],
-    rag_documents: &[crate::llm::RagDocument],
-    context_chunks: &[SearchResult],
-    full_response: &str,
-    notebook_id: Uuid,
-) -> crate::llm::citations::ExtractedCitations {
-    if uses_native_citations && !native_citations.is_empty() {
-        let mut seen_doc_indices = HashSet::new();
-        let mut rejected = 0usize;
-        let mapped: Vec<crate::llm::Citation> = native_citations
-            .iter()
-            .filter(|nc| seen_doc_indices.insert(nc.document_index))
-            .filter_map(|nc| {
-                // A document index the request never sent, or a quote the
-                // document does not contain, is a citation pointing at nothing.
-                let Some(doc) = rag_documents.get(nc.document_index) else {
-                    rejected += 1;
-                    tracing::warn!(
-                        %notebook_id,
-                        document_index = nc.document_index,
-                        available = rag_documents.len(),
-                        reason = ReasonCode::CitationRejected.as_str(),
-                        "Native citation names a document that was not sent"
-                    );
-                    return None;
-                };
-                if !crate::llm::citations::quote_belongs_to(&doc.content, &nc.cited_text) {
-                    rejected += 1;
-                    tracing::warn!(
-                        %notebook_id,
-                        document_index = nc.document_index,
-                        source_id = %doc.source_id,
-                        reason = ReasonCode::CitationRejected.as_str(),
-                        "Native citation quotes a span the document does not contain"
-                    );
-                    return None;
-                }
-                // The same span check the regex path applies: a chunk whose
-                // recorded passage cannot exist was not written by the chunker,
-                // and a citation into it opens nothing (US-019 AC-3).
-                let provenance = ChunkProvenance::read(doc.metadata.as_ref());
-                if !provenance.is_coherent() {
-                    rejected += 1;
-                    tracing::warn!(
-                        %notebook_id,
-                        document_index = nc.document_index,
-                        source_id = %doc.source_id,
-                        reason = ReasonCode::CitationRejected.as_str(),
-                        "Native citation resolves to a document with an incoherent span"
-                    );
-                    return None;
-                }
-
-                Some(crate::llm::Citation::new(
-                    doc.source_id,
-                    doc.chunk_index,
-                    crate::llm::citations::truncate_text(&nc.cited_text, 200).into_owned(),
-                    doc.relevance_score,
-                    provenance,
-                ))
-            })
-            .collect();
-
-        for (i, citation) in mapped.iter().enumerate() {
-            out.emit(ChatEvent::citation(i + 1, citation.source_id))
-                .await;
-        }
-
-        tracing::info!(
-            %notebook_id,
-            native_count = native_citations.len(),
-            deduped = mapped.len(),
-            rejected,
-            "Native citation mapping completed (Anthropic Citations API)"
-        );
-        crate::llm::citations::ExtractedCitations {
-            citations: mapped,
-            rejected,
-        }
-    } else {
-        let citable: Vec<CitableChunk> = context_chunks.iter().map(CitableChunk::from).collect();
-        let extracted = extract_citations_verified(full_response, &citable);
-        tracing::info!(
-            %notebook_id,
-            context_chunks = context_chunks.len(),
-            citations = extracted.citations.len(),
-            rejected = extracted.rejected,
-            response_len = full_response.len(),
-            "Regex citation extraction completed"
-        );
-        extracted
-    }
-}
-
-/// Spawn fire-and-forget tasks for memory extraction + conversation summarization.
-#[allow(clippy::too_many_arguments)]
-fn spawn_memory_tasks(
+struct MemoryTaskContext {
     mistral_client: MistralClient,
     embedder: crate::core::providers::SharedEmbeddingProvider,
     memory_repo: Arc<dyn MemoryRepository>,
@@ -696,7 +584,24 @@ fn spawn_memory_tasks(
     principal: Principal,
     dropped_messages: Vec<crate::llm::LlmMessage>,
     conversation_turn: usize,
-) {
+}
+
+/// Spawn fire-and-forget tasks for memory extraction + conversation summarization.
+fn spawn_memory_tasks(ctx: MemoryTaskContext) {
+    let MemoryTaskContext {
+        mistral_client,
+        embedder,
+        memory_repo,
+        source_repo,
+        memory_decay_tracker,
+        notebook_id,
+        user_question,
+        full_response,
+        entitlements,
+        principal,
+        dropped_messages,
+        conversation_turn,
+    } = ctx;
     // Spawn memory extraction + temporal decay
     let mem_repo = memory_repo.clone();
     let mem_source_repo = source_repo;
@@ -1790,9 +1695,8 @@ mod tests {
         RagLogEntry {
             notebook_id: Uuid::new_v4(),
             user_id: Uuid::new_v4(),
-            query: "what is the retry budget".to_owned(),
-            reformulated_query: None,
-            hyde_document: None,
+            query_hash: query_hash("what is the retry budget"),
+            reformulated_query_hash: None,
             chunks_retrieved: vec![ChunkLogEntry {
                 chunk_id: Uuid::new_v4(),
                 source_id: Uuid::new_v4(),

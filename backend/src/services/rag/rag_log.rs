@@ -1,7 +1,7 @@
 //! RAG evaluation logging service.
 //!
-//! Asynchronously logs RAG interaction details for quality analysis:
-//! query, retrieved chunks, scores, reformulation, HyDE document, feedback.
+//! Logs redacted RAG interaction details for quality analysis: query hashes,
+//! retrieved chunk identifiers, scores and feedback.
 //!
 //! Logs are created non-blocking (via `tokio::spawn`) so they don't
 //! delay the SSE response to the user.
@@ -24,9 +24,8 @@ use crate::repositories::RagLogRepository;
 pub struct RagLogEntry {
     pub notebook_id: Uuid,
     pub user_id: Uuid,
-    pub query: String,
-    pub reformulated_query: Option<String>,
-    pub hyde_document: Option<String>,
+    pub query_hash: String,
+    pub reformulated_query_hash: Option<String>,
     pub chunks_retrieved: Vec<ChunkLogEntry>,
     pub response_id: Option<Uuid>,
     pub retrieval_score_avg: Option<f32>,

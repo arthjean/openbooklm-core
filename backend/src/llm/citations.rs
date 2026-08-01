@@ -14,7 +14,11 @@
 //! to the grounded-response report instead of silently lowering citation
 //! coverage.
 
-use std::{borrow::Cow, collections::HashSet, sync::LazyLock};
+use std::{
+    borrow::Cow,
+    collections::{HashMap, HashSet},
+    sync::LazyLock,
+};
 
 use regex::Regex;
 
@@ -48,6 +52,26 @@ pub fn extract_citations(response: &str, context_chunks: &[CitableChunk]) -> Vec
 pub fn extract_citations_verified(
     response: &str,
     context_chunks: &[CitableChunk],
+) -> ExtractedCitations {
+    extract_citations_with_active_generations(response, context_chunks, None)
+}
+
+/// Resolve citations against the active pointers read immediately before
+/// emission. A chunk retrieved from a generation that was superseded while the
+/// model was answering is stale and is refused.
+#[must_use]
+pub fn extract_citations_verified_against_active(
+    response: &str,
+    context_chunks: &[CitableChunk],
+    active_generations: &HashMap<uuid::Uuid, uuid::Uuid>,
+) -> ExtractedCitations {
+    extract_citations_with_active_generations(response, context_chunks, Some(active_generations))
+}
+
+fn extract_citations_with_active_generations(
+    response: &str,
+    context_chunks: &[CitableChunk],
+    active_generations: Option<&HashMap<uuid::Uuid, uuid::Uuid>>,
 ) -> ExtractedCitations {
     let code_ranges = find_code_ranges(response);
     let mut citations = Vec::new();
@@ -114,6 +138,19 @@ pub fn extract_citations_verified(
             continue;
         }
 
+        if active_generations.is_some_and(|active| {
+            active.get(&chunk.source_id).copied() != Some(chunk.generation_id)
+        }) {
+            tracing::warn!(
+                citation_index = index,
+                source_id = %chunk.source_id,
+                generation_id = %chunk.generation_id,
+                "Citation resolves to a generation that is no longer active, skipping"
+            );
+            rejected += 1;
+            continue;
+        }
+
         // The span and pages the chunker recorded must describe a passage that
         // can exist. One that cannot was not written by this pipeline, and a
         // citation into it would open something the reader cannot verify.
@@ -123,6 +160,18 @@ pub fn extract_citations_verified(
                 citation_index = index,
                 source_id = %chunk.source_id,
                 "Citation resolves to a chunk with an incoherent span, skipping"
+            );
+            rejected += 1;
+            continue;
+        }
+
+        if active_generations.is_some()
+            && !claim_is_supported_by(full_match.start(), response, &chunk.content)
+        {
+            tracing::warn!(
+                citation_index = index,
+                source_id = %chunk.source_id,
+                "Citation evidence is not linked to the associated claim, skipping"
             );
             rejected += 1;
             continue;
@@ -156,6 +205,147 @@ pub fn extract_citations_verified(
         citations,
         rejected,
     }
+}
+
+/// Associate a marker with the immediately preceding claim and require a
+/// conservative lexical entailment signal from the cited passage.
+///
+/// This deliberately prefers refusing a paraphrase over publishing an
+/// unrelated citation. Numbers and negations are retained as content tokens,
+/// which catches the common false-support case where subject words overlap but
+/// the value or polarity differs.
+#[must_use]
+pub fn claim_is_supported_by(marker_start: usize, response: &str, evidence: &str) -> bool {
+    let Some(prefix) = response.get(..marker_start) else {
+        return false;
+    };
+    let claim = prefix
+        .rsplit(['\n', '.', '!', '?'])
+        .next()
+        .unwrap_or("")
+        .trim_matches(|c: char| c.is_whitespace() || matches!(c, '-' | '*' | ':' | ';'));
+    let claim_tokens = meaningful_tokens(claim);
+    if claim_tokens.is_empty() {
+        return false;
+    }
+    let evidence_tokens: HashSet<String> = meaningful_tokens(evidence).into_iter().collect();
+
+    let numeric: Vec<&String> = claim_tokens
+        .iter()
+        .filter(|token| is_number_token(token))
+        .collect();
+    if numeric
+        .iter()
+        .any(|token| !evidence_tokens.contains(token.as_str()))
+    {
+        return false;
+    }
+    if claim_tokens
+        .iter()
+        .filter(|token| is_polarity_token(token))
+        .any(|token| !evidence_tokens.contains(token.as_str()))
+    {
+        return false;
+    }
+
+    let matched = claim_tokens
+        .iter()
+        .filter(|token| evidence_tokens.contains(token.as_str()))
+        .count();
+    let required = claim_tokens.len().div_ceil(2).clamp(1, 4);
+    matched >= required
+}
+
+fn is_polarity_token(token: &str) -> bool {
+    matches!(
+        token,
+        "no" | "not" | "never" | "without" | "aucun" | "jamais" | "pas" | "sans"
+    )
+}
+
+fn is_number_token(token: &str) -> bool {
+    token.chars().any(|c| c.is_ascii_digit())
+        || matches!(
+            token,
+            "zero"
+                | "one"
+                | "two"
+                | "three"
+                | "four"
+                | "five"
+                | "six"
+                | "seven"
+                | "eight"
+                | "nine"
+                | "ten"
+                | "zéro"
+                | "un"
+                | "deux"
+                | "trois"
+                | "quatre"
+                | "cinq"
+                | "sept"
+                | "huit"
+                | "neuf"
+                | "dix"
+        )
+}
+
+fn meaningful_tokens(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter_map(|raw| {
+            let token = raw.to_lowercase();
+            (token.len() >= 2 && !is_stop_word(&token)).then_some(token)
+        })
+        .collect()
+}
+
+fn is_stop_word(token: &str) -> bool {
+    matches!(
+        token,
+        "a" | "an"
+            | "and"
+            | "are"
+            | "as"
+            | "at"
+            | "be"
+            | "by"
+            | "for"
+            | "from"
+            | "in"
+            | "is"
+            | "it"
+            | "of"
+            | "on"
+            | "or"
+            | "that"
+            | "the"
+            | "this"
+            | "to"
+            | "was"
+            | "were"
+            | "with"
+            | "au"
+            | "aux"
+            | "ce"
+            | "ces"
+            | "dans"
+            | "de"
+            | "des"
+            | "du"
+            | "et"
+            | "est"
+            | "la"
+            | "le"
+            | "les"
+            | "par"
+            | "pour"
+            | "que"
+            | "qui"
+            | "sur"
+            | "un"
+            | "une"
+    )
 }
 
 /// Whether a provider-native citation quotes a passage of the document it names.
@@ -443,6 +633,50 @@ mod tests {
             "retry budget is five"
         ));
         assert!(!quote_belongs_to("anything", "   "));
+    }
+
+    #[test]
+    fn production_resolution_requires_current_generation_and_claim_support() {
+        let source_id = Uuid::from_u128(11);
+        let generation_id = Uuid::from_u128(12);
+        let mut chunk = make_chunk(
+            &source_id.to_string(),
+            "The retry budget is four attempts before the job fails.",
+        );
+        chunk.generation_id = generation_id;
+        let active = HashMap::from([(source_id, generation_id)]);
+
+        let accepted = extract_citations_verified_against_active(
+            "The retry budget is four attempts [1].",
+            &[chunk.clone()],
+            &active,
+        );
+        assert_eq!(accepted.citations.len(), 1);
+        assert_eq!(accepted.rejected, 0);
+
+        let unsupported = extract_citations_verified_against_active(
+            "The retry budget is five attempts [1].",
+            &[chunk.clone()],
+            &active,
+        );
+        assert!(unsupported.citations.is_empty());
+        assert_eq!(unsupported.rejected, 1);
+
+        let wrong_polarity = extract_citations_verified_against_active(
+            "The job does not fail after four attempts [1].",
+            &[chunk.clone()],
+            &active,
+        );
+        assert!(wrong_polarity.citations.is_empty());
+        assert_eq!(wrong_polarity.rejected, 1);
+
+        let stale = extract_citations_verified_against_active(
+            "The retry budget is four attempts [1].",
+            &[chunk],
+            &HashMap::from([(source_id, Uuid::from_u128(13))]),
+        );
+        assert!(stale.citations.is_empty());
+        assert_eq!(stale.rejected, 1);
     }
 
     #[test]

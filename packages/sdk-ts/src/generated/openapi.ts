@@ -438,7 +438,7 @@ export interface components {
         ChatChunk: {
             text: string;
         };
-        /** @description An inline `[N]` citation marker, emitted as soon as it appears in the text. */
+        /** @description An inline `[N]` citation marker, emitted after final evidence validation. */
         ChatCitationRef: {
             index: number;
             /** Format: uuid */

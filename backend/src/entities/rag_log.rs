@@ -1,7 +1,8 @@
 //! RAG evaluation log entity for quality tracking.
 //!
-//! Stores per-interaction data: query, retrieved chunks, relevance scores,
-//! reformulated queries, HyDE documents, and user feedback.
+//! Stores per-interaction query hashes, retrieved chunk identifiers, scores and
+//! user feedback. Legacy raw-text columns remain only for write compatibility
+//! and are scrubbed by a database trigger.
 //!
 //! Logs are created asynchronously (via `tokio::spawn`) so they don't
 //! delay the SSE response to the user. Complex aggregation queries
@@ -22,14 +23,20 @@ pub struct Model {
     /// User who initiated the query
     pub user_id: Uuid,
 
-    /// Original user query
+    /// Legacy compatibility column. Always empty after the redaction migration.
     pub query: String,
 
-    /// Query after reformulation (if applied)
+    /// Legacy compatibility column. Always NULL after the redaction migration.
     pub reformulated_query: Option<String>,
 
-    /// HyDE-generated hypothetical document (if applied)
+    /// Legacy compatibility column. Always NULL after the redaction migration.
     pub hyde_document: Option<String>,
+
+    /// SHA-256 of the original user query.
+    pub query_hash: String,
+
+    /// SHA-256 of the reformulated query, when one was used.
+    pub reformulated_query_hash: Option<String>,
 
     /// Retrieved chunks with metadata (JSONB):
     /// `[{ "chunk_id": "uuid", "source_id": "uuid", "chunk_index": 0, "relevance_score": 0.85 }]`

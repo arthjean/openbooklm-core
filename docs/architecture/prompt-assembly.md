@@ -127,8 +127,10 @@ properties that do not depend on a model's mood:
 - structural characters survive as entities, not as markup;
 - citation markers the payload wrote resolve only to retrieved evidence.
 
-Model behaviour is not asserted, because it is not reproducible. What is
-asserted is every precondition of a successful injection.
+Model behaviour is not asserted, because it is not reproducible in the offline
+gate. These checks prove the structural boundary only. EP-004 remains open
+until a provider-specific behavioral evaluation demonstrates zero successful
+instruction following on the same fixtures.
 
 Cross-notebook reach is answered where it is enforced rather than in the prompt:
 `NotebookScope` carries the account and the notebook, and all four search
@@ -170,24 +172,30 @@ page 1, hidden behind a cache hit.
 
 ### A marker is not a citation
 
-A citation is emitted only when five things hold:
+A citation is emitted only when seven things hold:
 
 1. the marker resolves to a chunk retrieved this turn;
 2. that chunk carries an index generation (a nil generation was never published);
-3. its recorded span and pages describe a passage that can exist — `span_start <
+3. that generation is still the source's active generation immediately before
+   emission;
+4. its recorded span and pages describe a passage that can exist - `span_start <
    span_end`, `page_number <= page_end`, no last page without a first;
-4. the quoted passage is a passage of that chunk;
-5. the marker is not inside a code span or fence.
+5. the immediately preceding claim has a conservative lexical support signal in
+   that passage, including matching values and polarity;
+6. a provider-native quoted passage is a passage of that chunk;
+7. the marker is not inside a code span or fence.
 
-Rule 3 is the span half of US-019 AC-3. The chunker writes both ends in one
+Rule 4 is the span half of US-019 AC-3. The chunker writes both ends in one
 pass, so a violation means the row did not come from it: a hand-edited index, a
 truncated write, a generation from another schema. A chunk with no span at all
 is not a violation — notebooks indexed before US-019 carry none, and they stay
 citable.
 
-Everything else is refused and counted. Provider-native citations get the same
+Everything else is refused and counted. No public citation event is sent while
+the answer is still streaming. Provider-native citations get the same
 treatment, through the same checks: a `document_index` the request never sent, a
-`cited_text` the document does not contain, an incoherent span. Both paths read
+`cited_text` the document does not contain, a stale generation, an unrelated
+claim or an incoherent span. Both paths read
 provenance through `llm::types::ChunkProvenance`, which parses the stored
 metadata once, typed, instead of probing the JSON key by key in each of them.
 The count reaches the retrieval trace as `citation_rejected`, so a regression

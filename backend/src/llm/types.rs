@@ -211,6 +211,8 @@ pub struct NativeCitation {
 pub struct RagDocument {
     /// Source UUID for mapping citations back to notebook sources.
     pub source_id: Uuid,
+    /// Generation that was active when this document was retrieved.
+    pub generation_id: Uuid,
     /// Human-readable document title.
     pub title: String,
     /// Document text content (parent_content or chunk content).

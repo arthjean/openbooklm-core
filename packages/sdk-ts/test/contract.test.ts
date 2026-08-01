@@ -57,7 +57,7 @@ const CHAT_CASES: Array<[string, string]> = [
   ["system", "system_history_truncated"],
   ["system", "system_history_summarized"],
   ["warning", "warning"],
-  ["citation", "citation"],
+  ["citation", "citation_after_validation"],
   ["citations", "citations"],
   ["metrics", "metrics"],
   ["metrics", "metrics_no_context"],

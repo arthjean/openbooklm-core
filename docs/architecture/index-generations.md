@@ -215,12 +215,12 @@ on a fresh one: once generations exist, two of them legitimately hold the same
 `(generation_id, chunk_index)` and keeping the previous generation for rollback
 is the normal state. Validating the whole table would abort on healthy data.
 
-**Forward deployment.** The migration is compatible with the previous binary in
-one direction only: the old code ignores the new columns and would write chunks
-without a `generation_id`, which the `NOT NULL` constraint refuses. Deploy the
-migration and the new binary together, as the server already does under its
-advisory lock. Rolling back means redeploying the previous binary *and*
-restoring the backup taken before the upgrade, per `docs/upgrading.md`.
+**Forward deployment.** The migration changes the chunk writer protocol. The
+old code writes without a `generation_id`, which the `NOT NULL` constraint
+refuses. Stop every old instance before the new binary applies the migration;
+the advisory lock only serializes migrators and does not protect application
+writes. Rolling back means redeploying the previous binary *and* restoring the
+backup taken before the upgrade, per `docs/upgrading.md`.
 
 **Batch size.** The backfill is a single grouped `INSERT ... SELECT` plus two
 `UPDATE`s. On the synthetic upgraded fixture this is not a measurable cost; a

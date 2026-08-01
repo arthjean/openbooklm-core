@@ -121,7 +121,8 @@ catch. It is counted as wrong and classified: `unknown_chunk`,
 `stale_generation`, `cross_notebook`, `span_mismatch`, `unrelated_to_claim`.
 
 The chat path refuses the same things before a citation is ever emitted (US-019):
-a marker that resolves to nothing retrieved, a chunk with no index generation, a
+a marker that resolves to nothing retrieved, a missing or stale active
+generation, a claim without lexical support in the cited passage, a
 provider-native quote the document does not contain, and a marker written inside
 a code fence. Refusals are counted and reach the trace as `citation_rejected`,
 so a regression appears as refusals rather than as silently lower coverage.
@@ -171,11 +172,12 @@ It is a release gate, not only a unit test: it fails when the suite drops below
 fifty cases, when an attack family loses its last fixture, when a payload breaks
 a boundary property, or when a citation resolves outside the retrieved set.
 
-It asserts structure, not behaviour. A model's refusal is not reproducible; what
-is reproducible is whether the payload could close its own element, forge a
-second data policy, or change a byte of the instructions that follow the
-evidence. Those are the preconditions of every successful injection, and the
-suite requires zero of them across all fifty cases.
+It asserts structure, not behaviour. A model's refusal is not reproducible in
+this offline gate; what is reproducible is whether the payload could close its
+own element, forge a second data policy, or change a byte of the instructions
+that follow the evidence. These checks are necessary but do not prove model
+behavior. EP-004 stays open until a provider-specific behavioral run covers all
+fifty cases with zero successful instruction following.
 
 Cross-notebook reach is answered one layer down, where it is enforced: every
 search query joins `notebooks.user_id`, so a scope naming another account

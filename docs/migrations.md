@@ -96,11 +96,10 @@ divergent database, so the check cannot be skipped by calling them directly.
 ## Concurrency
 
 Every verb holds a PostgreSQL advisory lock (`pg_advisory_lock`, key
-`MIGRATION_LOCK_KEY`). A rolling deploy starts the new instance before stopping
-the old one, so two processes can reach the migrator simultaneously; the lock
-makes the second wait and then find nothing to apply. Verified with two
-concurrent `core-up` runs against one empty database: both exit 0, one row is
-written.
+`MIGRATION_LOCK_KEY`). If two instances of the same new release start together,
+the lock makes the second wait and then find nothing to apply. This serializes
+migrators, not application writes from an older release. A migration that
+changes a writer protocol requires all older instances to stop first.
 
 The lock is session-scoped, so a killed process releases it when its connection
 closes.
@@ -111,25 +110,24 @@ closes.
 hosted database. All three drop tables. The core baseline's `down` in particular
 would drop tables it never created on a bridged database.
 
-Rollback is a *deployment* operation, not a schema operation. Every migration in
-this PRD is additive, so the previous application version runs unchanged against
-the expanded schema — that is the whole point of the expand/contract discipline.
+Rollback is a *deployment* operation, not a down migration. Additive schema does
+not by itself guarantee binary compatibility: constraints and writer protocols
+also matter.
 
-1. **Redeploy the previous application version.** Backend and frontend. The
-   expanded schema is a superset of what it expects.
-2. **Verify.** Sign-in, notebook list, source ingestion, one chat exchange with
-   a citation, Stripe portal in test mode.
-3. **Leave the schema alone.** The new tables are unread by the old code. They
-   cost storage and nothing else.
+For migrations explicitly marked rollback-compatible, redeploy the previous
+binary and leave the expanded schema in place. Across
+`m20260801_000001_index_generations`, restore the backup and then start the
+previous binary. Its validator refuses the unknown migration and its writer
+cannot populate `chunks.generation_id`.
 
-Restore from backup only if the data itself is wrong, not merely the schema:
+Restore the pre-upgrade backup for an incompatible migration:
 
 ```bash
 pg_restore --clean --if-exists -d "$DATABASE_URL" backup.dump
 ```
 
-That *is* destructive and loses everything written since the backup. It is the
-last resort, not the rollback procedure.
+That loses everything written since the backup, which is why the coordinated
+upgrade starts with a verified dump and a maintenance window.
 
 The rollback window is one stable hosted release. After it closes, a later PRD
 removes the legacy columns and tables, and rollback past that point requires a
@@ -141,6 +139,12 @@ restore.
 |---|---|
 | `m20260729_000001_core_baseline` | the complete core schema for a fresh install |
 | `m20260801_000001_index_generations` | immutable index generations, the active-generation pointer, and the backfill of existing chunks (EP-002) |
+| `m20260801_000002_rag_log_redaction` | query hashes plus structural scrubbing of legacy raw RAG log fields (US-004) |
+
+The RAG-log redaction is intentionally irreversible: existing raw query,
+reformulation and HyDE values are cleared during `up`, and the trigger rejects
+future writes to those legacy fields. A `down` migration cannot reconstruct
+that private text.
 
 `m20260801_000001_index_generations` is additive and idempotent, and refuses to
 run on a corpus it cannot represent: among the chunks it would backfill,
@@ -152,8 +156,8 @@ reprocessed since stays a no-op.
 
 It also changes what the previous binary can do. The old code writes chunks
 without a `generation_id`, which the new `NOT NULL` constraint refuses, so the
-migration and the new binary deploy together — which is what the server already
-does under its advisory lock. See
+migration and the new binary deploy in one stop-first maintenance window. The
+advisory lock serializes migrators only; it does not make a rolling deploy safe. See
 [architecture/index-generations.md](architecture/index-generations.md) for the
 model, its invariants and the tests that verify them.
 

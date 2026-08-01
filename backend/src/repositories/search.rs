@@ -30,12 +30,17 @@
 use std::sync::LazyLock;
 
 use async_trait::async_trait;
-use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, Statement, TransactionTrait};
+use sea_orm::{
+    AccessMode, ConnectionTrait, DatabaseConnection, DbBackend, IsolationLevel, QueryResult,
+    Statement, TransactionTrait,
+};
 
 use crate::services::rag::utils::{format_embedding, sanitize_tsquery};
 
 use super::ann::APPROVED_STRATEGY;
-use super::traits::{ChunkSearchResult, NotebookScope, RepoResult, SearchRepository};
+use super::traits::{
+    ChunkSearchResult, HybridChunkSearchResult, NotebookScope, RepoResult, SearchRepository,
+};
 
 /// The approved strategy's `SET LOCAL` statements, rendered once.
 ///
@@ -117,6 +122,45 @@ impl SeaOrmSearchRepository {
     }
 }
 
+fn dense_rows(rows: Vec<QueryResult>) -> RepoResult<Vec<ChunkSearchResult>> {
+    rows.into_iter()
+        .map(|row| {
+            let distance: f64 = row.try_get("", "distance")?;
+            #[allow(clippy::cast_possible_truncation)]
+            Ok(ChunkSearchResult {
+                id: row.try_get("", "id")?,
+                generation_id: row.try_get("", "generation_id")?,
+                source_id: row.try_get("", "source_id")?,
+                chunk_index: row.try_get("", "chunk_index")?,
+                content: row.try_get("", "content")?,
+                parent_content: row.try_get("", "parent_content")?,
+                source_title: row.try_get("", "source_title")?,
+                relevance_score: (1.0 - distance).max(0.0) as f32,
+                metadata: row.try_get("", "metadata").ok(),
+            })
+        })
+        .collect()
+}
+
+fn lexical_rows(rows: Vec<QueryResult>) -> RepoResult<Vec<ChunkSearchResult>> {
+    rows.into_iter()
+        .map(|row| {
+            let rank: f32 = row.try_get("", "rank")?;
+            Ok(ChunkSearchResult {
+                id: row.try_get("", "id")?,
+                generation_id: row.try_get("", "generation_id")?,
+                source_id: row.try_get("", "source_id")?,
+                chunk_index: row.try_get("", "chunk_index")?,
+                content: row.try_get("", "content")?,
+                parent_content: row.try_get("", "parent_content")?,
+                source_title: row.try_get("", "source_title")?,
+                relevance_score: rank.min(1.0),
+                metadata: row.try_get("", "metadata").ok(),
+            })
+        })
+        .collect()
+}
+
 #[async_trait]
 impl SearchRepository for SeaOrmSearchRepository {
     #[tracing::instrument(skip(self, query_embedding), fields(notebook_id = %scope.notebook_id, %limit))]
@@ -154,23 +198,7 @@ impl SearchRepository for SeaOrmSearchRepository {
 
         txn.commit().await?;
 
-        rows.into_iter()
-            .map(|row| {
-                let distance: f64 = row.try_get("", "distance")?;
-                #[allow(clippy::cast_possible_truncation)]
-                Ok(ChunkSearchResult {
-                    id: row.try_get("", "id")?,
-                    generation_id: row.try_get("", "generation_id")?,
-                    source_id: row.try_get("", "source_id")?,
-                    chunk_index: row.try_get("", "chunk_index")?,
-                    content: row.try_get("", "content")?,
-                    parent_content: row.try_get("", "parent_content")?,
-                    source_title: row.try_get("", "source_title")?,
-                    relevance_score: (1.0 - distance).max(0.0) as f32,
-                    metadata: row.try_get("", "metadata").ok(),
-                })
-            })
-            .collect()
+        dense_rows(rows)
     }
 
     #[tracing::instrument(skip(self), fields(notebook_id = %scope.notebook_id, %limit))]
@@ -198,22 +226,80 @@ impl SearchRepository for SeaOrmSearchRepository {
             ))
             .await?;
 
-        rows.into_iter()
-            .map(|row| {
-                let rank: f32 = row.try_get("", "rank")?;
-                Ok(ChunkSearchResult {
-                    id: row.try_get("", "id")?,
-                    generation_id: row.try_get("", "generation_id")?,
-                    source_id: row.try_get("", "source_id")?,
-                    chunk_index: row.try_get("", "chunk_index")?,
-                    content: row.try_get("", "content")?,
-                    parent_content: row.try_get("", "parent_content")?,
-                    source_title: row.try_get("", "source_title")?,
-                    relevance_score: rank.min(1.0),
-                    metadata: row.try_get("", "metadata").ok(),
-                })
-            })
-            .collect()
+        lexical_rows(rows)
+    }
+
+    #[tracing::instrument(skip(self, query_embedding, query), fields(notebook_id = %scope.notebook_id, %limit))]
+    async fn search_hybrid_chunks(
+        &self,
+        scope: NotebookScope,
+        query_embedding: &[f32],
+        query: &str,
+        limit: i32,
+    ) -> RepoResult<HybridChunkSearchResult> {
+        let sanitized = sanitize_tsquery(query);
+        let embedding = format_embedding(query_embedding);
+        let txn = self
+            .db
+            .begin_with_config(
+                Some(IsolationLevel::RepeatableRead),
+                Some(AccessMode::ReadOnly),
+            )
+            .await?;
+
+        if !SCAN_PREAMBLE.is_empty() {
+            txn.execute_unprepared(&SCAN_PREAMBLE).await?;
+        }
+
+        let dense = txn
+            .query_all(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                SEARCH_SIMILAR_SQL,
+                [
+                    embedding.into(),
+                    scope.notebook_id.into(),
+                    scope.account_id.into(),
+                    limit.into(),
+                ],
+            ))
+            .await?;
+        let lexical = if sanitized.is_empty() {
+            Vec::new()
+        } else {
+            match txn
+                .query_all(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    SEARCH_LEXICAL_SQL,
+                    [
+                        sanitized.into(),
+                        scope.notebook_id.into(),
+                        scope.account_id.into(),
+                        limit.into(),
+                    ],
+                ))
+                .await
+            {
+                Ok(rows) => rows,
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        notebook_id = %scope.notebook_id,
+                        "Lexical search failed, using dense-only"
+                    );
+                    txn.rollback().await?;
+                    return Ok(HybridChunkSearchResult {
+                        dense: dense_rows(dense)?,
+                        lexical: Vec::new(),
+                    });
+                }
+            }
+        };
+        txn.commit().await?;
+
+        Ok(HybridChunkSearchResult {
+            dense: dense_rows(dense)?,
+            lexical: lexical_rows(lexical)?,
+        })
     }
 
     #[tracing::instrument(skip(self), fields(notebook_id = %scope.notebook_id))]

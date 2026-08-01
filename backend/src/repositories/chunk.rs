@@ -21,6 +21,16 @@ use super::traits::{ChunkRepository, RepoResult};
 
 // SQL queries as constants for readability and reuse
 
+/// A writer holds a shared row lock for its whole batch transaction.
+/// Publication takes the conflicting update lock before validation, so no
+/// chunk can arrive between validation and the active-pointer move.
+const LOCK_BUILDING_GENERATION_SQL: &str = r"
+    SELECT id
+    FROM source_index_generations
+    WHERE id = $1 AND source_id = $2 AND state = 'building'
+    FOR SHARE
+";
+
 /// Number of bound parameter placeholders per row in the batch INSERT.
 /// 10 bound params: id, generation_id, source_id, chunk_index, content,
 /// context_prefix, parent_content, metadata, embedding, content_hash.
@@ -181,6 +191,29 @@ async fn insert_chunk_rows(
     Ok(())
 }
 
+async fn lock_building_generation(
+    conn: &impl ConnectionTrait,
+    generation_id: Uuid,
+    source_id: Uuid,
+) -> RepoResult<()> {
+    let row = conn
+        .query_one(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            LOCK_BUILDING_GENERATION_SQL,
+            [generation_id.into(), source_id.into()],
+        ))
+        .await?;
+    if row.is_none() {
+        return Err(RagError::VectorStoreFailed {
+            source_id: source_id.to_string(),
+            reason: "index generation is not owned by this source or is no longer building"
+                .to_owned(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct SeaOrmChunkRepository {
     db: DatabaseConnection,
@@ -225,6 +258,7 @@ impl ChunkRepository for SeaOrmChunkRepository {
         }
 
         let txn = self.db.begin().await?;
+        lock_building_generation(&txn, generation_id, source_id).await?;
         insert_chunk_rows(&txn, generation_id, source_id, chunks, embeddings, 0).await?;
         txn.commit().await?;
         tracing::debug!(%source_id, count = chunks.len(), "Stored chunks with embeddings");
@@ -246,6 +280,7 @@ impl ChunkRepository for SeaOrmChunkRepository {
             return Ok(());
         }
 
+        lock_building_generation(txn, generation_id, source_id).await?;
         insert_chunk_rows(
             txn,
             generation_id,

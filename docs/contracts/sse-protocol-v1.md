@@ -68,7 +68,13 @@ disconnected client starts a new exchange.
 ### Optionality
 
 - `metrics.context_relevance` is `null` when the answer used no retrieved
-  context.
+  context, and also when the ordering that selected the context carries no
+  relevance scale: reciprocal-rank fusion produces a rank artifact and context
+  stuffing assigns every chunk the same constant, so averaging either would
+  publish a number that moves with the pool size rather than with the answer
+  (US-012). A value is emitted when a reranker or a dense-only search ordered
+  the evidence. The field and its type are unchanged; only the conditions under
+  which it is populated are narrower.
 - `done.rag_log_id` is `null` for the same reason: with no retrieved context
   there is no RAG log row for feedback to reference. The key is always present.
 - `citation.index` is 1-based and refers to the `[N]` marker in the answer text.

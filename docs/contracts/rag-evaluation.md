@@ -83,11 +83,13 @@ byte-identical JSON except for `generated_at`. The evaluator takes the timestamp
 as a parameter rather than reading the clock, so there is no second source of
 variance.
 
-One deliberate intervention makes that possible: reciprocal rank fusion collects
-into a hash map and sorts stably, so equal scores come out in hash-iteration
-order. The evaluator re-sorts by `(score desc, chunk id asc)` before scoring and
-says so in the report notes. US-013 owns moving that tie-breaker into the
-production truncation contract.
+That used to need an intervention here: reciprocal rank fusion collects into a
+hash map and sorts stably, so equal scores came out in hash-iteration order and
+the evaluator re-sorted by `(score desc, chunk id asc)` before scoring. Since
+US-013 the tie-break lives in fusion itself, where it also makes production
+truncation deterministic. The evaluator still re-imposes the same order, now as
+a check rather than a repair: if the pipeline's tie-break regresses, the report
+diffs instead of flapping.
 
 ## Grounded-response metrics
 

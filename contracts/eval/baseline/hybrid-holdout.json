@@ -331,7 +331,7 @@
   "notes": [
     "Embeddings come from the deterministic in-process hashing provider. Semantic categories score low by construction; the PRD's absolute targets assume a real embedding model.",
     "Lexical scores come from a BM25-shaped in-memory scorer, not from PostgreSQL ts_rank_cd. They are comparable across revisions of this repository and not against a database.",
-    "Fused results are re-sorted by (score desc, chunk id asc) before scoring. Reciprocal rank fusion leaves ties in hash order, which would make this report unstable; US-013 owns moving the tie-breaker into the production path.",
+    "Fused results carry the production tie-break (score desc, chunk id asc), applied inside reciprocal rank fusion since US-013. The evaluator re-imposes the same order defensively, so a regression in the pipeline's tie-break shows up as a report diff rather than as a flapping report.",
     "Claim assertion is decided by the corpus's literal answer markers, never by a model. A judge, when configured, only adds diagnostics.",
     "A citation counts only when its chunk resolves, belongs to the active generation and the query's notebook, and its quoted span supports an asserted claim."
   ]

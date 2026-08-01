@@ -73,16 +73,15 @@ const _: () = assert!(PARENT_TEXT_CHUNK_SIZE > CHILD_CHUNK_SIZE);
 // Types
 // ============================================================================
 
-/// Chunk configuration parameters.
+/// Chunk configuration parameters for one splitting pass.
 ///
-/// For parent-child chunking, `size` and `overlap` represent the child chunk
-/// parameters (used for embedding/retrieval), while `parent_size` is the larger
-/// window returned to the LLM for richer context.
+/// Parent-child chunking runs two passes, so it builds two of these; the parent
+/// geometry itself comes from [`parent_chunk_size`], which is its only
+/// definition.
 #[derive(Debug, Clone, Copy)]
 struct ChunkParams {
     size: usize,
     overlap: usize,
-    parent_size: Option<usize>,
 }
 
 impl ChunkParams {
@@ -92,65 +91,36 @@ impl ChunkParams {
             SourceType::Pdf => Self {
                 size: PDF_CHUNK_SIZE,
                 overlap: PDF_OVERLAP,
-                parent_size: None,
             },
             SourceType::Web => Self {
                 size: WEB_CHUNK_SIZE,
                 overlap: WEB_OVERLAP,
-                parent_size: None,
             },
             // DOCX/EPUB: use markdown-like params since we extract structured content
             SourceType::Markdown | SourceType::Docx | SourceType::Epub => Self {
                 size: MARKDOWN_CHUNK_SIZE,
                 overlap: MARKDOWN_OVERLAP,
-                parent_size: None,
             },
             SourceType::Text => Self {
                 size: TEXT_CHUNK_SIZE,
                 overlap: TEXT_OVERLAP,
-                parent_size: None,
             },
             // YouTube: markdown-like params (transcript formatted as timestamped Markdown)
             SourceType::Youtube => Self {
                 size: MARKDOWN_CHUNK_SIZE,
                 overlap: MARKDOWN_OVERLAP,
-                parent_size: None,
             },
         }
     }
 
-    /// Parent-child chunk parameters for small-to-big retrieval.
+    /// Child (retrieval) chunk parameters for small-to-big retrieval.
     ///
-    /// `size` and `overlap` are the child (retrieval) chunk params.
-    /// `parent_size` is the larger context window stored for the LLM.
-    const fn parent_child_for_source_type(source_type: SourceType) -> Self {
-        match source_type {
-            SourceType::Pdf => Self {
-                size: CHILD_CHUNK_SIZE,
-                overlap: CHILD_OVERLAP,
-                parent_size: Some(PARENT_PDF_CHUNK_SIZE),
-            },
-            SourceType::Web => Self {
-                size: CHILD_CHUNK_SIZE,
-                overlap: CHILD_OVERLAP,
-                parent_size: Some(PARENT_WEB_CHUNK_SIZE),
-            },
-            SourceType::Markdown | SourceType::Docx | SourceType::Epub => Self {
-                size: CHILD_CHUNK_SIZE,
-                overlap: CHILD_OVERLAP,
-                parent_size: Some(PARENT_MARKDOWN_CHUNK_SIZE),
-            },
-            SourceType::Text => Self {
-                size: CHILD_CHUNK_SIZE,
-                overlap: CHILD_OVERLAP,
-                parent_size: Some(PARENT_TEXT_CHUNK_SIZE),
-            },
-            // YouTube: uses markdown-equivalent params (2048 parent, section-aware)
-            SourceType::Youtube => Self {
-                size: CHILD_CHUNK_SIZE,
-                overlap: CHILD_OVERLAP,
-                parent_size: Some(PARENT_MARKDOWN_CHUNK_SIZE),
-            },
+    /// The same for every source type: only the parent geometry varies, and
+    /// that lives in [`parent_chunk_size`].
+    const fn child_params() -> Self {
+        Self {
+            size: CHILD_CHUNK_SIZE,
+            overlap: CHILD_OVERLAP,
         }
     }
 }
@@ -158,6 +128,28 @@ impl ChunkParams {
 // ============================================================================
 // Public API
 // ============================================================================
+
+/// Parent chunk size, in [`crate::services::rag::provenance::CHUNK_SIZE_UNIT`],
+/// for a source type.
+///
+/// The single definition of the parent geometry: parent-child chunking reads it
+/// to split, and a generation records it as provenance (US-011). Returning
+/// `usize` rather than `Option<usize>` is what makes the two agree by
+/// construction — there is no arm that could omit a size and leave a
+/// fingerprint describing a geometry the splitter did not use.
+#[must_use]
+pub const fn parent_chunk_size(source_type: SourceType) -> usize {
+    match source_type {
+        SourceType::Pdf => PARENT_PDF_CHUNK_SIZE,
+        SourceType::Web => PARENT_WEB_CHUNK_SIZE,
+        SourceType::Text => PARENT_TEXT_CHUNK_SIZE,
+        // YouTube transcripts are formatted as timestamped Markdown, so they
+        // take the Markdown geometry.
+        SourceType::Markdown | SourceType::Docx | SourceType::Epub | SourceType::Youtube => {
+            PARENT_MARKDOWN_CHUNK_SIZE
+        }
+    }
+}
 
 /// Chunk content based on source type.
 ///
@@ -194,7 +186,6 @@ pub fn chunk_content_with_params(
         ChunkParams {
             size: chunk_size,
             overlap,
-            parent_size: None,
         },
     )
 }
@@ -258,19 +249,11 @@ pub fn chunk_content_with_parents(
     content: &str,
     source_type: SourceType,
 ) -> Result<Vec<(String, Vec<String>, ChunkMetadata)>, RagError> {
-    let params = ChunkParams::parent_child_for_source_type(source_type);
     let parent_params = ChunkParams {
-        size: params.parent_size.ok_or_else(|| RagError::ChunkingFailed {
-            reason: "parent_child params must have parent_size".into(),
-        })?,
+        size: parent_chunk_size(source_type),
         overlap: PARENT_OVERLAP,
-        parent_size: None,
     };
-    let child_params = ChunkParams {
-        size: params.size,
-        overlap: params.overlap,
-        parent_size: None,
-    };
+    let child_params = ChunkParams::child_params();
 
     // Pass 1: Split into parent chunks
     let parent_chunks = match source_type {
@@ -656,72 +639,50 @@ mod tests {
     fn chunk_params_for_types() {
         // NOTE: These are legacy single-level sizes, only used by the fallback
         // `chunk_content()` path. The active pipeline uses `chunk_content_with_parents()`
-        // which uses `parent_child_for_source_type()` sizes instead.
+        // which uses `parent_chunk_size()` and `child_params()` instead.
         // For Text, the legacy size (2048) exceeds the parent-child parent size (1024)
         // — this is intentional: the legacy path produced larger, single-level chunks
         // while the new architecture uses smaller parents + even smaller children.
         let pdf = ChunkParams::for_source_type(SourceType::Pdf);
         assert_eq!(pdf.size, 512);
         assert_eq!(pdf.overlap, 50);
-        assert_eq!(pdf.parent_size, None);
 
         let web = ChunkParams::for_source_type(SourceType::Web);
         assert_eq!(web.size, 1024);
         assert_eq!(web.overlap, 100);
-        assert_eq!(web.parent_size, None);
 
         let md = ChunkParams::for_source_type(SourceType::Markdown);
         assert_eq!(md.size, 1500);
         assert_eq!(md.overlap, 150);
-        assert_eq!(md.parent_size, None);
 
         let text = ChunkParams::for_source_type(SourceType::Text);
         assert_eq!(text.size, 2048);
         assert_eq!(text.overlap, 200);
-        assert_eq!(text.parent_size, None);
 
         let docx = ChunkParams::for_source_type(SourceType::Docx);
         assert_eq!(docx.size, 1500);
         assert_eq!(docx.overlap, 150);
-        assert_eq!(docx.parent_size, None);
 
         let epub = ChunkParams::for_source_type(SourceType::Epub);
         assert_eq!(epub.size, 1500);
         assert_eq!(epub.overlap, 150);
-        assert_eq!(epub.parent_size, None);
     }
 
     #[test]
     fn parent_child_params_for_types() {
-        let pdf = ChunkParams::parent_child_for_source_type(SourceType::Pdf);
-        assert_eq!(pdf.size, 256);
-        assert_eq!(pdf.overlap, 25);
-        assert_eq!(pdf.parent_size, Some(1024));
+        // The child pass is identical for every source type; only the parent
+        // geometry varies, and `parent_chunk_size` is its only definition.
+        let child = ChunkParams::child_params();
+        assert_eq!(child.size, 256);
+        assert_eq!(child.overlap, 25);
 
-        let web = ChunkParams::parent_child_for_source_type(SourceType::Web);
-        assert_eq!(web.size, 256);
-        assert_eq!(web.overlap, 25);
-        assert_eq!(web.parent_size, Some(1024));
-
-        let md = ChunkParams::parent_child_for_source_type(SourceType::Markdown);
-        assert_eq!(md.size, 256);
-        assert_eq!(md.overlap, 25);
-        assert_eq!(md.parent_size, Some(2048));
-
-        let text = ChunkParams::parent_child_for_source_type(SourceType::Text);
-        assert_eq!(text.size, 256);
-        assert_eq!(text.overlap, 25);
-        assert_eq!(text.parent_size, Some(1024));
-
-        let docx = ChunkParams::parent_child_for_source_type(SourceType::Docx);
-        assert_eq!(docx.size, 256);
-        assert_eq!(docx.overlap, 25);
-        assert_eq!(docx.parent_size, Some(2048));
-
-        let epub = ChunkParams::parent_child_for_source_type(SourceType::Epub);
-        assert_eq!(epub.size, 256);
-        assert_eq!(epub.overlap, 25);
-        assert_eq!(epub.parent_size, Some(2048));
+        assert_eq!(parent_chunk_size(SourceType::Pdf), 1024);
+        assert_eq!(parent_chunk_size(SourceType::Web), 1024);
+        assert_eq!(parent_chunk_size(SourceType::Markdown), 2048);
+        assert_eq!(parent_chunk_size(SourceType::Text), 1024);
+        assert_eq!(parent_chunk_size(SourceType::Docx), 2048);
+        assert_eq!(parent_chunk_size(SourceType::Epub), 2048);
+        assert_eq!(parent_chunk_size(SourceType::Youtube), 2048);
     }
 
     #[test]
@@ -1059,24 +1020,22 @@ mod tests {
 
     #[test]
     fn parent_child_parent_sizes_correct() {
-        // Verify parent sizes are accessible via the unified parent_child params
-        let pdf = ChunkParams::parent_child_for_source_type(SourceType::Pdf);
-        assert_eq!(pdf.parent_size, Some(1024));
-
-        let web = ChunkParams::parent_child_for_source_type(SourceType::Web);
-        assert_eq!(web.parent_size, Some(1024));
-
-        let md = ChunkParams::parent_child_for_source_type(SourceType::Markdown);
-        assert_eq!(md.parent_size, Some(2048));
-
-        let text = ChunkParams::parent_child_for_source_type(SourceType::Text);
-        assert_eq!(text.parent_size, Some(1024));
-
-        let docx = ChunkParams::parent_child_for_source_type(SourceType::Docx);
-        assert_eq!(docx.parent_size, Some(2048));
-
-        let epub = ChunkParams::parent_child_for_source_type(SourceType::Epub);
-        assert_eq!(epub.parent_size, Some(2048));
+        // Every parent must be strictly larger than a child, or the second pass
+        // could not split it.
+        for source_type in [
+            SourceType::Pdf,
+            SourceType::Web,
+            SourceType::Markdown,
+            SourceType::Text,
+            SourceType::Docx,
+            SourceType::Epub,
+            SourceType::Youtube,
+        ] {
+            assert!(
+                parent_chunk_size(source_type) > CHILD_CHUNK_SIZE,
+                "{source_type:?} parent is not larger than a child"
+            );
+        }
     }
 
     #[test]

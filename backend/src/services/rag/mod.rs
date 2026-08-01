@@ -7,6 +7,7 @@ pub mod contextual;
 pub mod embedding_cache;
 pub mod eval;
 pub mod hyde;
+pub mod provenance;
 pub mod query_reformulation;
 pub mod search;
 pub mod utils;

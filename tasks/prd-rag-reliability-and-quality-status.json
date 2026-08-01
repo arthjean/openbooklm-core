@@ -17,10 +17,10 @@
     {
       "id": "EP-002",
       "title": "Atomic, Idempotent, and Cancellable Indexing",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "stories_total": 7,
-      "stories_done": 0
+      "stories_done": 7
     },
     {
       "id": "EP-003",
@@ -99,95 +99,95 @@
       "id": "US-005",
       "title": "Validate the index-generation publication model",
       "epic": "EP-002",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "size": "M",
       "blocked_by": [],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-08-01",
+      "completed_at": "2026-08-01",
+      "reviewed_at": "2026-08-01"
     },
     {
       "id": "US-006",
       "title": "Add the generation schema and backfill",
       "epic": "EP-002",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "size": "L",
       "blocked_by": [
         "US-005"
       ],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-08-01",
+      "completed_at": "2026-08-01",
+      "reviewed_at": "2026-08-01"
     },
     {
       "id": "US-007",
       "title": "Write and validate immutable generations",
       "epic": "EP-002",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "size": "L",
       "blocked_by": [
         "US-006"
       ],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-08-01",
+      "completed_at": "2026-08-01",
+      "reviewed_at": "2026-08-01"
     },
     {
       "id": "US-008",
       "title": "Publish, read, rollback, and reclaim generations",
       "epic": "EP-002",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "size": "L",
       "blocked_by": [
         "US-007"
       ],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-08-01",
+      "completed_at": "2026-08-01",
+      "reviewed_at": "2026-08-01"
     },
     {
       "id": "US-009",
       "title": "Make source reprocessing single-owner and retry-safe",
       "epic": "EP-002",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "size": "M",
       "blocked_by": [
         "US-008"
       ],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-08-01",
+      "completed_at": "2026-08-01",
+      "reviewed_at": "2026-08-01"
     },
     {
       "id": "US-010",
       "title": "Own, cancel, and drain ingestion work",
       "epic": "EP-002",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "size": "L",
       "blocked_by": [],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-08-01",
+      "completed_at": "2026-08-01",
+      "reviewed_at": "2026-08-01"
     },
     {
       "id": "US-011",
       "title": "Version embeddings, caches, and chunking semantics",
       "epic": "EP-002",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "size": "M",
       "blocked_by": [
         "US-008"
       ],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-08-01",
+      "completed_at": "2026-08-01",
+      "reviewed_at": "2026-08-01"
     },
     {
       "id": "US-012",

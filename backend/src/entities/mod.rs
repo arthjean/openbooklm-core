@@ -37,6 +37,7 @@ pub mod notebook_memory;
 pub mod ocr_cache;
 pub mod rag_log;
 pub mod source;
+pub mod source_index_generation;
 
 pub use account::Entity as Account;
 pub use account_settings::Entity as AccountSettings;
@@ -48,3 +49,4 @@ pub use notebook_memory::Entity as NotebookMemory;
 pub use ocr_cache::Entity as OcrCache;
 pub use rag_log::Entity as RagLog;
 pub use source::Entity as Source;
+pub use source_index_generation::Entity as SourceIndexGeneration;

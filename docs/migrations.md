@@ -135,6 +135,28 @@ The rollback window is one stable hosted release. After it closes, a later PRD
 removes the legacy columns and tables, and rollback past that point requires a
 restore.
 
+## Applied core migrations
+
+| Version | Adds |
+|---|---|
+| `m20260729_000001_core_baseline` | the complete core schema for a fresh install |
+| `m20260801_000001_index_generations` | immutable index generations, the active-generation pointer, and the backfill of existing chunks (EP-002) |
+
+`m20260801_000001_index_generations` is additive and idempotent, and refuses to
+run on a corpus it cannot represent: among the chunks it would backfill,
+duplicate `(source_id, chunk_index)` pairs, NULL embeddings, or chunks whose
+source no longer exists abort the migration naming the source that caused it.
+Fix the listed sources and run it again. Chunks that already belong to a
+generation are not re-validated, so a replay on a database that has been
+reprocessed since stays a no-op.
+
+It also changes what the previous binary can do. The old code writes chunks
+without a `generation_id`, which the new `NOT NULL` constraint refuses, so the
+migration and the new binary deploy together — which is what the server already
+does under its advisory lock. See
+[architecture/index-generations.md](architecture/index-generations.md) for the
+model, its invariants and the tests that verify them.
+
 ## Adding a migration
 
 - **Core schema change** → new file in `backend/migration/src/core_track/`,

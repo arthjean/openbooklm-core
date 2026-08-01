@@ -14,6 +14,7 @@
 //! | existing hosted | the bridge records the baseline as satisfied; no core SQL runs |
 
 mod m20260729_000001_core_baseline;
+mod m20260801_000001_index_generations;
 
 use sea_orm_migration::prelude::*;
 use sea_orm_migration::sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
@@ -30,7 +31,10 @@ pub struct CoreMigrator;
 #[async_trait::async_trait]
 impl MigratorTrait for CoreMigrator {
     fn migrations() -> Vec<Box<dyn MigrationTrait>> {
-        vec![Box::new(m20260729_000001_core_baseline::Migration)]
+        vec![
+            Box::new(m20260729_000001_core_baseline::Migration),
+            Box::new(m20260801_000001_index_generations::Migration),
+        ]
     }
 
     fn migration_table_name() -> sea_orm::DynIden {

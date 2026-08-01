@@ -34,6 +34,8 @@ use openbooklm::services::rag::provenance::{
     ChunkingProvenance, EmbeddingProvenance, GenerationProvenance, Normalization,
 };
 use openbooklm::types::{ChunkMetadata, ChunkWithContext};
+use openbooklm_migration_core::MigratorTrait;
+use openbooklm_migration_core::core_track::CoreMigrator;
 
 // ============================================================================
 // Fixture
@@ -62,11 +64,20 @@ impl Fixture {
     ///
     /// Returns `None` when `TEST_DATABASE_URL` is unset, so an accidental run
     /// without a database skips rather than fails misleadingly.
+    ///
+    /// The migration is applied here rather than assumed, because assuming it
+    /// is what makes an unmigrated database fail as `relation "accounts" does
+    /// not exist` in twenty-one tests at once, which reads like a regression
+    /// and is not one. `CoreMigrator::up` is idempotent, so on a database that
+    /// is already migrated this costs one query against the history table.
     async fn setup() -> Option<Self> {
         let db_url = std::env::var("TEST_DATABASE_URL").ok()?;
         let db = openbooklm::db::connect(&db_url, &DatabasePoolConfig::default())
             .await
             .expect("connect to the test database");
+        CoreMigrator::up(&db, None)
+            .await
+            .expect("apply the core track to the test database");
 
         let account_id = Uuid::new_v4();
         let notebook_id = Uuid::new_v4();
@@ -526,9 +537,6 @@ impl ScratchDb {
 
     /// Apply the whole core track.
     async fn migrate(&self) -> Result<(), sea_orm::DbErr> {
-        use openbooklm_migration_core::MigratorTrait;
-        use openbooklm_migration_core::core_track::CoreMigrator;
-
         let db = self.connect().await;
         CoreMigrator::up(&db, None).await
     }

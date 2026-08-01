@@ -120,6 +120,12 @@ A citation that satisfies only the first is the failure this metric exists to
 catch. It is counted as wrong and classified: `unknown_chunk`,
 `stale_generation`, `cross_notebook`, `span_mismatch`, `unrelated_to_claim`.
 
+The chat path refuses the same things before a citation is ever emitted (US-019):
+a marker that resolves to nothing retrieved, a chunk with no index generation, a
+provider-native quote the document does not contain, and a marker written inside
+a code fence. Refusals are counted and reach the trace as `citation_rejected`,
+so a regression appears as refusals rather than as silently lower coverage.
+
 ### Abstention
 
 Abstention is correct exactly when the question cannot be answered from what was
@@ -148,6 +154,33 @@ RRF score is a function of ranks and a reranker score is provider-defined; they
 are not on the same scale, and recording which applies is what keeps a later
 consumer from averaging them. US-012 turns this into typed fields on the
 candidates themselves.
+
+## The hostile-content suite
+
+`contracts/eval/adversarial/cases.json` holds fifty synthetic hostile documents
+over six families — instruction override, secret request, fake system tag,
+poisoned citation, cross-notebook reference, encoded payload — and
+`rag-eval adversarial` assembles each into a real prompt.
+
+```bash
+cargo run --bin rag-eval -- adversarial            # exits non-zero on any violation
+cargo run --bin rag-eval -- adversarial --out /tmp/isolation.json
+```
+
+It is a release gate, not only a unit test: it fails when the suite drops below
+fifty cases, when an attack family loses its last fixture, when a payload breaks
+a boundary property, or when a citation resolves outside the retrieved set.
+
+It asserts structure, not behaviour. A model's refusal is not reproducible; what
+is reproducible is whether the payload could close its own element, forge a
+second data policy, or change a byte of the instructions that follow the
+evidence. Those are the preconditions of every successful injection, and the
+suite requires zero of them across all fifty cases.
+
+Cross-notebook reach is answered one layer down, where it is enforced: every
+search query joins `notebooks.user_id`, so a scope naming another account
+returns nothing. See
+[docs/architecture/prompt-assembly.md](../architecture/prompt-assembly.md).
 
 ## The release gate
 

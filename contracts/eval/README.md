@@ -16,6 +16,7 @@ for what each metric means and how the release gate decides.
 | `corpus/queries.json` | Labeled queries: category, split, judgments, expected claims |
 | `baseline/hybrid-train.json` | Approved measurement on the training split |
 | `baseline/hybrid-holdout.json` | Approved measurement on the holdout split |
+| `adversarial/cases.json` | Fifty hostile documents for the `rag-eval adversarial` gate (US-020) |
 
 ## Commands
 
@@ -30,6 +31,9 @@ cargo run --bin rag-eval -- retrieval --mode hybrid --split train
 
 # Measure answer behavior over the same retrieval
 cargo run --bin rag-eval -- grounding --split train
+
+# Every hostile fixture stays inside the untrusted-data boundary
+cargo run --bin rag-eval -- adversarial
 
 # Produce a candidate artifact and compare it against the approved one
 cargo run --bin rag-eval -- baseline --out /tmp/candidate.json \

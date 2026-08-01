@@ -25,6 +25,7 @@
 //!
 //! | Module | Story | Owns |
 //! |---|---|---|
+//! | [`adversarial`] | US-020 | Hostile-content fixtures and the prompt-isolation check |
 //! | [`corpus`] | US-001 | Fixture schema, loading, validation |
 //! | [`index`] | US-002 | In-memory [`SearchRepository`](crate::repositories::SearchRepository) over the corpus |
 //! | [`retrieval`] | US-002 | Recall/MRR/nDCG/fill/latency over the corpus |
@@ -32,6 +33,7 @@
 //! | [`trace`] | US-004 | Redacted per-retrieval trace |
 //! | [`baseline`] | US-004 | Baseline artifact and the regression gate |
 
+pub mod adversarial;
 pub mod baseline;
 pub mod corpus;
 pub mod grounding;
@@ -39,6 +41,7 @@ pub mod index;
 pub mod retrieval;
 pub mod trace;
 
+pub use adversarial::{AdversarialSuite, IsolationReport, check_prompt_isolation};
 pub use baseline::{Baseline, ComparisonReport, Enforcement, REGRESSION_TOLERANCE};
 pub use corpus::{
     CORPUS_RELATIVE_PATH, CorpusError, CorpusViolation, EvalCorpus, EvalQuery, QueryCategory,

@@ -4,6 +4,7 @@
 //! cargo run --bin rag-eval -- validate
 //! cargo run --bin rag-eval -- retrieval --mode hybrid --split train
 //! cargo run --bin rag-eval -- grounding --split train
+//! cargo run --bin rag-eval -- adversarial
 //! cargo run --bin rag-eval -- baseline --out contracts/eval/baseline/hybrid-train.json
 //! cargo run --bin rag-eval -- compare \
 //!     --baseline contracts/eval/baseline/hybrid-train.json \
@@ -18,6 +19,8 @@
 //!
 //! `0` when the requested check passed, `1` when it failed, `2` when the
 //! invocation itself was wrong. `validate` fails on any corpus violation;
+//! `adversarial` fails on any prompt-isolation violation or fabricated
+//! citation, which is the release gate US-020 AC-3 asks for;
 //! `compare` fails on a regression, a tenant-isolation failure, a missing
 //! required metric, an incomparable pair, and — only under
 //! `--enforce regression_and_targets` — an unmet absolute target.
@@ -26,6 +29,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use openbooklm::services::rag::eval::adversarial::{
+    AdversarialSuite, MIN_CASES, REQUIRED_FAMILIES, check_prompt_isolation,
+};
 use openbooklm::services::rag::eval::baseline::{
     Baseline, Enforcement, Targets, compare, missing_metrics,
 };
@@ -47,6 +53,7 @@ USAGE:
                        [--latency-out FILE] [--revision REV] [--now TIMESTAMP]
     rag-eval grounding [--mode MODE] [--split SPLIT] [--limit N] [--out FILE]
                        [--revision REV] [--now TIMESTAMP]
+    rag-eval adversarial [--out FILE]
     rag-eval baseline  --out FILE [--mode MODE] [--split SPLIT] [--limit N]
                        [--revision REV] [--now TIMESTAMP]
     rag-eval compare   --baseline FILE --candidate FILE
@@ -93,6 +100,7 @@ fn main() -> ExitCode {
         "validate" => runtime.block_on(validate(&flags)),
         "retrieval" => runtime.block_on(retrieval(&flags)),
         "grounding" => runtime.block_on(grounding(&flags)),
+        "adversarial" => adversarial(&flags),
         "baseline" => runtime.block_on(baseline(&flags)),
         "compare" => compare_command(&flags),
         "help" | "--help" | "-h" => {
@@ -271,6 +279,63 @@ async fn validate(flags: &Flags) -> ExitCode {
     eprintln!("FAIL {} corpus violation(s):", violations.len());
     for violation in &violations {
         eprintln!("  {violation}");
+    }
+    ExitCode::FAILURE
+}
+
+/// The hostile-content gate (US-020 AC-3).
+///
+/// Assembles every checked-in payload into a real prompt through the real
+/// renderer and the real builder, and fails on any property a successful
+/// injection would first have to break. It asserts structure, not a model's
+/// refusal: a refusal is not reproducible, an unescaped `</content>` is.
+fn adversarial(flags: &Flags) -> ExitCode {
+    let suite = match AdversarialSuite::load_default() {
+        Ok(suite) => suite,
+        Err(e) => return fail(&format!("could not load the adversarial suite: {e}")),
+    };
+
+    if suite.cases.len() < MIN_CASES {
+        return fail(&format!(
+            "the suite holds {} cases, US-020 requires at least {MIN_CASES}",
+            suite.cases.len()
+        ));
+    }
+    for family in REQUIRED_FAMILIES {
+        if !suite.cases.iter().any(|case| case.family == *family) {
+            return fail(&format!("attack family `{family}` has no fixture"));
+        }
+    }
+
+    let report = check_prompt_isolation(&suite);
+    if let Some(path) = flags.get("out")
+        && let Err(message) = write_json(Path::new(path), &report)
+    {
+        return fail(&message);
+    }
+
+    if report.is_clean() {
+        println!(
+            "ok  adversarial {} — {} cases, {} families, {} citation markers refused, \
+             0 boundary violations, 0 fabricated citations",
+            suite.version,
+            report.cases,
+            REQUIRED_FAMILIES.len(),
+            report.rejected_citation_markers,
+        );
+        return ExitCode::SUCCESS;
+    }
+
+    eprintln!(
+        "FAIL {} isolation violation(s), {} fabricated citation(s):",
+        report.violations.len(),
+        report.fabricated_citations
+    );
+    for violation in &report.violations {
+        eprintln!(
+            "  {} [{}] {}: {}",
+            violation.case_id, violation.family, violation.property, violation.detail
+        );
     }
     ExitCode::FAILURE
 }

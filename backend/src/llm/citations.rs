@@ -226,7 +226,7 @@ pub fn claim_is_supported_by(marker_start: usize, response: &str, evidence: &str
         .unwrap_or("")
         .trim_matches(|c: char| c.is_whitespace() || matches!(c, '-' | '*' | ':' | ';'));
     let claim_numbers = numeric_values(claim);
-    let evidence_numbers: HashSet<u128> = numeric_values(evidence).into_iter().collect();
+    let evidence_numbers: HashSet<String> = numeric_values(evidence).into_iter().collect();
     if claim_numbers
         .iter()
         .any(|number| !evidence_numbers.contains(number))
@@ -263,26 +263,122 @@ fn is_polarity_token(token: &str) -> bool {
     )
 }
 
-fn numeric_values(text: &str) -> Vec<u128> {
+fn numeric_values(text: &str) -> Vec<String> {
+    let mut values = numeric_literal_values(text);
     let tokens: Vec<String> = text
         .split(|c: char| !c.is_alphanumeric())
         .filter(|token| !token.is_empty())
         .map(str::to_lowercase)
         .collect();
-    let mut values = Vec::new();
     let mut index = 0;
     while index < tokens.len() {
-        if let Ok(value) = tokens[index].parse::<u128>() {
-            values.push(value);
+        if tokens[index].chars().any(|c| c.is_ascii_digit()) {
             index += 1;
         } else if let Some((value, consumed)) = parse_word_number(&tokens[index..]) {
-            values.push(value);
+            values.push(value.to_string());
             index += consumed;
         } else {
             index += 1;
         }
     }
     values
+}
+
+fn numeric_literal_values(text: &str) -> Vec<String> {
+    let mut runs = Vec::new();
+    let mut run = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character.is_ascii_digit() {
+            run.push(character);
+            continue;
+        }
+        if !run.is_empty()
+            && is_numeric_separator(character)
+            && chars.peek().is_some_and(char::is_ascii_digit)
+        {
+            run.push(character);
+            continue;
+        }
+        if run.is_empty()
+            && matches!(character, '-' | '+')
+            && chars.peek().is_some_and(char::is_ascii_digit)
+        {
+            run.push(character);
+            continue;
+        }
+        if run.chars().any(|c| c.is_ascii_digit()) {
+            runs.extend(normalize_numeric_run(&run));
+        }
+        run.clear();
+    }
+    if run.chars().any(|c| c.is_ascii_digit()) {
+        runs.extend(normalize_numeric_run(&run));
+    }
+    runs
+}
+
+fn normalize_numeric_run(run: &str) -> Vec<String> {
+    let (negative, unsigned) = match run.as_bytes().first() {
+        Some(b'-') => (true, &run[1..]),
+        Some(b'+') => (false, &run[1..]),
+        _ => (false, run),
+    };
+    let groups: Vec<&str> = unsigned
+        .split(is_numeric_separator)
+        .filter(|group| !group.is_empty())
+        .collect();
+    if groups.is_empty() {
+        return Vec::new();
+    }
+    if groups.len() == 1 {
+        return vec![canonical_integer(groups[0], negative)];
+    }
+
+    let separators: Vec<char> = unsigned
+        .chars()
+        .filter(|character| is_numeric_separator(*character))
+        .collect();
+    let is_grouped_integer = groups[0].len() <= 3
+        && groups[1..].iter().all(|group| group.len() == 3)
+        && separators.len() == groups.len() - 1;
+    if is_grouped_integer {
+        return vec![canonical_integer(&groups.concat(), negative)];
+    }
+
+    if groups.len() == 2 && separators.len() == 1 && matches!(separators[0], '.' | ',') {
+        let integer = groups[0].trim_start_matches('0');
+        let fraction = groups[1].trim_end_matches('0');
+        let integer = if integer.is_empty() { "0" } else { integer };
+        if fraction.is_empty() {
+            return vec![canonical_integer(integer, negative)];
+        }
+        let sign = if negative { "-" } else { "" };
+        return vec![format!("{sign}{integer}.{fraction}")];
+    }
+
+    groups
+        .iter()
+        .enumerate()
+        .map(|(index, group)| canonical_integer(group, negative && index == 0))
+        .collect()
+}
+
+fn canonical_integer(digits: &str, negative: bool) -> String {
+    let digits = digits.trim_start_matches('0');
+    let digits = if digits.is_empty() { "0" } else { digits };
+    if negative && digits != "0" {
+        format!("-{digits}")
+    } else {
+        digits.to_owned()
+    }
+}
+
+fn is_numeric_separator(character: char) -> bool {
+    matches!(
+        character,
+        '.' | ',' | '_' | '\'' | '’' | ' ' | '\u{00a0}' | '\u{202f}'
+    )
 }
 
 fn parse_word_number(tokens: &[String]) -> Option<(u128, usize)> {
@@ -792,6 +888,24 @@ mod tests {
         );
         assert_eq!(accepted_normalized_number.citations.len(), 1);
         assert_eq!(accepted_normalized_number.rejected, 0);
+
+        chunk.content = "The retry budget is 1,002 attempts before failure.".to_owned();
+        let unsupported_grouped_number = extract_citations_verified_against_active(
+            "The retry budget is 1,001 attempts [1].",
+            &[chunk.clone()],
+            &active,
+        );
+        assert!(unsupported_grouped_number.citations.is_empty());
+        assert_eq!(unsupported_grouped_number.rejected, 1);
+
+        chunk.content = "The retry budget is 1,001 attempts before failure.".to_owned();
+        let accepted_group_normalization = extract_citations_verified_against_active(
+            "The retry budget is 1001 attempts [1].",
+            &[chunk.clone()],
+            &active,
+        );
+        assert_eq!(accepted_group_normalization.citations.len(), 1);
+        assert_eq!(accepted_group_normalization.rejected, 0);
 
         chunk.content = "The retry budget is thirteen attempts before failure.".to_owned();
         let unsupported_dozen = extract_citations_verified_against_active(

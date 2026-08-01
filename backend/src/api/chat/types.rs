@@ -51,12 +51,23 @@ impl SendMessageRequest {
         validation::validate_message(&self.message)
     }
 
-    /// Returns `max_context_chunks` clamped to `[1, MAX_CONTEXT_CHUNKS]`.
+    /// Returns `max_context_chunks`, or a validation error.
     ///
-    /// Out-of-range values are silently clamped rather than rejected,
-    /// preventing DoS via excessive chunk retrieval.
-    pub(crate) fn clamped_max_context_chunks(&self) -> i32 {
-        self.max_context_chunks.clamp(1, MAX_CONTEXT_CHUNKS)
+    /// Rejected rather than clamped since US-013. Clamping made the contract
+    /// unobservable: a client asking for 100 contexts got 20 and a client
+    /// asking for 0 got 1, both silently, so neither could tell that the
+    /// server had substituted a different request. The retrieval pipeline
+    /// enforces this exact number on every branch, which is only meaningful if
+    /// the number is the one the caller asked for.
+    pub(crate) fn validated_max_context_chunks(&self) -> Result<i32, AppError> {
+        if (1..=MAX_CONTEXT_CHUNKS).contains(&self.max_context_chunks) {
+            Ok(self.max_context_chunks)
+        } else {
+            Err(AppError::Validation(format!(
+                "max_context_chunks must be between 1 and {MAX_CONTEXT_CHUNKS}, got {}",
+                self.max_context_chunks
+            )))
+        }
     }
 }
 
@@ -154,7 +165,7 @@ mod tests {
     }
 
     // ====================================================================
-    // US-003: max_context_chunks clamping
+    // US-013: max_context_chunks is validated, not clamped
     // ====================================================================
 
     fn make_request(max_context_chunks: i32) -> SendMessageRequest {
@@ -169,36 +180,42 @@ mod tests {
     }
 
     #[test]
-    fn max_context_chunks_within_range_unchanged() {
-        assert_eq!(make_request(10).clamped_max_context_chunks(), 10);
-        assert_eq!(make_request(1).clamped_max_context_chunks(), 1);
-        assert_eq!(
-            make_request(MAX_CONTEXT_CHUNKS).clamped_max_context_chunks(),
-            MAX_CONTEXT_CHUNKS
-        );
+    fn a_limit_inside_the_contract_is_returned_unchanged() {
+        for value in [1, 10, MAX_CONTEXT_CHUNKS] {
+            assert_eq!(
+                make_request(value)
+                    .validated_max_context_chunks()
+                    .expect("inside the contract"),
+                value
+            );
+        }
     }
 
     #[test]
-    fn max_context_chunks_over_limit_clamped() {
-        assert_eq!(
-            make_request(MAX_CONTEXT_CHUNKS + 1).clamped_max_context_chunks(),
-            MAX_CONTEXT_CHUNKS
-        );
-        assert_eq!(
-            make_request(100).clamped_max_context_chunks(),
-            MAX_CONTEXT_CHUNKS
-        );
-        assert_eq!(
-            make_request(i32::MAX).clamped_max_context_chunks(),
-            MAX_CONTEXT_CHUNKS
-        );
+    fn a_limit_above_the_contract_is_rejected_rather_than_clamped() {
+        for value in [MAX_CONTEXT_CHUNKS + 1, 100, i32::MAX] {
+            let error = make_request(value)
+                .validated_max_context_chunks()
+                .expect_err("above the contract");
+            assert!(
+                matches!(error, AppError::Validation(_)),
+                "an out-of-contract limit is a validation error, got {error:?}"
+            );
+            assert!(
+                error.to_string().contains(&MAX_CONTEXT_CHUNKS.to_string()),
+                "the error must name the bound: {error}"
+            );
+        }
     }
 
     #[test]
-    fn max_context_chunks_under_minimum_clamped() {
-        assert_eq!(make_request(0).clamped_max_context_chunks(), 1);
-        assert_eq!(make_request(-5).clamped_max_context_chunks(), 1);
-        assert_eq!(make_request(i32::MIN).clamped_max_context_chunks(), 1);
+    fn a_zero_or_negative_limit_is_rejected() {
+        for value in [0, -5, i32::MIN] {
+            assert!(
+                make_request(value).validated_max_context_chunks().is_err(),
+                "{value} contexts is not a request the pipeline can honour"
+            );
+        }
     }
 
     // ====================================================================

@@ -371,10 +371,11 @@ fn notes_for(mode: RetrievalMode) -> Vec<String> {
     ];
     if mode == RetrievalMode::Hybrid {
         notes.push(
-            "Fused results are re-sorted by (score desc, chunk id asc) before \
-             scoring. Reciprocal rank fusion leaves ties in hash order, which \
-             would make this report unstable; US-013 owns moving the \
-             tie-breaker into the production path."
+            "Fused results carry the production tie-break (score desc, chunk \
+             id asc), applied inside reciprocal rank fusion since US-013. The \
+             evaluator re-imposes the same order defensively, so a regression \
+             in the pipeline's tie-break shows up as a report diff rather than \
+             as a flapping report."
                 .to_owned(),
         );
     }
@@ -411,7 +412,7 @@ async fn score_query(
         notebook_id,
         &query.query,
         config.mode.as_str(),
-        config.mode.score_domain(),
+        Some(config.mode.score_domain()),
     );
     trace.generation_ids = vec![corpus.generation_id()];
 
@@ -421,7 +422,7 @@ async fn score_query(
     let latency_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
 
     if retrieved.dropped_non_finite > 0 {
-        trace.add_reason(ReasonCode::NonFiniteScore);
+        trace.reasons.insert(ReasonCode::NonFiniteScore);
     }
     let results = retrieved.results;
     let requested = usize::try_from(config.limit.max(0)).unwrap_or(0);
@@ -446,9 +447,9 @@ async fn score_query(
     trace.durations.search_ms = 0;
 
     if returned == 0 {
-        trace.add_reason(ReasonCode::NoCandidates);
+        trace.reasons.insert(ReasonCode::NoCandidates);
     } else if returned < requested {
-        trace.add_reason(ReasonCode::UnderfilledTopK);
+        trace.reasons.insert(ReasonCode::UnderfilledTopK);
     }
     if index
         .count_chunks_for_notebook(notebook_id)
@@ -456,7 +457,7 @@ async fn score_query(
         .unwrap_or(0)
         == 0
     {
-        trace.add_reason(ReasonCode::EmptyCorpus);
+        trace.reasons.insert(ReasonCode::EmptyCorpus);
     }
 
     // --- Tenant isolation -------------------------------------------------
@@ -467,7 +468,7 @@ async fn score_query(
         .collect();
     let isolation_breach = results.iter().any(|r| forbidden.contains(&r.source_id));
     if isolation_breach {
-        trace.add_reason(ReasonCode::IsolationBreach);
+        trace.reasons.insert(ReasonCode::IsolationBreach);
     }
 
     // --- Relevance judgments ---------------------------------------------
@@ -486,7 +487,7 @@ async fn score_query(
     // must be visible in the report, not an implicit zero.
     let judged = !relevant.is_empty();
     if query.answerable && !judged {
-        trace.add_reason(ReasonCode::MissingJudgment);
+        trace.reasons.insert(ReasonCode::MissingJudgment);
     }
 
     let hit_ranks: Vec<usize> = results
@@ -541,7 +542,7 @@ async fn score_query(
         round((returned - unique_parents) as f64 / returned as f64)
     };
     if unique_parents < returned {
-        trace.add_reason(ReasonCode::DedupShortfall);
+        trace.reasons.insert(ReasonCode::DedupShortfall);
     }
 
     #[allow(clippy::cast_precision_loss)]
@@ -622,18 +623,16 @@ async fn prepare(
     notebook_id: Uuid,
     query: &str,
 ) -> Result<RetrievedSet, AppError> {
-    let raw = retrieve_with(index, embedder, config, notebook_id, query).await?;
+    // A non-finite score cannot be ranked and must not reach a metric. The
+    // pipeline drops such a candidate at the conversion boundary and reports
+    // the count, so the evaluator no longer has to re-filter: a
+    // `RetrievalScore` that exists is finite by construction (US-012).
+    let (mut results, dropped_non_finite) =
+        retrieve_with(index, embedder, config, notebook_id, query).await?;
 
-    // A non-finite score cannot be ranked and must not reach a metric. Drop the
-    // candidate, and count it: silently coercing it to zero is how a broken
-    // provider looks like a mediocre one.
-    let before = raw.len();
-    let mut results: Vec<SearchResult> = raw
-        .into_iter()
-        .filter(|r| r.relevance_score.is_finite())
-        .collect();
-    let dropped_non_finite = before - results.len();
-
+    // One ordering pass for every mode, before the cut: truncating an
+    // unordered set is what would make the report depend on retrieval's
+    // internal iteration order.
     stabilize(&mut results);
     results.truncate(usize::try_from(config.limit.max(0)).unwrap_or(0));
 
@@ -650,18 +649,22 @@ async fn retrieve_with(
     config: &RetrievalRunConfig,
     notebook_id: Uuid,
     query: &str,
-) -> Result<Vec<SearchResult>, AppError> {
+) -> Result<(Vec<SearchResult>, usize), AppError> {
     // Every mode asks for the same pool: comparing modes at different pool
     // sizes would measure the pool, not the ranking.
     let pool = config.limit.max(1);
 
     match config.mode {
-        RetrievalMode::ExactReference => Ok(index
-            .exact_reference(notebook_id, query, pool)
-            .await?
-            .into_iter()
-            .map(SearchResult::from)
-            .collect()),
+        RetrievalMode::ExactReference => {
+            let chunks = index.exact_reference(notebook_id, query, pool).await?;
+            let total = chunks.len();
+            let results: Vec<SearchResult> = chunks
+                .into_iter()
+                .filter_map(|c| SearchResult::from_chunk(c, ScoreDomain::DenseSimilarity))
+                .collect();
+            let dropped = total - results.len();
+            Ok((results, dropped))
+        }
         mode => {
             let search_mode = match mode {
                 RetrievalMode::Dense => SearchMode::Dense,
@@ -675,7 +678,7 @@ async fn retrieve_with(
             // cache: an offline run must measure retrieval, not what a previous
             // run happened to leave behind.
             let query_embedder = crate::services::rag::search::QueryEmbedder::direct(embedder);
-            let (results, _, _) = search(
+            let found = search(
                 index,
                 &config.fusion,
                 notebook_id,
@@ -683,24 +686,23 @@ async fn retrieve_with(
                 &query_embedder,
             )
             .await?;
-            Ok(results)
+            Ok((found.results, found.dropped_non_finite))
         }
     }
 }
 
-/// Impose a total order on a result set.
+/// Assert the total order the pipeline now guarantees.
 ///
-/// Reciprocal rank fusion collects into a `HashMap` and sorts with a stable
-/// sort, so equal scores come out in hash-iteration order, which differs
-/// between processes. Scoring that directly would make the report flap. The
-/// tie-break lives here rather than in the pipeline because US-013 owns the
-/// production truncation contract; until then, the evaluator states what it did
-/// in the report notes instead of quietly depending on luck.
+/// Since US-013 the production path breaks score ties on the chunk identifier,
+/// so a fused result set arrives here already totally ordered. This re-imposes
+/// the same order for the modes that bypass fusion (the exact reference) and
+/// keeps the evaluator honest if the pipeline's tie-break ever regresses: the
+/// sort is idempotent when the invariant holds and repairs the report when it
+/// does not, which a `debug_assert` alone could not do in a release run.
 fn stabilize(results: &mut [SearchResult]) {
     results.sort_by(|a, b| {
-        b.relevance_score
-            .partial_cmp(&a.relevance_score)
-            .unwrap_or(std::cmp::Ordering::Equal)
+        a.score
+            .cmp_desc(b.score)
             .then_with(|| a.chunk_id.cmp(&b.chunk_id))
     });
 }
@@ -949,7 +951,7 @@ mod tests {
             .collect();
         for outcome in &empty {
             assert!(
-                outcome.trace.reasons.contains(&ReasonCode::NoCandidates),
+                outcome.trace.reasons.contains(ReasonCode::NoCandidates),
                 "{} returned nothing without a reason",
                 outcome.query_id
             );
@@ -975,8 +977,8 @@ mod tests {
             .expect("run");
         assert!(
             run.report.queries.iter().all(|q| {
-                q.trace.reasons.contains(&ReasonCode::UnderfilledTopK)
-                    || q.trace.reasons.contains(&ReasonCode::NoCandidates)
+                q.trace.reasons.contains(ReasonCode::UnderfilledTopK)
+                    || q.trace.reasons.contains(ReasonCode::NoCandidates)
             }),
             "an underfilled run must say so"
         );
@@ -1086,8 +1088,9 @@ mod tests {
             chunk_index: 0,
             content: "c".to_owned(),
             parent_content: parent.map(str::to_owned),
-            relevance_score: 0.5,
+            score: crate::types::RetrievalScore::Rrf(0.5),
             metadata: None,
+            collapsed_children: Vec::new(),
         };
 
         // Two children of one parent in one source: one context.

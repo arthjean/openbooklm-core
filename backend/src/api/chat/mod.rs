@@ -101,7 +101,7 @@ pub async fn send_message_handler(
         config: &state.config,
         notebook_id,
         query: &req.message,
-        max_chunks: payload.clamped_max_context_chunks(),
+        max_chunks: req.max_context_chunks,
         embeddings: &state.clients.embeddings,
         reranker: &state.clients.reranker,
         hyde_service: state.clients.hyde_service.as_ref(),
@@ -115,7 +115,7 @@ pub async fn send_message_handler(
     })
     .await;
     let context_chunks = retrieved.chunks;
-    let rag_timings = retrieved.timings;
+    let rag_outcome = retrieved.outcome;
     let reformulated_query = retrieved.reformulated_query;
 
     // 5. Build system prompt
@@ -223,7 +223,7 @@ pub async fn send_message_handler(
         mistral: state.clients.mistral.clone(),
         user_question: req.message,
         locale: payload.locale.as_deref().unwrap_or("en").to_owned(),
-        rag_timings,
+        rag_outcome,
         reformulated_query,
         memory_enabled: req.memory_enabled,
         embeddings: state.clients.embeddings.clone(),

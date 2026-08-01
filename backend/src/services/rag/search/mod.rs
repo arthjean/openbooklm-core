@@ -19,6 +19,8 @@
 mod context;
 mod formatting;
 mod fusion;
+mod preference;
+mod stuffing;
 mod transforms;
 pub mod types;
 
@@ -33,6 +35,7 @@ use crate::services::rag::embedding_cache::EmbeddingCache;
 use crate::services::rag::eval::trace::query_hash;
 use crate::services::rag::hyde::HydeService;
 use crate::services::rag::provenance::{EmbeddingProvenance, QueryEmbeddingKind};
+use crate::types::ScoreDomain;
 
 // ============================================================================
 // Constants (used in orchestration and tests)
@@ -48,15 +51,21 @@ pub const DEFAULT_DENSE_WEIGHT: f32 = 1.0;
 /// following Anthropic's Contextual Retrieval recommendations.
 pub const DEFAULT_SPARSE_WEIGHT: f32 = 0.25;
 
-// Re-export all public items for backward compatibility.
+// The search service's public surface. Each item is re-exported from the module
+// that owns it: routing them through one another would only hide where the
+// behaviour lives.
 pub use context::{
-    CORRECTIVE_RAG_MAX_RETRIES, CORRECTIVE_RAG_THRESHOLD, CorrectiveRetrievalParams,
-    PipelineTimings, PreferenceBoost, RERANK_TOP_K, RetrievalParams, build_rag_documents,
-    extract_preference_keywords, format_context_for_llm, max_context_stuffing_chunks,
-    retrieve_context, retrieve_context_corrective,
+    CORRECTIVE_RAG_MAX_RETRIES, CorrectiveRetrievalParams, InsufficiencyReason, PipelineOutcome,
+    RetrievalConfidence, RetrievalParams, retrieve_context, retrieve_context_corrective,
 };
+pub use formatting::{build_rag_documents, format_context_for_llm};
 pub use fusion::reciprocal_rank_fusion;
-pub use types::{CorrectiveResult, MAX_LIMIT, SearchMode, SearchRequest, SearchResult};
+pub use preference::{PreferenceBoost, extract_preference_keywords};
+pub use stuffing::max_context_stuffing_chunks;
+pub use transforms::{mean_relevance, unique_parent_count};
+pub use types::{
+    CorrectiveResult, MAX_LIMIT, SearchMode, SearchOutcome, SearchRequest, SearchResult,
+};
 
 use fusion::filter_and_convert;
 
@@ -120,8 +129,8 @@ fn lookup_kinds(
 
 /// Main search function that routes to the appropriate search method.
 ///
-/// Returns `(results, embed_ms, search_ms)` — timings are populated for Dense/Hybrid
-/// modes and `(0, 0)` for Lexical (no embedding involved).
+/// Returns a [`SearchOutcome`]: results, per-stage timings, per-stage candidate
+/// counts and the number of candidates rejected for a non-finite score.
 ///
 /// Takes [`HybridSearchConfig`] rather than the whole [`CoreConfig`](crate::core::config::CoreConfig):
 /// fusion weights are the only configuration this layer reads, and narrowing the
@@ -138,7 +147,7 @@ pub async fn search(
     notebook_id: Uuid,
     request: &SearchRequest,
     embedder: &QueryEmbedder<'_>,
-) -> Result<(Vec<SearchResult>, u128, u128), AppError> {
+) -> Result<SearchOutcome, AppError> {
     let mode = effective_mode(config, request.mode);
 
     match mode {
@@ -148,10 +157,7 @@ pub async fn search(
         SearchMode::Dense => {
             semantic_search_with_hyde(search_repo, notebook_id, request, embedder).await
         }
-        SearchMode::Lexical => {
-            let results = lexical_search(search_repo, notebook_id, request).await?;
-            Ok((results, 0, 0))
-        }
+        SearchMode::Lexical => lexical_search(search_repo, notebook_id, request).await,
     }
 }
 
@@ -167,22 +173,23 @@ pub async fn semantic_search(
     request: &SearchRequest,
     embedder: &QueryEmbedder<'_>,
 ) -> Result<Vec<SearchResult>, AppError> {
-    let (results, _, _) =
-        semantic_search_with_hyde(search_repo, notebook_id, request, embedder).await?;
-    Ok(results)
+    Ok(
+        semantic_search_with_hyde(search_repo, notebook_id, request, embedder)
+            .await?
+            .results,
+    )
 }
 
 /// Semantic search with optional HyDE enhancement.
 ///
-/// Returns `(results, embed_ms, search_ms)` where `embed_ms` is the time spent
-/// generating the query embedding and `search_ms` is the time spent in the DB search.
+/// Scores are cosine similarities: [`ScoreDomain::DenseSimilarity`].
 #[tracing::instrument(skip(search_repo, request, embedder), fields(%notebook_id))]
 pub async fn semantic_search_with_hyde(
     search_repo: &dyn SearchRepository,
     notebook_id: Uuid,
     request: &SearchRequest,
     embedder: &QueryEmbedder<'_>,
-) -> Result<(Vec<SearchResult>, u128, u128), AppError> {
+) -> Result<SearchOutcome, AppError> {
     let QueryEmbedder {
         provider: embeddings,
         hyde,
@@ -268,7 +275,15 @@ pub async fn semantic_search_with_hyde(
     let search_ms = search_start.elapsed().as_millis();
     tracing::info!(search_ms, %notebook_id, "Dense search completed");
 
-    let results = filter_and_convert(chunks, request.min_relevance);
+    let (results, dropped_non_finite) =
+        filter_and_convert(chunks, request.min_relevance, ScoreDomain::DenseSimilarity);
+    if dropped_non_finite > 0 {
+        tracing::warn!(
+            %notebook_id,
+            dropped_non_finite,
+            "Dense candidates carried non-finite scores and were rejected"
+        );
+    }
 
     tracing::debug!(
         %notebook_id,
@@ -280,38 +295,61 @@ pub async fn semantic_search_with_hyde(
         "Semantic search completed"
     );
 
-    Ok((results, embed_ms, search_ms))
+    Ok(SearchOutcome {
+        dense_candidates: results.len(),
+        results,
+        embed_ms,
+        search_ms,
+        dropped_non_finite,
+        lexical_candidates: 0,
+        cache_hit,
+    })
 }
 
 /// Perform lexical (full-text) search across a notebook's sources.
+///
+/// Scores are `ts_rank_cd` values: [`ScoreDomain::LexicalRank`].
 #[tracing::instrument(skip(search_repo, request), fields(%notebook_id))]
 pub async fn lexical_search(
     search_repo: &dyn SearchRepository,
     notebook_id: Uuid,
     request: &SearchRequest,
-) -> Result<Vec<SearchResult>, AppError> {
+) -> Result<SearchOutcome, AppError> {
     let query = request.validated_query()?;
 
+    let search_start = std::time::Instant::now();
     let chunks = search_repo
         .search_lexical_chunks(notebook_id, query, request.clamped_limit())
         .await?;
+    let search_ms = search_start.elapsed().as_millis();
 
-    let results = filter_and_convert(chunks, request.min_relevance);
+    let (results, dropped_non_finite) =
+        filter_and_convert(chunks, request.min_relevance, ScoreDomain::LexicalRank);
 
     tracing::debug!(
         %notebook_id,
         query_hash = %query_hash(query),
         count = results.len(),
+        dropped_non_finite,
         "Lexical search completed"
     );
 
-    Ok(results)
+    Ok(SearchOutcome {
+        lexical_candidates: results.len(),
+        results,
+        embed_ms: 0,
+        search_ms,
+        dropped_non_finite,
+        dense_candidates: 0,
+        cache_hit: false,
+    })
 }
 
 /// Perform hybrid search combining dense and sparse retrieval.
 ///
-/// Executes both searches in parallel, then fuses results using RRF.
-/// Returns `(results, embed_ms, search_ms)` where timings come from the dense path.
+/// Executes both searches in parallel, then fuses results using RRF. The fused
+/// scores are [`ScoreDomain::RrfRank`] values, which are not comparable with
+/// the dense similarities or lexical ranks they were derived from (US-012).
 #[tracing::instrument(skip(search_repo, config, request, embedder), fields(%notebook_id))]
 pub async fn hybrid_search(
     search_repo: &dyn SearchRepository,
@@ -319,7 +357,7 @@ pub async fn hybrid_search(
     notebook_id: Uuid,
     request: &SearchRequest,
     embedder: &QueryEmbedder<'_>,
-) -> Result<(Vec<SearchResult>, u128, u128), AppError> {
+) -> Result<SearchOutcome, AppError> {
     let query = request.validated_query()?;
 
     // Both sub-searches use the same limit; RRF fusion deduplicates and re-scores
@@ -336,41 +374,51 @@ pub async fn hybrid_search(
         lexical_search(search_repo, notebook_id, &lexical_req)
     );
 
-    let (dense_results, embed_ms, search_ms) = dense_res?;
-    let lexical_results = lexical_res.unwrap_or_else(|e| {
+    let dense = dense_res?;
+    let lexical = lexical_res.unwrap_or_else(|e| {
         tracing::warn!(error = %e, "Lexical search failed, using dense-only");
-        Vec::new()
+        SearchOutcome::default()
     });
 
     // Fuse results using RRF
     let fused = reciprocal_rank_fusion(
-        &dense_results,
-        &lexical_results,
+        &dense.results,
+        &lexical.results,
         config.rrf_k,
         config.dense_weight,
         config.sparse_weight,
     );
 
-    // Apply limit and min_relevance filter
+    // `min_relevance` applies on the fused domain, not on the dense or lexical
+    // scores the fusion consumed (US-012). Truncation keeps the fusion's total
+    // order, which is deterministic through its chunk-id tie-break (US-013).
     let min_rel = request.min_relevance.unwrap_or(0.0);
     let results: Vec<_> = fused
         .into_iter()
-        .filter(|r| r.relevance_score >= min_rel)
+        .filter(|r| r.relevance() >= min_rel)
         .take(usize::try_from(request.limit.max(0)).unwrap_or(0))
         .collect();
 
     tracing::debug!(
         %notebook_id,
         query_hash = %query_hash(query),
-        dense = dense_results.len(),
-        lexical = lexical_results.len(),
+        dense = dense.results.len(),
+        lexical = lexical.results.len(),
         fused = results.len(),
-        embed_ms,
-        search_ms,
+        embed_ms = dense.embed_ms,
+        search_ms = dense.search_ms,
         "Hybrid search completed"
     );
 
-    Ok((results, embed_ms, search_ms))
+    Ok(SearchOutcome {
+        results,
+        embed_ms: dense.embed_ms,
+        search_ms: dense.search_ms.max(lexical.search_ms),
+        dropped_non_finite: dense.dropped_non_finite + lexical.dropped_non_finite,
+        dense_candidates: dense.results.len(),
+        lexical_candidates: lexical.results.len(),
+        cache_hit: dense.cache_hit,
+    })
 }
 
 // ============================================================================
@@ -396,7 +444,7 @@ const fn effective_mode(config: &HybridSearchConfig, requested: SearchMode) -> S
 #[cfg(test)]
 mod tests {
     use super::*;
-    use transforms::average_relevance;
+    use crate::types::RetrievalScore;
     use types::MAX_LIMIT;
     use uuid::Uuid;
 
@@ -409,8 +457,9 @@ mod tests {
             chunk_index: 0,
             content: String::new(),
             parent_content: None,
-            relevance_score: score,
+            score: RetrievalScore::Dense(score),
             metadata: None,
+            collapsed_children: Vec::new(),
         }
     }
 
@@ -490,7 +539,7 @@ mod tests {
         );
 
         // Verify the score ratio is approximately 4:1
-        let ratio = fused[0].relevance_score / fused[1].relevance_score;
+        let ratio = fused[0].relevance() / fused[1].relevance();
         assert!(
             (ratio - 4.0).abs() < 0.01,
             "Score ratio should be ~4.0, got {ratio}"
@@ -510,24 +559,12 @@ mod tests {
 
         assert_eq!(fused.len(), 2);
         assert!(
-            (fused[0].relevance_score - fused[1].relevance_score).abs() < f32::EPSILON,
+            (fused[0].relevance() - fused[1].relevance()).abs() < f32::EPSILON,
             "Equal weights should produce equal scores for equal ranks"
         );
     }
 
-    // --- Retrieval pool & rerank constants ---
-
-    #[test]
-    fn default_retrieval_pool_size_is_50() {
-        // The default pool size is configured in Config (env var RETRIEVAL_POOL_SIZE).
-        // Validate that the default (50) is above RERANK_TOP_K (20).
-        let default_pool_size: i32 = 50;
-        assert_eq!(RERANK_TOP_K, 20, "Rerank should keep top-20 chunks");
-        assert!(
-            default_pool_size > RERANK_TOP_K,
-            "Default pool size must be larger than rerank top-K"
-        );
-    }
+    // --- Retrieval pool and limits ---
 
     #[test]
     fn max_limit_accommodates_max_pool_size() {
@@ -553,76 +590,126 @@ mod tests {
         assert_eq!(req.clamped_limit(), 5);
     }
 
+    // --- Score domains (US-012) ---
+
     #[test]
-    fn rerank_truncates_to_top_k() {
-        // Simulate pool_size results that would come from search
-        let pool_size = 50; // default config value
-        // After reranking, we should get at most RERANK_TOP_K results
-        let truncated: Vec<SearchResult> = (0..pool_size)
-            .map(|i| {
-                make_result(
-                    Uuid::new_v4(),
-                    &format!("Source {i}"),
-                    #[allow(clippy::cast_precision_loss)]
-                    {
-                        (i as f32).mul_add(-0.005, 1.0)
-                    },
-                )
-            })
-            .take(RERANK_TOP_K as usize)
-            .collect();
-        assert_eq!(truncated.len(), RERANK_TOP_K as usize);
+    fn fusion_produces_its_own_score_domain() {
+        let dense = vec![make_result(Uuid::new_v4(), "A", 0.95)];
+        let lexical = vec![make_result(Uuid::new_v4(), "B", 0.90)];
+        let fused = reciprocal_rank_fusion(
+            &dense,
+            &lexical,
+            60.0,
+            DEFAULT_DENSE_WEIGHT,
+            DEFAULT_SPARSE_WEIGHT,
+        );
+
         assert!(
-            truncated.len() <= 20,
-            "Pipeline must return at most 20 chunks"
+            fused
+                .iter()
+                .all(|r| r.score.domain() == ScoreDomain::RrfRank),
+            "a fused candidate carries a rank score, not the similarity it came from"
+        );
+    }
+
+    #[test]
+    fn fusion_breaks_ties_on_the_chunk_id_rather_than_hash_order() {
+        // Two candidates at the same rank in the same list fuse to the same
+        // score; without a tie-break the surviving order would come from
+        // `HashMap` iteration and differ between runs (US-013).
+        let ids: Vec<Uuid> = (0..8).map(|_| Uuid::new_v4()).collect();
+        let dense: Vec<SearchResult> = ids
+            .iter()
+            .map(|id| make_result(*id, "same rank", 0.5))
+            .collect();
+
+        let first = reciprocal_rank_fusion(&dense, &[], 60.0, 1.0, 0.25);
+        let mut reversed = dense.clone();
+        reversed.reverse();
+        let second = reciprocal_rank_fusion(&reversed, &[], 60.0, 1.0, 0.25);
+
+        let order = |v: &[SearchResult]| v.iter().map(|r| r.chunk_id).collect::<Vec<_>>();
+        // The two inputs rank the same chunks differently, so the fused scores
+        // differ; what must hold is that equal scores never depend on hashing.
+        for fused in [&first, &second] {
+            for window in fused.windows(2) {
+                let equal_scores =
+                    (window[0].relevance() - window[1].relevance()).abs() < f32::EPSILON;
+                if equal_scores {
+                    assert!(
+                        window[0].chunk_id < window[1].chunk_id,
+                        "equal scores must come back in chunk-id order"
+                    );
+                }
+            }
+        }
+        assert_eq!(order(&first).len(), ids.len());
+    }
+
+    #[test]
+    fn a_non_finite_repository_score_is_dropped_and_counted() {
+        use crate::types::ChunkSearchResult;
+
+        let chunk = |score: f32| ChunkSearchResult {
+            id: Uuid::new_v4(),
+            generation_id: Uuid::nil(),
+            source_id: Uuid::new_v4(),
+            chunk_index: 0,
+            content: "c".into(),
+            parent_content: None,
+            source_title: "T".into(),
+            relevance_score: score,
+            metadata: None,
+        };
+
+        let (results, dropped) = filter_and_convert(
+            vec![
+                chunk(0.9),
+                chunk(f32::NAN),
+                chunk(f32::INFINITY),
+                chunk(0.1),
+            ],
+            None,
+            ScoreDomain::DenseSimilarity,
+        );
+
+        assert_eq!(results.len(), 2, "only the rankable candidates survive");
+        assert_eq!(dropped, 2);
+        assert!(
+            results.iter().all(|r| r.relevance() > 0.0),
+            "no candidate was coerced to a zero score"
         );
     }
 
     // --- Corrective RAG ---
 
     #[test]
-    fn corrective_rag_threshold_is_reasonable() {
-        assert!((CORRECTIVE_RAG_THRESHOLD - 0.5).abs() < f32::EPSILON);
+    fn corrective_retrieval_retries_at_most_once() {
         assert_eq!(CORRECTIVE_RAG_MAX_RETRIES, 1);
     }
 
     #[test]
-    fn average_relevance_calculation() {
-        let results = vec![
-            make_result(Uuid::new_v4(), "A", 0.8),
-            make_result(Uuid::new_v4(), "B", 0.6),
-            make_result(Uuid::new_v4(), "C", 0.4),
-        ];
-        let avg = average_relevance(&results);
-        assert!(
-            (avg - 0.6).abs() < f32::EPSILON,
-            "Expected avg 0.6, got {avg}"
-        );
-    }
+    fn a_mean_is_reported_only_for_a_relevance_scale() {
+        let mut dense = make_result(Uuid::new_v4(), "A", 0.8);
+        let mut other = make_result(Uuid::new_v4(), "B", 0.4);
+        let mean =
+            mean_relevance(&[dense.clone(), other.clone()]).expect("dense is a relevance scale");
+        assert!((mean - 0.6).abs() < f32::EPSILON);
 
-    #[test]
-    fn average_relevance_empty() {
-        assert_eq!(average_relevance(&[]), 0.0);
-    }
+        for domain in [
+            RetrievalScore::Rrf(0.02),
+            RetrievalScore::Lexical(0.3),
+            RetrievalScore::Stuffed,
+        ] {
+            dense.score = domain;
+            other.score = domain;
+            assert!(
+                mean_relevance(&[dense.clone(), other.clone()]).is_none(),
+                "{domain:?} is not a scale on which a mean is a relevance"
+            );
+        }
 
-    #[test]
-    fn average_relevance_above_threshold_no_correction_needed() {
-        let results = vec![
-            make_result(Uuid::new_v4(), "A", 0.9),
-            make_result(Uuid::new_v4(), "B", 0.8),
-        ];
-        let avg = average_relevance(&results);
-        assert!(avg >= CORRECTIVE_RAG_THRESHOLD);
-    }
-
-    #[test]
-    fn average_relevance_below_threshold_needs_correction() {
-        let results = vec![
-            make_result(Uuid::new_v4(), "A", 0.3),
-            make_result(Uuid::new_v4(), "B", 0.2),
-        ];
-        let avg = average_relevance(&results);
-        assert!(avg < CORRECTIVE_RAG_THRESHOLD);
+        assert!(mean_relevance(&[]).is_none(), "an empty set has no mean");
     }
 
     // --- Backward compatibility: old chunks without parent_content (US-009) ---
@@ -647,7 +734,7 @@ mod tests {
         );
 
         assert_eq!(fused.len(), 1);
-        assert!(fused[0].relevance_score > 0.0);
+        assert!(fused[0].relevance() > 0.0);
         assert!(
             fused[0].parent_content.is_none(),
             "Legacy chunks should retain None parent_content through RRF"

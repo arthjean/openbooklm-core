@@ -123,6 +123,158 @@ impl From<SourceType> for String {
 }
 
 // ============================================================================
+// Score domains (US-012)
+// ============================================================================
+
+/// Which scale a candidate's score is expressed on.
+///
+/// Five retrieval stages produce a number called "relevance" and none of them
+/// means the same thing: an RRF score is a function of ranks, a dense score is
+/// a similarity, `ts_rank_cd` is a lexical rank, a reranker's score is defined
+/// by its provider, and stuffing assigns a constant. Averaging or thresholding
+/// across two of them is the defect US-012 removes, so the scale travels with
+/// the value rather than being inferred from the call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScoreDomain {
+    /// Reciprocal-rank-fusion score. A function of ranks, not of similarity.
+    RrfRank,
+    /// `1 - cosine_distance`, clamped at zero.
+    DenseSimilarity,
+    /// PostgreSQL `ts_rank_cd`, clamped at one.
+    LexicalRank,
+    /// A reranking provider's relevance score. Scale is provider-defined and
+    /// not comparable across providers.
+    RerankerRelevance,
+    /// Context stuffing assigns every chunk the same score; the value carries
+    /// no ranking information at all.
+    StuffingUniform,
+}
+
+impl ScoreDomain {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RrfRank => "rrf_rank",
+            Self::DenseSimilarity => "dense_similarity",
+            Self::LexicalRank => "lexical_rank",
+            Self::RerankerRelevance => "reranker_relevance",
+            Self::StuffingUniform => "stuffing_uniform",
+        }
+    }
+
+    /// Whether a value on this scale means "how relevant", so that averaging it
+    /// over a result set produces a number worth reporting.
+    ///
+    /// False for [`RrfRank`](Self::RrfRank) (a rank artifact whose magnitude
+    /// depends on `k` and the pool size), [`LexicalRank`](Self::LexicalRank)
+    /// (unbounded below the clamp and query-dependent) and
+    /// [`StuffingUniform`](Self::StuffingUniform) (constant by construction).
+    #[must_use]
+    pub const fn is_relevance_scale(self) -> bool {
+        matches!(self, Self::DenseSimilarity | Self::RerankerRelevance)
+    }
+}
+
+impl std::fmt::Display for ScoreDomain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The uniform score context stuffing assigns.
+///
+/// Named rather than written as a literal so that a reader who finds `1.0` in a
+/// result set can tell it is "no ranking information" and not "perfect match".
+pub const STUFFING_UNIFORM_SCORE: f32 = 1.0;
+
+/// A ranking value together with the scale it belongs to.
+///
+/// Constructing one is the only way to attach a score to a candidate, and every
+/// constructor rejects a non-finite value: a NaN that reaches a comparator
+/// silently reorders a result set, and `NaN.max(0.0)`, which is how the dense
+/// path used to clamp, returns `0.0`, turning a broken provider into a
+/// plausible-looking bad one (US-012).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetrievalScore {
+    /// Cosine similarity from pgvector, clamped at zero.
+    Dense(f32),
+    /// PostgreSQL `ts_rank_cd`, clamped at one.
+    Lexical(f32),
+    /// Reciprocal rank fusion of the dense and lexical orderings.
+    Rrf(f32),
+    /// A reranking provider's relevance score, on that provider's scale.
+    Reranker(f32),
+    /// Every stuffed chunk carries the same score, which is no score.
+    Stuffed,
+}
+
+impl RetrievalScore {
+    /// Build a score on `domain`, rejecting anything that cannot be ranked.
+    ///
+    /// Returns `None` for NaN and both infinities. The caller drops the
+    /// candidate and records [`ReasonCode::NonFiniteScore`](crate::services::rag::eval::trace::ReasonCode::NonFiniteScore).
+    #[must_use]
+    pub fn new(domain: ScoreDomain, value: f32) -> Option<Self> {
+        if !value.is_finite() {
+            return None;
+        }
+        Some(match domain {
+            ScoreDomain::DenseSimilarity => Self::Dense(value),
+            ScoreDomain::LexicalRank => Self::Lexical(value),
+            ScoreDomain::RrfRank => Self::Rrf(value),
+            ScoreDomain::RerankerRelevance => Self::Reranker(value),
+            ScoreDomain::StuffingUniform => Self::Stuffed,
+        })
+    }
+
+    /// The scale this value is expressed on.
+    #[must_use]
+    pub const fn domain(self) -> ScoreDomain {
+        match self {
+            Self::Dense(_) => ScoreDomain::DenseSimilarity,
+            Self::Lexical(_) => ScoreDomain::LexicalRank,
+            Self::Rrf(_) => ScoreDomain::RrfRank,
+            Self::Reranker(_) => ScoreDomain::RerankerRelevance,
+            Self::Stuffed => ScoreDomain::StuffingUniform,
+        }
+    }
+
+    /// The raw value, for ordering *within* this domain and for the public
+    /// citation payload, which has carried one float since before EP-003.
+    #[must_use]
+    pub const fn value(self) -> f32 {
+        match self {
+            Self::Dense(v) | Self::Lexical(v) | Self::Rrf(v) | Self::Reranker(v) => v,
+            Self::Stuffed => STUFFING_UNIFORM_SCORE,
+        }
+    }
+
+    /// Descending comparison, valid only between two scores on the same scale.
+    ///
+    /// Mixed domains compare equal rather than producing an arbitrary order: a
+    /// result set is homogeneous by construction, so a mixed comparison is a
+    /// programming error, and the `debug_assert` is what surfaces it in tests
+    /// instead of shipping a subtly reordered list.
+    #[must_use]
+    pub fn cmp_desc(self, other: Self) -> std::cmp::Ordering {
+        debug_assert_eq!(
+            self.domain(),
+            other.domain(),
+            "scores from different domains must never be compared"
+        );
+        if self.domain() != other.domain() {
+            return std::cmp::Ordering::Equal;
+        }
+        other
+            .value()
+            .partial_cmp(&self.value())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    }
+}
+
+// ============================================================================
 // SearchResult
 // ============================================================================
 
@@ -137,24 +289,62 @@ pub struct SearchResult {
     pub chunk_index: i32,
     pub content: String,
     pub parent_content: Option<String>,
-    pub relevance_score: f32,
+    /// The ranking value and the scale it belongs to (US-012).
+    pub score: RetrievalScore,
     /// Chunk metadata (JSONB) — section_header, page_number, YouTube timestamps, etc.
     pub metadata: Option<serde_json::Value>,
+    /// Chunks collapsed into this one because they share its parent context.
+    ///
+    /// Diversification keeps one representative per parent; the identifiers of
+    /// the children it absorbed stay here so a diagnostic can tell "one passage
+    /// matched" from "six overlapping children of one passage matched"
+    /// (US-014).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub collapsed_children: Vec<Uuid>,
 }
 
-impl From<ChunkSearchResult> for SearchResult {
-    fn from(c: ChunkSearchResult) -> Self {
-        Self {
-            chunk_id: c.id,
-            generation_id: c.generation_id,
-            source_id: c.source_id,
-            source_title: c.source_title,
-            chunk_index: c.chunk_index,
-            content: c.content,
-            parent_content: c.parent_content,
-            relevance_score: c.relevance_score,
-            metadata: c.metadata,
-        }
+impl SearchResult {
+    /// Convert a repository row, attaching the domain the query it came from
+    /// produced.
+    ///
+    /// There is deliberately no `From<ChunkSearchResult>`: the repository row
+    /// carries a bare float, and only the call site knows whether it is a
+    /// cosine similarity, a lexical rank or a stuffing constant. Requiring the
+    /// domain here is what stops that knowledge from being lost (US-012).
+    #[must_use]
+    pub fn from_chunk(chunk: ChunkSearchResult, domain: ScoreDomain) -> Option<Self> {
+        let score = RetrievalScore::new(domain, chunk.relevance_score)?;
+        Some(Self {
+            chunk_id: chunk.id,
+            generation_id: chunk.generation_id,
+            source_id: chunk.source_id,
+            source_title: chunk.source_title,
+            chunk_index: chunk.chunk_index,
+            content: chunk.content,
+            parent_content: chunk.parent_content,
+            score,
+            metadata: chunk.metadata,
+            collapsed_children: Vec::new(),
+        })
+    }
+
+    /// The ranking value, for consumers that need one float.
+    #[must_use]
+    pub const fn relevance(&self) -> f32 {
+        self.score.value()
+    }
+
+    /// The canonical context this result stands for, when it has one.
+    ///
+    /// Two children of one parent inside one source are one context; the same
+    /// text in two sources is two, because citation attribution differs. A
+    /// chunk with no parent is its own context and returns `None`, which is
+    /// what keeps legacy chunks from collapsing into each other.
+    #[must_use]
+    pub fn parent_key(&self) -> Option<(Uuid, &str)> {
+        self.parent_content
+            .as_deref()
+            .map(|parent| (self.source_id, parent))
     }
 }
 
@@ -167,7 +357,7 @@ impl From<&SearchResult> for crate::llm::types::CitableChunk {
             // precise navigational anchors. The LLM receives parent_content via
             // format_context_for_llm in context.rs.
             content: sr.content.clone(),
-            relevance_score: sr.relevance_score,
+            relevance_score: sr.relevance(),
             metadata: sr.metadata.clone(),
         }
     }
@@ -476,6 +666,96 @@ mod tests {
     fn source_type_into_string_unchanged() {
         assert_eq!(String::from(SourceType::Pdf), "pdf");
         assert_eq!(String::from(SourceType::Web), "web");
+    }
+
+    // ── RetrievalScore tests (US-012) ─────────────────────────────────────
+
+    #[test]
+    fn a_score_carries_the_scale_it_was_measured_on() {
+        let cases = [
+            (ScoreDomain::DenseSimilarity, RetrievalScore::Dense(0.4)),
+            (ScoreDomain::LexicalRank, RetrievalScore::Lexical(0.4)),
+            (ScoreDomain::RrfRank, RetrievalScore::Rrf(0.4)),
+            (
+                ScoreDomain::RerankerRelevance,
+                RetrievalScore::Reranker(0.4),
+            ),
+        ];
+        for (domain, expected) in cases {
+            let score = RetrievalScore::new(domain, 0.4).expect("finite");
+            assert_eq!(score, expected);
+            assert_eq!(score.domain(), domain);
+            assert!((score.value() - 0.4).abs() < f32::EPSILON);
+        }
+    }
+
+    #[test]
+    fn stuffing_discards_the_value_because_it_carries_no_ranking() {
+        let score = RetrievalScore::new(ScoreDomain::StuffingUniform, 0.123).expect("finite");
+        assert_eq!(score, RetrievalScore::Stuffed);
+        assert!((score.value() - STUFFING_UNIFORM_SCORE).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn a_non_finite_score_is_rejected_rather_than_coerced_to_zero() {
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(
+                RetrievalScore::new(ScoreDomain::DenseSimilarity, value).is_none(),
+                "{value} must not produce a rankable score"
+            );
+        }
+        // The clamp the dense repository path used to apply turns NaN into 0.0,
+        // which is exactly the coercion US-012 forbids.
+        assert!((f32::NAN.max(0.0) - 0.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn only_relevance_scales_are_worth_averaging() {
+        assert!(ScoreDomain::DenseSimilarity.is_relevance_scale());
+        assert!(ScoreDomain::RerankerRelevance.is_relevance_scale());
+        assert!(!ScoreDomain::RrfRank.is_relevance_scale());
+        assert!(!ScoreDomain::LexicalRank.is_relevance_scale());
+        assert!(!ScoreDomain::StuffingUniform.is_relevance_scale());
+    }
+
+    #[test]
+    fn same_domain_scores_order_descending() {
+        let high = RetrievalScore::Reranker(0.9);
+        let low = RetrievalScore::Reranker(0.2);
+        assert_eq!(high.cmp_desc(low), std::cmp::Ordering::Less);
+        assert_eq!(low.cmp_desc(high), std::cmp::Ordering::Greater);
+        assert_eq!(high.cmp_desc(high), std::cmp::Ordering::Equal);
+    }
+
+    #[test]
+    fn score_domain_wire_names_are_pinned() {
+        assert_eq!(ScoreDomain::RrfRank.as_str(), "rrf_rank");
+        assert_eq!(ScoreDomain::DenseSimilarity.as_str(), "dense_similarity");
+        assert_eq!(ScoreDomain::LexicalRank.as_str(), "lexical_rank");
+        assert_eq!(
+            ScoreDomain::RerankerRelevance.as_str(),
+            "reranker_relevance"
+        );
+        assert_eq!(ScoreDomain::StuffingUniform.as_str(), "stuffing_uniform");
+    }
+
+    #[test]
+    fn a_chunk_with_no_parent_is_its_own_context() {
+        let mut result = SearchResult {
+            chunk_id: Uuid::new_v4(),
+            generation_id: Uuid::nil(),
+            source_id: Uuid::new_v4(),
+            source_title: "T".into(),
+            chunk_index: 0,
+            content: "c".into(),
+            parent_content: None,
+            score: RetrievalScore::Rrf(0.5),
+            metadata: None,
+            collapsed_children: Vec::new(),
+        };
+        assert!(result.parent_key().is_none());
+        result.parent_content = Some("p".into());
+        assert_eq!(result.parent_key(), Some((result.source_id, "p")));
     }
 
     // ── ChunkWithContext tests ────────────────────────────────────────────

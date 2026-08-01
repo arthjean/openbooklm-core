@@ -524,9 +524,12 @@ impl CoreConfig {
     }
 
     fn validate_rag_pipeline(&self, errors: &mut Vec<String>) {
+        // The floor is the largest context cardinality the API accepts
+        // (`MAX_CONTEXT_CHUNKS`). A pool smaller than that cannot fill a
+        // maximal request even before diversification collapses it (US-013).
         if self.retrieval_pool_size < 20 {
             errors.push(format!(
-                "RETRIEVAL_POOL_SIZE must be >= 20 (RERANK_TOP_K), got {}",
+                "RETRIEVAL_POOL_SIZE must be >= 20, the maximum requestable context count, got {}",
                 self.retrieval_pool_size
             ));
         }

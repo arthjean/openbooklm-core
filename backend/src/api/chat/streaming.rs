@@ -30,11 +30,9 @@ use crate::services::memory::{
     MIN_DROPPED_FOR_SUMMARY, apply_memory_actions, decay_memories, extract_memories,
     store_conversation_summary, summarize_truncated_history,
 };
-use crate::services::rag::eval::trace::{
-    ReasonCode, RetrievalTrace, ScoreDomain, StageCounts, StageDurations,
-};
+use crate::services::rag::eval::trace::{ReasonCode, RetrievalTrace, StageDurations};
 use crate::services::rag::rag_log::{ChunkLogEntry, RagLogEntry, create_rag_log};
-use crate::services::rag::search::PipelineTimings;
+use crate::services::rag::search::{PipelineOutcome, mean_relevance};
 use crate::types::MemoryDecayTracker;
 use crate::types::SearchResult;
 
@@ -80,8 +78,9 @@ pub(super) struct StreamContext {
     pub user_question: String,
     /// UI locale for generating follow-up suggestions in the correct language.
     pub locale: String,
-    /// Per-stage RAG pipeline timings (embed, search, rerank).
-    pub rag_timings: PipelineTimings,
+    /// What the RAG pipeline produced besides the contexts: timings, per-stage
+    /// candidate counts, reason codes and the score domain that ordered them.
+    pub rag_outcome: PipelineOutcome,
     /// The standalone query retrieval used, when reformulation changed it.
     /// Reaches the trace as a hash and is never logged as text.
     pub reformulated_query: Option<String>,
@@ -135,7 +134,7 @@ pub(super) async fn stream_llm_response(
         mistral,
         user_question,
         locale,
-        rag_timings,
+        rag_outcome,
         reformulated_query,
         memory_enabled,
         embeddings,
@@ -332,7 +331,7 @@ pub(super) async fn stream_llm_response(
         &user_question,
         reformulated_query.as_deref(),
         &context_chunks,
-        &rag_timings,
+        &rag_outcome,
         llm_ttft_ms.unwrap_or(0),
     )
     .emit();
@@ -351,14 +350,11 @@ pub(super) async fn stream_llm_response(
 
     out.emit(ChatEvent::citations(citations.clone())).await;
 
-    // Compute and send metrics (context_relevance from chunk scores)
-    let context_relevance = if context_chunks.is_empty() {
-        None
-    } else {
-        let sum: f32 = context_chunks.iter().map(|c| c.relevance_score).sum();
-        #[allow(clippy::cast_precision_loss)]
-        Some(sum / context_chunks.len() as f32)
-    };
+    // Mean score, but only from a scale on which a mean means something. An
+    // RRF value is a rank artifact and a stuffed chunk carries a constant;
+    // publishing either as "context relevance" reports a number that moves
+    // with the pool size rather than with the answer (US-012).
+    let context_relevance = mean_relevance(&context_chunks);
     out.emit(ChatEvent::metrics(context_relevance)).await;
 
     // Save complete response
@@ -398,12 +394,6 @@ pub(super) async fn stream_llm_response(
     // Create RAG log entry linked to the saved message
     #[allow(clippy::if_not_else)] // positive branch is the main logic path
     let rag_log_id = if !context_chunks.is_empty() {
-        #[allow(clippy::cast_precision_loss)]
-        let avg_score = context_chunks
-            .iter()
-            .map(|c| c.relevance_score)
-            .sum::<f32>()
-            / context_chunks.len() as f32;
         let entry = RagLogEntry {
             notebook_id,
             user_id: principal.account_id,
@@ -416,11 +406,13 @@ pub(super) async fn stream_llm_response(
                     chunk_id: c.chunk_id,
                     source_id: c.source_id,
                     chunk_index: c.chunk_index,
-                    relevance_score: c.relevance_score,
+                    relevance_score: c.relevance(),
                 })
                 .collect(),
             response_id: Some(saved_message.id),
-            retrieval_score_avg: Some(avg_score),
+            // Same rule as the streamed metric: an average is written only
+            // when the domain it came from is a relevance scale (US-012).
+            retrieval_score_avg: context_relevance,
             context_relevance,
             model: Some(model_name.to_string()),
             provider: Some(provider.name().to_string()),
@@ -474,19 +466,14 @@ fn build_retrieval_trace(
     query: &str,
     reformulated: Option<&str>,
     context_chunks: &[SearchResult],
-    timings: &PipelineTimings,
+    outcome: &PipelineOutcome,
     llm_ttft_ms: u128,
 ) -> RetrievalTrace {
-    // Stuffing assigns every chunk the same score, so the ordering carries no
-    // ranking information; fusion produces a rank score. Recording which one
-    // applies is what keeps a later consumer from averaging the two (US-012).
-    let score_domain = if timings.stuffed {
-        ScoreDomain::StuffingUniform
-    } else {
-        ScoreDomain::RrfRank
-    };
-
-    let mut trace = RetrievalTrace::new(notebook_id, query, "chat", score_domain);
+    // The domain comes from the pipeline rather than being guessed from the
+    // shape of the result set: whether a reranker ran, failed or was absent
+    // decides which scale ordered these chunks, and only the pipeline knows
+    // (US-012).
+    let mut trace = RetrievalTrace::new(notebook_id, query, "chat", outcome.score_domain);
     if let Some(reformulated) = reformulated {
         trace = trace.with_reformulation(reformulated);
     }
@@ -500,14 +487,11 @@ fn build_retrieval_trace(
     generation_ids.dedup();
     trace.generation_ids = generation_ids;
 
-    let selected = context_chunks.len();
-    let unique_parents = unique_parent_count(context_chunks);
-    trace.candidates = StageCounts {
-        selected,
-        deduplicated: unique_parents,
-        ..StageCounts::default()
-    };
-    trace.unique_parents = unique_parents;
+    // Counts come from the pipeline. Recomputing them from the surviving
+    // chunks can only ever describe the last stage, which is precisely the
+    // stage a recall regression did *not* happen in (US-004).
+    trace.candidates = outcome.counts;
+    trace.unique_parents = outcome.unique_parents;
     trace.tokens.selected = context_chunks
         .iter()
         .map(|c| {
@@ -517,49 +501,23 @@ fn build_retrieval_trace(
 
     let ms = |value: u128| u64::try_from(value).unwrap_or(u64::MAX);
     trace.durations = StageDurations {
-        embed_ms: ms(timings.embed_ms),
-        search_ms: ms(timings.search_ms),
-        rerank_ms: ms(timings.rerank_ms),
-        stuffing_load_ms: ms(timings.stuffing_load_ms),
-        total_ms: ms(timings.embed_ms
-            + timings.search_ms
-            + timings.rerank_ms
-            + timings.stuffing_load_ms
+        embed_ms: ms(outcome.embed_ms),
+        search_ms: ms(outcome.search_ms),
+        rerank_ms: ms(outcome.rerank_ms),
+        stuffing_load_ms: ms(outcome.stuffing_load_ms),
+        total_ms: ms(outcome.embed_ms
+            + outcome.search_ms
+            + outcome.rerank_ms
+            + outcome.stuffing_load_ms
             + llm_ttft_ms),
     };
 
-    if timings.stuffed {
-        trace.add_reason(ReasonCode::StuffingApplied);
-    }
-    if selected == 0 {
-        trace.add_reason(ReasonCode::NoCandidates);
-    }
-    if unique_parents < selected {
-        trace.add_reason(ReasonCode::DedupShortfall);
+    trace.reasons.extend(&outcome.reasons);
+    if context_chunks.is_empty() {
+        trace.reasons.insert(ReasonCode::NoCandidates);
     }
     trace.finish();
     trace
-}
-
-/// Distinct parent contexts in a selection.
-///
-/// Two children of one parent in one source are one context; the same text in
-/// two sources is two, because citation attribution differs.
-fn unique_parent_count(chunks: &[SearchResult]) -> usize {
-    let mut seen: Vec<(Uuid, &str)> = Vec::new();
-    let mut singletons = 0;
-    for chunk in chunks {
-        match chunk.parent_content.as_deref() {
-            Some(parent) => {
-                let key = (chunk.source_id, parent);
-                if !seen.contains(&key) {
-                    seen.push(key);
-                }
-            }
-            None => singletons += 1,
-        }
-    }
-    seen.len() + singletons
 }
 
 /// Write the interaction log, and survive its failure.
@@ -1532,8 +1490,28 @@ mod tests {
             chunk_index: 0,
             content: content.to_owned(),
             parent_content: parent.map(str::to_owned),
-            relevance_score: 0.8,
+            score: crate::types::RetrievalScore::Rrf(0.8),
             metadata: None,
+            collapsed_children: Vec::new(),
+        }
+    }
+
+    /// A pipeline outcome shaped like one the retrieval path would produce.
+    ///
+    /// The fusion domain is stated rather than defaulted: the default is
+    /// "nothing ranked anything", which is not what a pipeline that returned
+    /// contexts produced.
+    fn outcome(selected: usize, unique_parents: usize) -> PipelineOutcome {
+        PipelineOutcome {
+            counts: crate::services::rag::eval::trace::StageCounts {
+                selected,
+                deduplicated: unique_parents,
+                ..Default::default()
+            },
+            unique_parents,
+            score_domain: Some(crate::types::ScoreDomain::RrfRank),
+            confidence: crate::services::rag::search::RetrievalConfidence::Sufficient,
+            ..PipelineOutcome::default()
         }
     }
 
@@ -1550,20 +1528,19 @@ mod tests {
                 chunk(source, Some("parent A"), "child two"),
                 chunk(source, Some("parent B"), "child three"),
             ],
-            &PipelineTimings {
+            &PipelineOutcome {
                 embed_ms: 12,
                 search_ms: 30,
                 rerank_ms: 40,
-                stuffed: false,
-                stuffing_load_ms: 0,
-                cache_hit: false,
+                reasons: [ReasonCode::DedupShortfall].into_iter().collect(),
+                ..outcome(3, 2)
             },
             100,
         );
 
         assert_eq!(trace.notebook_id, notebook);
         assert_eq!(trace.mode, "chat");
-        assert_eq!(trace.score_domain, ScoreDomain::RrfRank);
+        assert_eq!(trace.score_domain, Some(crate::types::ScoreDomain::RrfRank));
         assert_eq!(trace.candidates.selected, 3);
         assert_eq!(trace.unique_parents, 2, "two children share one parent");
         assert!(trace.tokens.selected > 0);
@@ -1575,7 +1552,7 @@ mod tests {
             "stage times plus first token"
         );
         assert!(trace.reformulated_query_hash.is_some());
-        assert!(trace.reasons.contains(&ReasonCode::DedupShortfall));
+        assert!(trace.reasons.contains(ReasonCode::DedupShortfall));
     }
 
     #[test]
@@ -1589,7 +1566,7 @@ mod tests {
                 Some("the parent passage"),
                 "the child passage",
             )],
-            &PipelineTimings::default(),
+            &outcome(1, 1),
             0,
         );
         let rendered = serde_json::to_string(&trace).expect("trace serializes");
@@ -1614,19 +1591,21 @@ mod tests {
             "anything",
             None,
             &[chunk(Uuid::new_v4(), None, "a")],
-            &PipelineTimings {
+            &PipelineOutcome {
                 stuffed: true,
                 stuffing_load_ms: 7,
-                ..PipelineTimings::default()
+                score_domain: Some(crate::types::ScoreDomain::StuffingUniform),
+                reasons: [ReasonCode::StuffingApplied].into_iter().collect(),
+                ..outcome(1, 1)
             },
             0,
         );
         assert_eq!(
             trace.score_domain,
-            ScoreDomain::StuffingUniform,
+            Some(crate::types::ScoreDomain::StuffingUniform),
             "a uniform score must not be reported as a rank score"
         );
-        assert!(trace.reasons.contains(&ReasonCode::StuffingApplied));
+        assert!(trace.reasons.contains(ReasonCode::StuffingApplied));
         assert_eq!(trace.durations.stuffing_load_ms, 7);
     }
 
@@ -1637,12 +1616,12 @@ mod tests {
             "anything",
             None,
             &[],
-            &PipelineTimings::default(),
+            &PipelineOutcome::default(),
             0,
         );
         assert_eq!(trace.candidates.selected, 0);
         assert_eq!(trace.unique_parents, 0);
-        assert!(trace.reasons.contains(&ReasonCode::NoCandidates));
+        assert!(trace.reasons.contains(ReasonCode::NoCandidates));
     }
 
     /// A metrics repository that is down, and counts how often it was asked.

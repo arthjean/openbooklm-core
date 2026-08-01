@@ -29,47 +29,13 @@ use uuid::Uuid;
 // Score domains
 // ============================================================================
 
-/// Which scale a candidate's score is expressed on.
+/// The scale a candidate's score is expressed on.
 ///
-/// Recorded so a report never compares an RRF rank score against a provider's
-/// relevance score. US-012 turns this into typed score fields on the candidates
-/// themselves; here it is the trace's record of which scale produced the
-/// ordering that was measured.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ScoreDomain {
-    /// Reciprocal-rank-fusion score. A function of ranks, not of similarity.
-    RrfRank,
-    /// `1 - cosine_distance`, clamped at zero.
-    DenseSimilarity,
-    /// PostgreSQL `ts_rank_cd`, clamped at one.
-    LexicalRank,
-    /// A reranking provider's relevance score. Scale is provider-defined and
-    /// not comparable across providers.
-    RerankerRelevance,
-    /// Context stuffing assigns every chunk the same score; the value carries
-    /// no ranking information at all.
-    StuffingUniform,
-}
-
-impl ScoreDomain {
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::RrfRank => "rrf_rank",
-            Self::DenseSimilarity => "dense_similarity",
-            Self::LexicalRank => "lexical_rank",
-            Self::RerankerRelevance => "reranker_relevance",
-            Self::StuffingUniform => "stuffing_uniform",
-        }
-    }
-}
-
-impl fmt::Display for ScoreDomain {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
+/// Lives in [`crate::types`] since US-012, because the score and its scale now
+/// travel together on every candidate rather than being a property the trace
+/// records after the fact. Re-exported here so the reporting vocabulary stays
+/// one import.
+pub use crate::types::ScoreDomain;
 
 // ============================================================================
 // Reason codes
@@ -101,6 +67,25 @@ pub enum ReasonCode {
     DedupShortfall,
     /// A candidate carried a non-finite score and was rejected.
     NonFiniteScore,
+    /// Retrieval returned nothing, or fewer contexts than the evidence the
+    /// caller required, so the query was reformulated and retried (US-012).
+    CorrectiveRetrievalTriggered,
+    /// Reformulation was not attempted: no history, nothing to disambiguate,
+    /// no reformulator configured, or it had already run once for this turn
+    /// (US-017).
+    ReformulationSkipped,
+    /// History was cut to fit the reformulation message and token budget
+    /// before the provider call (US-017).
+    ReformulationTruncated,
+    /// Reformulation ran and retrieval used its output (US-017).
+    ReformulationApplied,
+    /// Reformulation was attempted and did not produce a usable query;
+    /// retrieval continued once with the original (US-017).
+    ReformulationFailed,
+    /// Dense retrieval could not fill the requested top-k under the notebook
+    /// filter, so the approximate index scanned out before finding enough
+    /// matching rows (US-016).
+    AnnUnderfilled,
     /// The corpus has no relevance judgment for this query.
     MissingJudgment,
     /// A source outside the query's notebook appeared in the result set.
@@ -124,6 +109,12 @@ impl ReasonCode {
             Self::RerankerFailed => "reranker_failed",
             Self::DedupShortfall => "dedup_shortfall",
             Self::NonFiniteScore => "non_finite_score",
+            Self::CorrectiveRetrievalTriggered => "corrective_retrieval_triggered",
+            Self::ReformulationSkipped => "reformulation_skipped",
+            Self::ReformulationTruncated => "reformulation_truncated",
+            Self::ReformulationApplied => "reformulation_applied",
+            Self::ReformulationFailed => "reformulation_failed",
+            Self::AnnUnderfilled => "ann_underfilled",
             Self::MissingJudgment => "missing_judgment",
             Self::IsolationBreach => "isolation_breach",
             Self::ProviderError => "provider_error",
@@ -135,6 +126,81 @@ impl ReasonCode {
 impl fmt::Display for ReasonCode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+/// The set of reasons one retrieval accumulated.
+///
+/// Sorted and duplicate-free by construction. Both properties are load-bearing:
+/// a reason recorded twice would double-count in a dashboard, and a set whose
+/// order depended on which stage happened to observe it first would make two
+/// runs of the same retrieval produce different report bytes (US-004).
+///
+/// It exists as a type because four places used to keep their own
+/// `Vec<ReasonCode>` and their own "push if absent" loop, and merging two of
+/// them meant re-filtering one into the other at a call site.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct ReasonSet(Vec<ReasonCode>);
+
+impl ReasonSet {
+    /// Record a reason. Recording it again changes nothing.
+    pub fn insert(&mut self, reason: ReasonCode) {
+        if let Err(index) = self.0.binary_search(&reason) {
+            self.0.insert(index, reason);
+        }
+    }
+
+    /// Whether this reason was recorded.
+    #[must_use]
+    pub fn contains(&self, reason: ReasonCode) -> bool {
+        self.0.binary_search(&reason).is_ok()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The reasons, in their stable order.
+    #[must_use]
+    pub fn as_slice(&self) -> &[ReasonCode] {
+        &self.0
+    }
+
+    /// Comma-separated wire names, for one log field.
+    #[must_use]
+    pub fn joined(&self) -> String {
+        self.0
+            .iter()
+            .map(|r| r.as_str())
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+}
+
+impl Extend<ReasonCode> for ReasonSet {
+    fn extend<T: IntoIterator<Item = ReasonCode>>(&mut self, iter: T) {
+        for reason in iter {
+            self.insert(reason);
+        }
+    }
+}
+
+impl FromIterator<ReasonCode> for ReasonSet {
+    fn from_iter<T: IntoIterator<Item = ReasonCode>>(iter: T) -> Self {
+        let mut set = Self::default();
+        set.extend(iter);
+        set
+    }
+}
+
+impl<'a> IntoIterator for &'a ReasonSet {
+    type Item = ReasonCode;
+    type IntoIter = std::iter::Copied<std::slice::Iter<'a, ReasonCode>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter().copied()
     }
 }
 
@@ -201,14 +267,17 @@ pub struct RetrievalTrace {
     pub reformulated_query_hash: Option<String>,
     /// Retrieval mode, as its stable wire name.
     pub mode: String,
-    /// Scale of the score that produced the final ordering.
-    pub score_domain: ScoreDomain,
+    /// Scale of the score that produced the final ordering, or `None` when
+    /// nothing ordered anything: an empty notebook and a retrieval that failed
+    /// before its first query have no scale, and naming one anyway would put a
+    /// number's provenance in an audit record that never had a number.
+    pub score_domain: Option<ScoreDomain>,
     pub candidates: StageCounts,
     /// Distinct parent contexts in the final selection.
     pub unique_parents: usize,
     pub tokens: TokenCounts,
     /// Everything notable that happened, in a stable order.
-    pub reasons: Vec<ReasonCode>,
+    pub reasons: ReasonSet,
     pub durations: StageDurations,
 }
 
@@ -233,7 +302,7 @@ impl RetrievalTrace {
         notebook_id: Uuid,
         query: &str,
         mode: impl Into<String>,
-        domain: ScoreDomain,
+        domain: Option<ScoreDomain>,
     ) -> Self {
         Self {
             generation_ids: Vec::new(),
@@ -245,7 +314,7 @@ impl RetrievalTrace {
             candidates: StageCounts::default(),
             unique_parents: 0,
             tokens: TokenCounts::default(),
-            reasons: Vec::new(),
+            reasons: ReasonSet::default(),
             durations: StageDurations::default(),
         }
     }
@@ -257,19 +326,10 @@ impl RetrievalTrace {
         self
     }
 
-    /// Record a reason, keeping the list free of duplicates and in a stable
-    /// order so two runs of the same retrieval produce the same trace.
-    pub fn add_reason(&mut self, reason: ReasonCode) {
-        if !self.reasons.contains(&reason) {
-            self.reasons.push(reason);
-            self.reasons.sort_unstable();
-        }
-    }
-
     /// `Ok` exactly when nothing else was recorded.
     pub fn finish(&mut self) {
         if self.reasons.is_empty() {
-            self.reasons.push(ReasonCode::Ok);
+            self.reasons.insert(ReasonCode::Ok);
         }
     }
 
@@ -278,12 +338,7 @@ impl RetrievalTrace {
     /// One event, at `info`: an operator who turns this off loses retrieval
     /// diagnosis entirely, and one line per chat turn is affordable.
     pub fn emit(&self) {
-        let reasons = self
-            .reasons
-            .iter()
-            .map(|r| r.as_str())
-            .collect::<Vec<_>>()
-            .join(",");
+        let reasons = self.reasons.joined();
         let generations = self
             .generation_ids
             .iter()
@@ -297,7 +352,7 @@ impl RetrievalTrace {
             query_hash = %self.query_hash,
             reformulated_query_hash = self.reformulated_query_hash.as_deref().unwrap_or(""),
             mode = %self.mode,
-            score_domain = %self.score_domain,
+            score_domain = self.score_domain.map_or("none", ScoreDomain::as_str),
             candidates_dense = self.candidates.dense,
             candidates_lexical = self.candidates.lexical,
             candidates_fused = self.candidates.fused,
@@ -342,7 +397,7 @@ mod tests {
             Uuid::nil(),
             "how many attempts does the retry budget allow",
             "hybrid",
-            ScoreDomain::RrfRank,
+            Some(ScoreDomain::RrfRank),
         )
         .with_reformulation("retry budget attempts");
         trace.candidates.selected = 3;
@@ -359,32 +414,73 @@ mod tests {
 
     #[test]
     fn reasons_are_deduplicated_and_ordered() {
-        let mut trace =
-            RetrievalTrace::new(Uuid::nil(), "q", "dense", ScoreDomain::DenseSimilarity);
-        trace.add_reason(ReasonCode::UnderfilledTopK);
-        trace.add_reason(ReasonCode::RerankerAbsent);
-        trace.add_reason(ReasonCode::UnderfilledTopK);
+        let mut trace = RetrievalTrace::new(
+            Uuid::nil(),
+            "q",
+            "dense",
+            Some(ScoreDomain::DenseSimilarity),
+        );
+        trace.reasons.insert(ReasonCode::UnderfilledTopK);
+        trace.reasons.insert(ReasonCode::RerankerAbsent);
+        trace.reasons.insert(ReasonCode::UnderfilledTopK);
         trace.finish();
         assert_eq!(
-            trace.reasons,
-            vec![ReasonCode::UnderfilledTopK, ReasonCode::RerankerAbsent]
+            trace.reasons.as_slice(),
+            [ReasonCode::UnderfilledTopK, ReasonCode::RerankerAbsent]
         );
 
         // Two traces built in different orders compare equal, which is what
         // makes a report byte-stable.
-        let mut other =
-            RetrievalTrace::new(Uuid::nil(), "q", "dense", ScoreDomain::DenseSimilarity);
-        other.add_reason(ReasonCode::RerankerAbsent);
-        other.add_reason(ReasonCode::UnderfilledTopK);
+        let mut other = RetrievalTrace::new(
+            Uuid::nil(),
+            "q",
+            "dense",
+            Some(ScoreDomain::DenseSimilarity),
+        );
+        other.reasons.insert(ReasonCode::RerankerAbsent);
+        other.reasons.insert(ReasonCode::UnderfilledTopK);
         other.finish();
         assert_eq!(trace.reasons, other.reasons);
     }
 
     #[test]
+    fn a_reason_set_merges_without_a_call_site_filter() {
+        let mut set: ReasonSet = [ReasonCode::RerankerAbsent, ReasonCode::Ok]
+            .into_iter()
+            .collect();
+        set.extend([ReasonCode::Ok, ReasonCode::NoCandidates]);
+
+        assert_eq!(
+            set.as_slice(),
+            [
+                ReasonCode::Ok,
+                ReasonCode::NoCandidates,
+                ReasonCode::RerankerAbsent
+            ],
+            "a merged set stays sorted and duplicate-free"
+        );
+        assert!(set.contains(ReasonCode::NoCandidates));
+        assert!(!set.contains(ReasonCode::EmptyCorpus));
+        assert_eq!(set.joined(), "ok,no_candidates,reranker_absent");
+    }
+
+    #[test]
     fn a_clean_retrieval_is_recorded_as_ok() {
-        let mut trace = RetrievalTrace::new(Uuid::nil(), "q", "lexical", ScoreDomain::LexicalRank);
+        let mut trace =
+            RetrievalTrace::new(Uuid::nil(), "q", "lexical", Some(ScoreDomain::LexicalRank));
         trace.finish();
-        assert_eq!(trace.reasons, vec![ReasonCode::Ok]);
+        assert_eq!(trace.reasons.as_slice(), [ReasonCode::Ok]);
+    }
+
+    #[test]
+    fn a_retrieval_that_never_ranked_anything_reports_no_score_domain() {
+        let mut trace = RetrievalTrace::new(Uuid::nil(), "q", "chat", None);
+        trace.finish();
+        let rendered = serde_json::to_string(&trace).expect("trace serializes");
+        assert!(
+            rendered.contains("\"score_domain\":null"),
+            "an absent scale must serialize as null, not as a plausible default: {rendered}"
+        );
     }
 
     #[test]

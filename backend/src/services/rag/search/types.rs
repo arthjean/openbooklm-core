@@ -39,6 +39,12 @@ pub struct SearchRequest {
     pub query: String,
     #[serde(default = "default_limit")]
     pub limit: i32,
+    /// Minimum score, **on the domain the requested mode produces**: a dense
+    /// similarity for [`SearchMode::Dense`], a lexical rank for
+    /// [`SearchMode::Lexical`], an RRF value for [`SearchMode::Hybrid`]. The
+    /// same number means something different in each, which is why it is
+    /// documented against the mode rather than treated as a universal
+    /// relevance floor (US-012).
     #[serde(default)]
     pub min_relevance: Option<f32>,
     #[serde(default)]
@@ -98,19 +104,52 @@ impl SearchRequest {
     }
 }
 
+/// What one search produced, and what it cost.
+///
+/// Replaces the `(results, embed_ms, search_ms)` tuple: the retrieval trace
+/// needs candidate counts per stage and the number of candidates rejected for
+/// carrying a non-finite score (US-004, US-012), and a five-element tuple is
+/// how those get silently dropped at a call site.
+#[derive(Debug, Clone, Default)]
+pub struct SearchOutcome {
+    pub results: Vec<SearchResult>,
+    /// Time spent producing the query vector, or 0 on a cache hit.
+    pub embed_ms: u128,
+    /// Time spent in the repository search.
+    pub search_ms: u128,
+    /// Candidates dropped because their score was NaN or infinite.
+    pub dropped_non_finite: usize,
+    /// Candidates the dense search returned.
+    pub dense_candidates: usize,
+    /// Candidates the lexical search returned.
+    pub lexical_candidates: usize,
+    /// Whether the query embedding came from the cache.
+    pub cache_hit: bool,
+}
+
 /// Result of corrective RAG retrieval.
 #[derive(Debug, Clone)]
 pub struct CorrectiveResult {
     /// The search results after possible reformulation.
     pub results: Vec<SearchResult>,
-    /// Average relevance score of the final results.
-    pub avg_relevance: f32,
-    /// Whether the retrieval quality is below threshold (warning should be shown).
-    pub low_quality_warning: bool,
+    /// Whether the final selection is the evidence that was requested.
+    ///
+    /// Replaces the average-score verdict: the number it averaged was an RRF
+    /// rank artifact, and a threshold on it decided nothing meaningful
+    /// (US-012).
+    pub confidence: super::context::RetrievalConfidence,
     /// The query that was actually used for retrieval (original or reformulated).
     pub effective_query: String,
-    /// Whether the query was reformulated due to low initial retrieval quality.
+    /// Whether the query was reformulated after insufficient initial evidence.
     pub was_corrected: bool,
+}
+
+impl CorrectiveResult {
+    /// Whether the caller should warn the user about retrieval quality.
+    #[must_use]
+    pub const fn low_quality_warning(&self) -> bool {
+        !self.confidence.is_sufficient()
+    }
 }
 
 /// Const clamp (stable since Rust 1.50 but const since 1.61).

@@ -19,14 +19,14 @@ use crate::error::AppError;
 use crate::llm::{LlmMessage, LlmProvider, TeachingMode, build_system_prompt};
 use crate::repositories::{MemoryRepository, RagLogRepository, SearchRepository};
 use crate::services::memory::{format_memory_for_prompt, select_core_memories};
-use crate::services::rag::eval::trace::query_hash;
+use crate::services::rag::eval::trace::{ReasonCode, ReasonSet, query_hash};
 use crate::services::rag::provenance::QueryEmbeddingKind;
 use crate::services::rag::query_reformulation::ChatTurn;
 use crate::services::rag::search::{
-    CorrectiveRetrievalParams, PipelineTimings, PreferenceBoost, RetrievalParams,
+    CorrectiveRetrievalParams, PipelineOutcome, PreferenceBoost, RetrievalParams,
     extract_preference_keywords, retrieve_context, retrieve_context_corrective,
 };
-use crate::types::SearchResult;
+use crate::types::{ScoreDomain, SearchResult};
 
 // ============================================================================
 // Data types
@@ -35,6 +35,9 @@ use crate::types::SearchResult;
 /// Validated and authorized chat request data.
 pub(crate) struct ValidatedRequest {
     pub message: String,
+    /// The context cardinality the caller asked for, already checked against
+    /// the server contract (US-013).
+    pub max_context_chunks: i32,
     /// Permit for this chat exchange. Consumption is recorded only after the
     /// provider emits its first non-empty token.
     pub permit: Permit,
@@ -64,18 +67,25 @@ pub(crate) struct ChatHistory {
 /// happened, and the log needs never to see it.
 pub(crate) struct RetrievedContext {
     pub chunks: Vec<SearchResult>,
-    pub timings: PipelineTimings,
+    pub outcome: PipelineOutcome,
     /// The standalone query retrieval actually used, when it differs from what
     /// the user typed.
     pub reformulated_query: Option<String>,
 }
 
 impl RetrievedContext {
-    /// Retrieval failed or was skipped. Chat continues without evidence.
-    pub(crate) fn empty() -> Self {
+    /// Retrieval failed for an infrastructure reason rather than for lack of
+    /// evidence.
+    ///
+    /// The distinction reaches the trace as a reason code: "the notebook had
+    /// nothing to say" and "the search never ran" produce the same empty
+    /// chunk list and are not the same incident (US-012).
+    fn failed() -> Self {
+        let mut outcome = PipelineOutcome::default();
+        outcome.reasons.insert(ReasonCode::ProviderError);
         Self {
             chunks: Vec::new(),
-            timings: PipelineTimings::default(),
+            outcome,
             reformulated_query: None,
         }
     }
@@ -228,6 +238,10 @@ pub(crate) async fn validate_and_authorize(
     payload: &SendMessageRequest,
 ) -> Result<ValidatedRequest, AppError> {
     let message = payload.validate()?.to_owned();
+    // Rejected here, before the notebook is touched and before any message is
+    // persisted: an out-of-contract context limit is a bad request, not a
+    // request to be quietly rewritten (US-013).
+    let max_context_chunks = payload.validated_max_context_chunks()?;
     verify_notebook_access(state.repos.notebooks.as_ref(), principal, notebook_id).await?;
 
     // Fetch notebook to read memory_enabled flag (notebook was already validated above)
@@ -292,6 +306,7 @@ pub(crate) async fn validate_and_authorize(
 
     Ok(ValidatedRequest {
         message,
+        max_context_chunks,
         permit,
         provider: selection.provider,
         model_for_stream: selection.model_override.or_else(|| payload.model.clone()),
@@ -429,8 +444,10 @@ pub(crate) async fn build_preference_boost(
 ///    standalone query before retrieval. This prevents embedding search failures
 ///    on implicit references like "What about that one?" or "Compare with the
 ///    previous chapter."
-/// 2. **Corrective** (after retrieval): If initial retrieval quality is low
-///    (`avg_relevance < 0.5`), reformulate and retry (existing behavior).
+/// 2. **Corrective** (after retrieval): If retrieval produced insufficient
+///    evidence (nothing, or fewer unique contexts than requested while the
+///    notebook still held material), reformulate and retry once. Never a score
+///    threshold (US-012).
 ///
 /// Emits typed thinking and warning events as retrieval progresses.
 /// Falls back to an empty context on any error.
@@ -467,15 +484,24 @@ pub(crate) async fn retrieve_rag_context(params: &RagContextParams<'_>) -> Retri
         // --- Proactive query reformulation for follow-up questions ---
         // Reformulate before retrieval when the query appears non-standalone.
         // This is separate from corrective RAG (which reformulates *after*
-        // low-quality retrieval) — it prevents the retrieval failure entirely.
+        // insufficient evidence): it prevents the retrieval failure entirely.
         // The query and the role it plays are produced together: whether
         // retrieval is embedding the user's own question or its replacement is
         // decided here, not re-derived downstream by comparing two strings
         // (US-011).
+        let mut already_reformulated = false;
+        // What the proactive attempt did, for the trace. A turn that never
+        // asked for reformulation and a turn whose provider refused it are
+        // different operational facts and must not share a reason code
+        // (US-017).
+        let mut reformulation_reasons: ReasonSet =
+            std::iter::once(ReasonCode::ReformulationSkipped).collect();
         let (effective_query, embedding_kind): (std::borrow::Cow<'_, str>, QueryEmbeddingKind) =
             if !chat_turns.is_empty() && needs_proactive_reformulation(query) {
                 let result = reformulator.reformulate(query, &chat_turns).await;
+                reformulation_reasons = result.outcome.reason_codes().into_iter().collect();
                 if result.was_reformulated {
+                    already_reformulated = true;
                     // Hashes, not text: a retrieval log must never carry the
                     // question a user typed (US-004).
                     tracing::info!(
@@ -496,31 +522,34 @@ pub(crate) async fn retrieve_rag_context(params: &RagContextParams<'_>) -> Retri
             };
 
         match retrieve_context_corrective(&CorrectiveRetrievalParams {
-            search_repo,
-            config,
-            notebook_id,
-            query: &effective_query,
-            max_chunks,
-            embeddings: embeddings.as_deref(),
-            reranker: reranker.as_deref(),
-            hyde_service: *hyde_service,
+            base: RetrievalParams {
+                search_repo,
+                config,
+                notebook_id,
+                query: &effective_query,
+                max_chunks,
+                embeddings: embeddings.as_deref(),
+                reranker: reranker.as_deref(),
+                hyde_service: *hyde_service,
+                embedding_cache: *embedding_cache,
+                embedding_kind,
+                provider,
+                model,
+                preference_boost: preference_boost.as_ref(),
+            },
             reformulator: Some(reformulator),
             chat_history: &chat_turns,
-            embedding_cache: *embedding_cache,
-            embedding_kind,
-            provider,
-            model,
-            preference_boost: preference_boost.as_ref(),
+            already_reformulated,
         })
         .await
         {
-            Ok((corrective, timings)) => {
+            Ok((corrective, mut outcome)) => {
+                outcome.reasons.extend(&reformulation_reasons);
                 tracing::info!(
                     %notebook_id,
                     chunks_retrieved = corrective.results.len(),
-                    avg_relevance = corrective.avg_relevance,
+                    confidence = ?corrective.confidence,
                     was_corrected = corrective.was_corrected,
-                    low_quality = corrective.low_quality_warning,
                     effective_query_hash = %query_hash(&corrective.effective_query),
                     "Corrective RAG retrieval"
                 );
@@ -531,7 +560,7 @@ pub(crate) async fn retrieve_rag_context(params: &RagContextParams<'_>) -> Retri
                         .await;
                 }
 
-                if corrective.low_quality_warning {
+                if corrective.low_quality_warning() {
                     events
                         .emit(ChatEvent::warning(WarningKind::LowRetrievalQuality))
                         .await;
@@ -542,13 +571,13 @@ pub(crate) async fn retrieve_rag_context(params: &RagContextParams<'_>) -> Retri
 
                 RetrievedContext {
                     chunks: corrective.results,
-                    timings,
+                    outcome,
                     reformulated_query,
                 }
             }
             Err(e) => {
                 tracing::warn!(%notebook_id, error = %e, "Corrective RAG failed, proceeding without context");
-                RetrievedContext::empty()
+                RetrievedContext::failed()
             }
         }
     } else {
@@ -569,22 +598,28 @@ pub(crate) async fn retrieve_rag_context(params: &RagContextParams<'_>) -> Retri
             preference_boost: preference_boost.as_ref(),
         };
         match retrieve_context(&retrieval_params).await {
-            Ok((chunks, timings)) => {
+            Ok((chunks, outcome)) => {
                 tracing::info!(
                     %notebook_id,
                     chunks_retrieved = chunks.len(),
-                    top_score = chunks.first().map(|c| c.relevance_score),
+                    score_domain = outcome.score_domain.map_or("none", ScoreDomain::as_str),
+                    confidence = ?outcome.confidence,
                     "Retrieved context chunks for RAG"
                 );
+                if !outcome.confidence.is_sufficient() && !chunks.is_empty() {
+                    events
+                        .emit(ChatEvent::warning(WarningKind::LowRetrievalQuality))
+                        .await;
+                }
                 RetrievedContext {
                     chunks,
-                    timings,
+                    outcome,
                     reformulated_query: None,
                 }
             }
             Err(e) => {
                 tracing::warn!(%notebook_id, error = %e, "Failed to retrieve context, proceeding without");
-                RetrievedContext::empty()
+                RetrievedContext::failed()
             }
         }
     }

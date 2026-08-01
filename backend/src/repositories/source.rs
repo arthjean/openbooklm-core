@@ -1,5 +1,7 @@
 //! SeaORM implementation of SourceRepository
 
+use std::collections::HashSet;
+
 use async_trait::async_trait;
 use chrono::Utc;
 use sea_orm::{
@@ -15,13 +17,6 @@ use crate::error::SourceError;
 use crate::types::SourceType;
 
 use super::traits::{ActiveGenerationLease, RepoResult, SourceRepository};
-
-const LOCK_ACTIVE_GENERATION_SQL: &str = r"
-    SELECT id
-    FROM sources
-    WHERE id = $1 AND active_generation_id = $2
-    FOR SHARE
-";
 
 #[derive(Clone)]
 pub struct SeaOrmSourceRepository {
@@ -80,26 +75,47 @@ impl SourceRepository for SeaOrmSourceRepository {
         Ok(Source::find_by_id(source_id).one(&self.db).await?)
     }
 
-    #[tracing::instrument(skip(self), fields(%source_id, %generation_id))]
-    async fn lock_active_generation(
+    #[tracing::instrument(skip(self, generations), fields(generation_count = generations.len()))]
+    async fn lock_active_generations(
         &self,
-        source_id: Uuid,
-        generation_id: Uuid,
-    ) -> RepoResult<Option<ActiveGenerationLease>> {
+        generations: &[(Uuid, Uuid)],
+    ) -> RepoResult<ActiveGenerationLease> {
         let transaction = self.db.begin().await?;
-        let active = transaction
-            .query_one(Statement::from_sql_and_values(
-                DbBackend::Postgres,
-                LOCK_ACTIVE_GENERATION_SQL,
-                [source_id.into(), generation_id.into()],
-            ))
-            .await?
-            .is_some();
-        if !active {
-            transaction.rollback().await?;
-            return Ok(None);
+        let requested: HashSet<_> = generations.iter().copied().collect();
+        if requested.is_empty() {
+            return Ok(ActiveGenerationLease::new(transaction, HashSet::new()));
         }
-        Ok(Some(ActiveGenerationLease::new(transaction)))
+        let predicates = (0..requested.len())
+            .map(|index| {
+                let source = index * 2 + 1;
+                let generation = source + 1;
+                format!("(id = ${source} AND active_generation_id = ${generation})")
+            })
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let sql =
+            format!("SELECT id, active_generation_id FROM sources WHERE {predicates} FOR SHARE");
+        let values: Vec<sea_orm::Value> = requested
+            .iter()
+            .flat_map(|(source_id, generation_id)| [(*source_id).into(), (*generation_id).into()])
+            .collect();
+        let rows = transaction
+            .query_all(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                sql,
+                values,
+            ))
+            .await?;
+        let active = rows
+            .into_iter()
+            .map(|row| {
+                Ok((
+                    row.try_get("", "id")?,
+                    row.try_get("", "active_generation_id")?,
+                ))
+            })
+            .collect::<Result<HashSet<(Uuid, Uuid)>, sea_orm::DbErr>>()?;
+        Ok(ActiveGenerationLease::new(transaction, active))
     }
 
     #[tracing::instrument(skip(self), fields(%source_id, %user_id))]

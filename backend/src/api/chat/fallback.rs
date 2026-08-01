@@ -69,6 +69,7 @@ pub(super) async fn stream_grounded_fallback(ctx: FallbackContext, out: &ChatEve
     emit_retrieval_trace(ctx.notebook_id, &ctx.query, ctx.reason);
 
     out.emit(ChatEvent::chunk(ctx.answer)).await;
+    out.finish_generation();
     out.emit(ChatEvent::citations(Vec::new())).await;
     out.emit(ChatEvent::metrics(None)).await;
 
@@ -176,6 +177,29 @@ mod tests {
                 session_id,
                 created_at: chrono::Utc::now().fixed_offset(),
             })
+        }
+
+        async fn create_message_in_transaction(
+            &self,
+            _transaction: &sea_orm::DatabaseTransaction,
+            notebook_id: Uuid,
+            role: &str,
+            content: &str,
+            citations: &[crate::llm::Citation],
+            model: Option<&str>,
+            agent_id: Option<Uuid>,
+            session_id: Option<Uuid>,
+        ) -> RepoResult<crate::entities::chat_message::Model> {
+            self.create_message(
+                notebook_id,
+                role,
+                content,
+                citations,
+                model,
+                agent_id,
+                session_id,
+            )
+            .await
         }
 
         async fn get_by_id(

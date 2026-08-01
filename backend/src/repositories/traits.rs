@@ -2,7 +2,7 @@
 //!
 //! Designed for mockability, implementation-agnostic (SeaORM, raw SQL), and single-entity focus.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use async_trait::async_trait;
 use chrono::{DateTime, FixedOffset};
@@ -146,18 +146,34 @@ pub trait NotebookRepository: Send + Sync {
 // Source
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Source-row lock held across the enqueue of one validated citation event.
+/// Source-row locks held across citation persistence and event enqueue.
 ///
-/// Publication updates the same source row, so it cannot move the active
-/// pointer between validation and event enqueue.
-#[must_use = "retain the lease until citation enqueue, then release it"]
+/// Publication updates the same rows, so it cannot move an active pointer
+/// across the final public citation boundary.
+#[must_use = "retain the lease through citation persistence and enqueue, then release it"]
 pub struct ActiveGenerationLease {
     transaction: sea_orm::DatabaseTransaction,
+    active: HashSet<(Uuid, Uuid)>,
 }
 
 impl ActiveGenerationLease {
-    pub(super) const fn new(transaction: sea_orm::DatabaseTransaction) -> Self {
-        Self { transaction }
+    pub(super) const fn new(
+        transaction: sea_orm::DatabaseTransaction,
+        active: HashSet<(Uuid, Uuid)>,
+    ) -> Self {
+        Self {
+            transaction,
+            active,
+        }
+    }
+
+    #[must_use]
+    pub fn is_active(&self, source_id: Uuid, generation_id: Uuid) -> bool {
+        self.active.contains(&(source_id, generation_id))
+    }
+
+    pub(crate) const fn transaction(&self) -> &sea_orm::DatabaseTransaction {
+        &self.transaction
     }
 
     pub async fn release(self) -> RepoResult<()> {
@@ -179,15 +195,31 @@ pub trait SourceRepository: Send + Sync {
 
     async fn get_by_id(&self, source_id: Uuid) -> RepoResult<Option<source::Model>>;
 
-    /// Lock the source pointer when `generation_id` is active.
+    /// Lock every currently active `(source, generation)` pair in one
+    /// transaction and report which requested pairs matched.
     ///
-    /// The caller must retain the returned lease until its citation event has
-    /// been enqueued, then release it promptly.
+    /// The caller must retain the lease through citation persistence and
+    /// non-blocking event enqueue, then release it promptly.
+    async fn lock_active_generations(
+        &self,
+        generations: &[(Uuid, Uuid)],
+    ) -> RepoResult<ActiveGenerationLease>;
+
     async fn lock_active_generation(
         &self,
         source_id: Uuid,
         generation_id: Uuid,
-    ) -> RepoResult<Option<ActiveGenerationLease>>;
+    ) -> RepoResult<Option<ActiveGenerationLease>> {
+        let lease = self
+            .lock_active_generations(&[(source_id, generation_id)])
+            .await?;
+        if lease.is_active(source_id, generation_id) {
+            Ok(Some(lease))
+        } else {
+            lease.release().await?;
+            Ok(None)
+        }
+    }
 
     /// Returns error if source doesn't exist or user doesn't own it.
     async fn get_for_user(&self, source_id: Uuid, user_id: Uuid) -> RepoResult<source::Model>;
@@ -540,6 +572,21 @@ pub trait ChatRepository: Send + Sync {
     #[allow(clippy::too_many_arguments)]
     async fn create_message(
         &self,
+        notebook_id: Uuid,
+        role: &str,
+        content: &str,
+        citations: &[Citation],
+        model: Option<&str>,
+        agent_id: Option<Uuid>,
+        session_id: Option<Uuid>,
+    ) -> RepoResult<chat_message::Model>;
+
+    /// Persist a message inside a transaction that already pins every source
+    /// generation referenced by its citations.
+    #[allow(clippy::too_many_arguments)]
+    async fn create_message_in_transaction(
+        &self,
+        transaction: &sea_orm::DatabaseTransaction,
         notebook_id: Uuid,
         role: &str,
         content: &str,

@@ -3,8 +3,8 @@
 use async_trait::async_trait;
 use chrono::{DateTime, FixedOffset};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
-    QueryOrder, QuerySelect, Set,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, DatabaseTransaction,
+    EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set,
 };
 use uuid::Uuid;
 
@@ -30,6 +30,46 @@ impl SeaOrmChatRepository {
     /// Base query filtered by notebook_id
     fn for_notebook(notebook_id: Uuid) -> sea_orm::Select<ChatMessage> {
         ChatMessage::find().filter(chat_message::Column::NotebookId.eq(notebook_id))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn insert_message<C: ConnectionTrait>(
+        connection: &C,
+        notebook_id: Uuid,
+        role: &str,
+        content: &str,
+        citations: &[Citation],
+        model: Option<&str>,
+        session_id: Option<Uuid>,
+    ) -> RepoResult<chat_message::Model> {
+        let citations_json = serde_json::to_value(citations).map_err(|e| {
+            ChatError::CitationsSerializationFailed {
+                notebook_id: notebook_id.to_string(),
+                reason: e.to_string(),
+            }
+        })?;
+
+        let message = chat_message::ActiveModel {
+            id: Set(Uuid::new_v4()),
+            notebook_id: Set(notebook_id),
+            role: Set(role.to_string()),
+            content: Set(content.to_string()),
+            citations: Set(citations_json),
+            model: Set(model.map(String::from)),
+            session_id: Set(session_id),
+            ..Default::default()
+        };
+
+        let result = message
+            .insert(connection)
+            .await
+            .map_err(|e| ChatError::SaveFailed {
+                notebook_id: notebook_id.to_string(),
+                reason: e.to_string(),
+            })?;
+
+        tracing::debug!(id = %result.id, %notebook_id, %role, "Message saved");
+        Ok(result)
     }
 }
 
@@ -65,34 +105,40 @@ impl ChatRepository for SeaOrmChatRepository {
         _agent_id: Option<Uuid>,
         session_id: Option<Uuid>,
     ) -> RepoResult<chat_message::Model> {
-        let citations_json = serde_json::to_value(citations).map_err(|e| {
-            ChatError::CitationsSerializationFailed {
-                notebook_id: notebook_id.to_string(),
-                reason: e.to_string(),
-            }
-        })?;
+        Self::insert_message(
+            &self.db,
+            notebook_id,
+            role,
+            content,
+            citations,
+            model,
+            session_id,
+        )
+        .await
+    }
 
-        let message = chat_message::ActiveModel {
-            id: Set(Uuid::new_v4()),
-            notebook_id: Set(notebook_id),
-            role: Set(role.to_string()),
-            content: Set(content.to_string()),
-            citations: Set(citations_json),
-            model: Set(model.map(String::from)),
-            session_id: Set(session_id),
-            ..Default::default()
-        };
-
-        let result = message
-            .insert(&self.db)
-            .await
-            .map_err(|e| ChatError::SaveFailed {
-                notebook_id: notebook_id.to_string(),
-                reason: e.to_string(),
-            })?;
-
-        tracing::debug!(id = %result.id, %notebook_id, %role, "Message saved");
-        Ok(result)
+    #[tracing::instrument(skip(self, transaction, content, citations), fields(%notebook_id, %role))]
+    async fn create_message_in_transaction(
+        &self,
+        transaction: &DatabaseTransaction,
+        notebook_id: Uuid,
+        role: &str,
+        content: &str,
+        citations: &[Citation],
+        model: Option<&str>,
+        _agent_id: Option<Uuid>,
+        session_id: Option<Uuid>,
+    ) -> RepoResult<chat_message::Model> {
+        Self::insert_message(
+            transaction,
+            notebook_id,
+            role,
+            content,
+            citations,
+            model,
+            session_id,
+        )
+        .await
     }
 
     #[tracing::instrument(skip(self), fields(%notebook_id))]

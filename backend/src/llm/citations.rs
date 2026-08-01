@@ -225,22 +225,21 @@ pub fn claim_is_supported_by(marker_start: usize, response: &str, evidence: &str
         .next()
         .unwrap_or("")
         .trim_matches(|c: char| c.is_whitespace() || matches!(c, '-' | '*' | ':' | ';'));
+    let claim_numbers = numeric_values(claim);
+    let evidence_numbers: HashSet<u128> = numeric_values(evidence).into_iter().collect();
+    if claim_numbers
+        .iter()
+        .any(|number| !evidence_numbers.contains(number))
+    {
+        return false;
+    }
+
     let claim_tokens = meaningful_tokens(claim);
     if claim_tokens.is_empty() {
         return false;
     }
     let evidence_tokens: HashSet<String> = meaningful_tokens(evidence).into_iter().collect();
 
-    let numeric: Vec<&String> = claim_tokens
-        .iter()
-        .filter(|token| is_number_token(token))
-        .collect();
-    if numeric
-        .iter()
-        .any(|token| !evidence_tokens.contains(token.as_str()))
-    {
-        return false;
-    }
     if claim_tokens
         .iter()
         .filter(|token| is_polarity_token(token))
@@ -264,68 +263,145 @@ fn is_polarity_token(token: &str) -> bool {
     )
 }
 
-fn is_number_token(token: &str) -> bool {
+fn numeric_values(text: &str) -> Vec<u128> {
+    let tokens: Vec<String> = text
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(str::to_lowercase)
+        .collect();
+    let mut values = Vec::new();
+    let mut index = 0;
+    while index < tokens.len() {
+        if let Ok(value) = tokens[index].parse::<u128>() {
+            values.push(value);
+            index += 1;
+        } else if let Some((value, consumed)) = parse_word_number(&tokens[index..]) {
+            values.push(value);
+            index += consumed;
+        } else {
+            index += 1;
+        }
+    }
+    values
+}
+
+fn parse_word_number(tokens: &[String]) -> Option<(u128, usize)> {
+    let mut total = 0_u128;
+    let mut current = 0_u128;
+    let mut consumed = 0;
+    let mut saw_number = false;
+
+    while consumed < tokens.len() {
+        let token = tokens[consumed].as_str();
+        if matches!(token, "and" | "et") && saw_number {
+            if tokens
+                .get(consumed + 1)
+                .is_some_and(|next| is_number_component(next))
+            {
+                consumed += 1;
+                continue;
+            }
+            break;
+        }
+
+        if matches!(token, "dozen" | "douzaine") {
+            current = current.max(1).checked_mul(12)?;
+            saw_number = true;
+            consumed += 1;
+            continue;
+        }
+        if token == "score" {
+            current = current.max(1).checked_mul(20)?;
+            saw_number = true;
+            consumed += 1;
+            continue;
+        }
+        if matches!(token, "hundred" | "cent") {
+            current = current.max(1).checked_mul(100)?;
+            saw_number = true;
+            consumed += 1;
+            continue;
+        }
+        if let Some(scale) = number_scale(token) {
+            total = total.checked_add(current.max(1).checked_mul(scale)?)?;
+            current = 0;
+            saw_number = true;
+            consumed += 1;
+            continue;
+        }
+
+        let Some((atom, atom_tokens)) = number_atom(tokens, consumed) else {
+            break;
+        };
+        current = current.checked_add(atom)?;
+        saw_number = true;
+        consumed += atom_tokens;
+    }
+
+    saw_number.then(|| total.checked_add(current).map(|value| (value, consumed)))?
+}
+
+fn number_atom(tokens: &[String], index: usize) -> Option<(u128, usize)> {
+    let token = tokens.get(index)?.as_str();
+    if token == "quatre"
+        && tokens
+            .get(index + 1)
+            .is_some_and(|next| matches!(next.as_str(), "vingt" | "vingts"))
+    {
+        return Some((80, 2));
+    }
+    let value = match token {
+        "zero" | "zéro" => 0,
+        "one" | "un" => 1,
+        "two" | "deux" => 2,
+        "three" | "trois" => 3,
+        "four" | "quatre" => 4,
+        "five" | "cinq" => 5,
+        "six" => 6,
+        "seven" | "sept" => 7,
+        "eight" | "huit" => 8,
+        "nine" | "neuf" => 9,
+        "ten" | "dix" => 10,
+        "eleven" | "onze" => 11,
+        "twelve" | "douze" => 12,
+        "thirteen" | "treize" => 13,
+        "fourteen" | "quatorze" => 14,
+        "fifteen" | "quinze" => 15,
+        "sixteen" | "seize" => 16,
+        "seventeen" => 17,
+        "eighteen" => 18,
+        "nineteen" => 19,
+        "twenty" | "vingt" | "vingts" => 20,
+        "thirty" | "trente" => 30,
+        "forty" | "quarante" => 40,
+        "fifty" | "cinquante" => 50,
+        "sixty" | "soixante" => 60,
+        "seventy" => 70,
+        "eighty" => 80,
+        "ninety" => 90,
+        _ => return None,
+    };
+    Some((value, 1))
+}
+
+fn number_scale(token: &str) -> Option<u128> {
+    match token {
+        "thousand" | "mille" => Some(1_000),
+        "million" => Some(1_000_000),
+        "billion" | "milliard" => Some(1_000_000_000),
+        "trillion" => Some(1_000_000_000_000),
+        _ => None,
+    }
+}
+
+fn is_number_component(token: &str) -> bool {
     token.chars().any(|c| c.is_ascii_digit())
         || matches!(
             token,
-            "zero"
-                | "one"
-                | "two"
-                | "three"
-                | "four"
-                | "five"
-                | "six"
-                | "seven"
-                | "eight"
-                | "nine"
-                | "ten"
-                | "eleven"
-                | "twelve"
-                | "thirteen"
-                | "fourteen"
-                | "fifteen"
-                | "sixteen"
-                | "seventeen"
-                | "eighteen"
-                | "nineteen"
-                | "twenty"
-                | "thirty"
-                | "forty"
-                | "fifty"
-                | "sixty"
-                | "seventy"
-                | "eighty"
-                | "ninety"
-                | "hundred"
-                | "thousand"
-                | "million"
-                | "billion"
-                | "trillion"
-                | "zéro"
-                | "un"
-                | "deux"
-                | "trois"
-                | "quatre"
-                | "cinq"
-                | "sept"
-                | "huit"
-                | "neuf"
-                | "dix"
-                | "onze"
-                | "douze"
-                | "treize"
-                | "quatorze"
-                | "quinze"
-                | "seize"
-                | "vingt"
-                | "trente"
-                | "quarante"
-                | "cinquante"
-                | "soixante"
-                | "cent"
-                | "mille"
-                | "milliard"
+            "and" | "et" | "dozen" | "douzaine" | "score" | "hundred" | "cent"
         )
+        || number_scale(token).is_some()
+        || number_atom(&[token.to_owned()], 0).is_some()
 }
 
 fn meaningful_tokens(text: &str) -> Vec<String> {
@@ -335,6 +411,7 @@ fn meaningful_tokens(text: &str) -> Vec<String> {
             ((token.len() >= 2 || token.chars().any(|c| c.is_ascii_digit()))
                 && !is_stop_word(&token))
             .then_some(token)
+            .filter(|token| !is_number_component(token))
         })
         .collect()
 }
@@ -707,6 +784,23 @@ mod tests {
         );
         assert!(unsupported_digit.citations.is_empty());
         assert_eq!(unsupported_digit.rejected, 1);
+
+        let accepted_normalized_number = extract_citations_verified_against_active(
+            "The retry budget is 4 attempts [1].",
+            &[chunk.clone()],
+            &active,
+        );
+        assert_eq!(accepted_normalized_number.citations.len(), 1);
+        assert_eq!(accepted_normalized_number.rejected, 0);
+
+        chunk.content = "The retry budget is thirteen attempts before failure.".to_owned();
+        let unsupported_dozen = extract_citations_verified_against_active(
+            "The retry budget is a dozen attempts [1].",
+            &[chunk.clone()],
+            &active,
+        );
+        assert!(unsupported_dozen.citations.is_empty());
+        assert_eq!(unsupported_dozen.rejected, 1);
 
         chunk.content = "The retry budget is eleven attempts before failure.".to_owned();
         let unsupported_large_number = extract_citations_verified_against_active(

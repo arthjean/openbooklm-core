@@ -38,7 +38,7 @@ use crate::services::rag::search::{PipelineOutcome, mean_relevance};
 use crate::types::MemoryDecayTracker;
 use crate::types::SearchResult;
 
-use super::citation_resolution::{CitationResolution, resolve_citations};
+use super::citation_resolution::{CitationResolution, ResolvedCitations, resolve_citations};
 
 // ============================================================================
 // Constants
@@ -202,6 +202,7 @@ pub(super) async fn stream_llm_response(
     let mut message_counted = false;
     let mut llm_ttft_ms: Option<u128> = None;
     let mut native_citations = NativeCitationStream::default();
+    let mut sse_frames = SseFrameBuffer::default();
 
     // Process stream with cancellation and shutdown support
     'stream: loop {
@@ -243,6 +244,7 @@ pub(super) async fn stream_llm_response(
                             provider.as_ref(),
                             &mut full_response,
                             out,
+                            &mut sse_frames,
                             uses_native_citations.then_some(&mut native_citations),
                         ).await? {
                             ChunkResult::Continue => {
@@ -296,7 +298,6 @@ pub(super) async fn stream_llm_response(
 
     // Extract citations: native (Anthropic Citations API) or regex-based [N] fallback.
     let resolved = resolve_citations(
-        out,
         &CitationResolution {
             uses_native_citations,
             native_citations: &native_citations.citations,
@@ -310,7 +311,12 @@ pub(super) async fn stream_llm_response(
         source_repo.as_ref(),
     )
     .await;
-    let citations = resolved.citations;
+    let ResolvedCitations {
+        citations,
+        rejected,
+        event_refs,
+        lease,
+    } = resolved;
 
     // Emit the per-request retrieval trace (US-004), after citation resolution
     // so that a refused marker is part of the record. The timings are in it
@@ -324,12 +330,48 @@ pub(super) async fn stream_llm_response(
         &context_chunks,
         &rag_outcome,
         evidence_tokens,
-        resolved.rejected,
+        rejected,
         llm_ttft_ms.unwrap_or(0),
     )
     .emit();
 
-    out.emit(ChatEvent::citations(citations.clone())).await;
+    // Persist and enqueue every public citation shape while one transaction
+    // pins all referenced source generations. Enqueue is deliberately
+    // non-blocking so a stalled client cannot retain source-row locks.
+    let saved_message = if let Some(lease) = lease {
+        let saved = chat_repo
+            .create_message_in_transaction(
+                lease.transaction(),
+                notebook_id,
+                "assistant",
+                &full_response,
+                &citations,
+                Some(model_name),
+                None,
+                Some(session_id),
+            )
+            .await?;
+        for (index, source_id) in event_refs {
+            out.try_emit_non_terminal(ChatEvent::citation(index, source_id));
+        }
+        out.try_emit_non_terminal(ChatEvent::citations(citations.clone()));
+        lease.release().await?;
+        saved
+    } else {
+        let saved = create_message(CreateMessageParams {
+            repo: chat_repo.as_ref(),
+            notebook_id,
+            role: "assistant",
+            content: &full_response,
+            citations: &citations,
+            model: Some(model_name),
+            agent_id: None,
+            session_id: Some(session_id),
+        })
+        .await?;
+        out.emit(ChatEvent::citations(citations.clone())).await;
+        saved
+    };
 
     // Mean score, but only from a scale on which a mean means something. An
     // RRF value is a rank artifact and a stuffed chunk carries a constant;
@@ -337,19 +379,6 @@ pub(super) async fn stream_llm_response(
     // with the pool size rather than with the answer (US-012).
     let context_relevance = mean_relevance(&context_chunks);
     out.emit(ChatEvent::metrics(context_relevance)).await;
-
-    // Save complete response
-    let saved_message = create_message(CreateMessageParams {
-        repo: chat_repo.as_ref(),
-        notebook_id,
-        role: "assistant",
-        content: &full_response,
-        citations: &citations,
-        model: Some(model_name),
-        agent_id: None,
-        session_id: Some(session_id),
-    })
-    .await?;
 
     // Fire-and-forget: extract memories + summarize truncated history (US-007 + US-002)
     if memory_enabled
@@ -785,26 +814,65 @@ pub struct NativeCitationStream {
     document_numbers: HashMap<usize, usize>,
 }
 
+#[derive(Default)]
+pub struct SseFrameBuffer {
+    pending: Vec<u8>,
+}
+
+impl SseFrameBuffer {
+    fn push(&mut self, bytes: &[u8]) -> Result<Vec<String>, AppError> {
+        self.pending.extend_from_slice(bytes);
+        if self.pending.len() > MAX_RESPONSE_SIZE && !self.pending.contains(&b'\n') {
+            return Err(AppError::ProviderError(
+                "Provider SSE frame exceeded the response size limit".to_owned(),
+            ));
+        }
+
+        let mut start = 0;
+        let mut data = Vec::new();
+        for (end, byte) in self.pending.iter().copied().enumerate() {
+            if byte != b'\n' {
+                continue;
+            }
+            let mut line = &self.pending[start..end];
+            if line.last() == Some(&b'\r') {
+                line = &line[..line.len() - 1];
+            }
+            let line = std::str::from_utf8(line).map_err(|error| {
+                AppError::ProviderError(format!("Provider SSE frame is not UTF-8: {error}"))
+            })?;
+            if let Some(payload) = line.strip_prefix("data:") {
+                data.push(payload.strip_prefix(' ').unwrap_or(payload).to_owned());
+            }
+            start = end + 1;
+        }
+        if start > 0 {
+            self.pending.drain(..start);
+        }
+        if self.pending.len() > MAX_RESPONSE_SIZE {
+            return Err(AppError::ProviderError(
+                "Provider SSE frame exceeded the response size limit".to_owned(),
+            ));
+        }
+        Ok(data)
+    }
+}
+
 /// Process a chunk of bytes from the LLM stream.
 ///
 /// Native markers are injected while their events are parsed. This preserves
-/// their association with the preceding claim even when one network chunk
-/// contains several alternating text and citation events.
+/// their association with the preceding claim. `sse_frames` retains partial
+/// lines, so parsing is independent from how HTTP/TCP fragments the stream.
 pub async fn process_chunk(
     bytes: &[u8],
     provider: &dyn LlmProvider,
     full_response: &mut String,
     out: &ChatEventStream,
+    sse_frames: &mut SseFrameBuffer,
     mut native_citations: Option<&mut NativeCitationStream>,
 ) -> Result<ChunkResult, AppError> {
-    let chunk_str = String::from_utf8_lossy(bytes);
-
-    for line in chunk_str.lines() {
-        let Some(data) = line.strip_prefix("data: ") else {
-            continue;
-        };
-
-        let Some(event) = provider.parse_sse_data(data) else {
+    for data in sse_frames.push(bytes)? {
+        let Some(event) = provider.parse_sse_data(&data) else {
             continue;
         };
 
@@ -1017,9 +1085,16 @@ mod tests {
 
         // Send a chunk that would exceed the limit
         let bytes = MockProvider::text_delta_line(&"y".repeat(20));
-        let result = process_chunk(&bytes, &provider, &mut full_response, &out, None)
-            .await
-            .unwrap();
+        let result = process_chunk(
+            &bytes,
+            &provider,
+            &mut full_response,
+            &out,
+            &mut SseFrameBuffer::default(),
+            None,
+        )
+        .await
+        .unwrap();
 
         assert!(
             matches!(result, ChunkResult::Truncated),
@@ -1036,9 +1111,16 @@ mod tests {
         let mut full_response = String::new();
 
         let bytes = MockProvider::text_delta_line("hello");
-        let result = process_chunk(&bytes, &provider, &mut full_response, &out, None)
-            .await
-            .unwrap();
+        let result = process_chunk(
+            &bytes,
+            &provider,
+            &mut full_response,
+            &out,
+            &mut SseFrameBuffer::default(),
+            None,
+        )
+        .await
+        .unwrap();
 
         assert!(
             matches!(result, ChunkResult::Continue),
@@ -1054,9 +1136,16 @@ mod tests {
         let mut full_response = String::new();
 
         let bytes = MockProvider::done_line();
-        let result = process_chunk(&bytes, &provider, &mut full_response, &out, None)
-            .await
-            .unwrap();
+        let result = process_chunk(
+            &bytes,
+            &provider,
+            &mut full_response,
+            &out,
+            &mut SseFrameBuffer::default(),
+            None,
+        )
+        .await
+        .unwrap();
 
         assert!(
             matches!(result, ChunkResult::Done),
@@ -1070,6 +1159,7 @@ mod tests {
         let provider = MockProvider;
         let mut full_response = String::new();
         let mut native = NativeCitationStream::default();
+        let mut frames = SseFrameBuffer::default();
         let bytes = format!(
             "{}{}{}{}",
             String::from_utf8(MockProvider::text_delta_line("Claim A")).expect("text A"),
@@ -1083,6 +1173,7 @@ mod tests {
             &provider,
             &mut full_response,
             &out,
+            &mut frames,
             Some(&mut native),
         )
         .await
@@ -1097,6 +1188,45 @@ mod tests {
                 ChatEvent::Chunk(chunk) => assert_eq!(chunk.text, expected),
                 event => panic!("citation validation must remain after streaming, got {event:?}"),
             }
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn provider_events_survive_arbitrary_network_fragmentation() {
+        let (out, mut rx) = ChatEventStream::channel();
+        let provider = MockProvider;
+        let mut full_response = String::new();
+        let mut frames = SseFrameBuffer::default();
+        let event = MockProvider::text_delta_line("réponse fragmentée");
+        let split_inside_utf8 = event
+            .windows(2)
+            .position(|bytes| bytes == "é".as_bytes())
+            .expect("multibyte character")
+            + 1;
+
+        for fragment in [
+            &event[..7],
+            &event[7..split_inside_utf8],
+            &event[split_inside_utf8..],
+        ] {
+            let result = process_chunk(
+                fragment,
+                &provider,
+                &mut full_response,
+                &out,
+                &mut frames,
+                None,
+            )
+            .await
+            .expect("process fragment");
+            assert!(matches!(result, ChunkResult::Continue));
+        }
+
+        assert_eq!(full_response, "réponse fragmentée");
+        match rx.recv().await.expect("one reconstructed event") {
+            ChatEvent::Chunk(chunk) => assert_eq!(chunk.text, "réponse fragmentée"),
+            event => panic!("expected chunk, got {event:?}"),
         }
         assert!(rx.try_recv().is_err());
     }
@@ -1289,14 +1419,22 @@ mod tests {
         let (out, mut rx) = ChatEventStream::channel();
         let provider = MockProvider;
         let mut full_response = String::new();
+        let mut frames = SseFrameBuffer::default();
 
         // Feed 10 chunks of 10KB each = 100KB, all should succeed
         let chunk_10kb = "A".repeat(10_240);
         for i in 0..10 {
             let bytes = MockProvider::text_delta_line(&chunk_10kb);
-            let result = process_chunk(&bytes, &provider, &mut full_response, &out, None)
-                .await
-                .unwrap();
+            let result = process_chunk(
+                &bytes,
+                &provider,
+                &mut full_response,
+                &out,
+                &mut frames,
+                None,
+            )
+            .await
+            .unwrap();
             assert!(
                 matches!(result, ChunkResult::Continue),
                 "Chunk {i} (at {}KB) should Continue",
@@ -1307,9 +1445,16 @@ mod tests {
 
         // The 11th chunk (even 1 byte) should trigger Truncated
         let bytes = MockProvider::text_delta_line("x");
-        let result = process_chunk(&bytes, &provider, &mut full_response, &out, None)
-            .await
-            .unwrap();
+        let result = process_chunk(
+            &bytes,
+            &provider,
+            &mut full_response,
+            &out,
+            &mut frames,
+            None,
+        )
+        .await
+        .unwrap();
         assert!(
             matches!(result, ChunkResult::Truncated),
             "Expected Truncated when accumulated response exceeds MAX_RESPONSE_SIZE"
@@ -1340,14 +1485,22 @@ mod tests {
         let (out, _rx) = ChatEventStream::channel();
         let provider = MockProvider;
         let mut full_response = String::new();
+        let mut frames = SseFrameBuffer::default();
 
         // Feed in two halves: 50KB + 50KB
         let half = "B".repeat(MAX_RESPONSE_SIZE / 2);
         for _ in 0..2 {
             let bytes = MockProvider::text_delta_line(&half);
-            let result = process_chunk(&bytes, &provider, &mut full_response, &out, None)
-                .await
-                .unwrap();
+            let result = process_chunk(
+                &bytes,
+                &provider,
+                &mut full_response,
+                &out,
+                &mut frames,
+                None,
+            )
+            .await
+            .unwrap();
             assert!(
                 matches!(result, ChunkResult::Continue),
                 "Expected Continue at or below MAX_RESPONSE_SIZE"
@@ -1368,14 +1521,22 @@ mod tests {
         let (out, mut rx) = ChatEventStream::channel();
         let provider = MockProvider;
         let mut full_response = String::new();
+        let mut frames = SseFrameBuffer::default();
 
         // Feed 5 chunks of 1KB each = 5KB total (well under limit)
         let chunk_1kb = "C".repeat(1_024);
         for _ in 0..5 {
             let bytes = MockProvider::text_delta_line(&chunk_1kb);
-            let result = process_chunk(&bytes, &provider, &mut full_response, &out, None)
-                .await
-                .unwrap();
+            let result = process_chunk(
+                &bytes,
+                &provider,
+                &mut full_response,
+                &out,
+                &mut frames,
+                None,
+            )
+            .await
+            .unwrap();
             assert!(matches!(result, ChunkResult::Continue));
         }
 
@@ -1383,9 +1544,16 @@ mod tests {
 
         // Send a done event — stream completes normally
         let bytes = MockProvider::done_line();
-        let result = process_chunk(&bytes, &provider, &mut full_response, &out, None)
-            .await
-            .unwrap();
+        let result = process_chunk(
+            &bytes,
+            &provider,
+            &mut full_response,
+            &out,
+            &mut frames,
+            None,
+        )
+        .await
+        .unwrap();
         assert!(
             matches!(result, ChunkResult::Done),
             "Expected Done on done event"
@@ -1406,11 +1574,19 @@ mod tests {
         let (out, _rx) = ChatEventStream::channel();
         let provider = MockProvider;
         let mut full_response = String::new();
+        let mut frames = SseFrameBuffer::default();
 
         let bytes = MockProvider::text_delta_line(&"Z".repeat(MAX_RESPONSE_SIZE + 1));
-        let result = process_chunk(&bytes, &provider, &mut full_response, &out, None)
-            .await
-            .unwrap();
+        let result = process_chunk(
+            &bytes,
+            &provider,
+            &mut full_response,
+            &out,
+            &mut frames,
+            None,
+        )
+        .await
+        .unwrap();
 
         assert!(
             matches!(result, ChunkResult::Truncated),

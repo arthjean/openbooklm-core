@@ -176,8 +176,9 @@ A citation is emitted only when seven things hold:
 
 1. the marker resolves to a chunk retrieved this turn;
 2. that chunk carries an index generation (a nil generation was never published);
-3. that generation remains active while a source-row lease is held through
-   event enqueue;
+3. that generation remains active while one transaction locks every cited
+   source through response persistence and enqueue of both citation event
+   shapes;
 4. its recorded span and pages describe a passage that can exist - `span_start <
    span_end`, `page_number <= page_end`, no last page without a first;
 5. the immediately preceding claim has a conservative lexical support signal in
@@ -204,6 +205,11 @@ shows up as refusals rather than as silently lower citation coverage.
 Interrupted, truncated and shutdown responses never reach final validation, so
 their persisted partial messages carry no citations even when marker text was
 already streamed.
+
+Citation enqueue is non-blocking while the source locks are held. A client that
+stops draining a full SSE buffer can lose citation metadata, but cannot block a
+source publication indefinitely. The persisted complete message still carries
+the transactionally validated citation set.
 
 ## Three ways to have no answer
 

@@ -375,7 +375,7 @@ async fn a_reader_sees_the_old_generation_until_publication_commits() {
     f.cleanup().await;
 }
 
-/// A citation lease pins the source pointer until its event has been enqueued.
+/// A citation lease pins the source pointer through persistence and enqueue.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "Requires PostgreSQL with pgvector (TEST_DATABASE_URL)"]
 async fn an_active_generation_lease_blocks_pointer_publication() {

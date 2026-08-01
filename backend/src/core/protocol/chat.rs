@@ -348,10 +348,10 @@ impl ChatEventStream {
     /// Emit an event. Returns `false` when the event was dropped because the
     /// client is gone or the stream already terminated.
     pub async fn emit(&self, event: ChatEvent) -> bool {
-        if matches!(event, ChatEvent::Citation(_))
+        if matches!(event, ChatEvent::Citation(_) | ChatEvent::Citations(_))
             && !self.generation_finished.load(Ordering::SeqCst)
         {
-            tracing::warn!("Dropped citation event before generation finished");
+            tracing::warn!("Dropped citation data before generation finished");
             return false;
         }
         if matches!(event, ChatEvent::Chunk(_)) && self.generation_finished.load(Ordering::SeqCst) {
@@ -380,6 +380,49 @@ impl ChatEventStream {
             return false;
         }
         self.tx.send(event).await.is_ok()
+    }
+
+    /// Enqueue a non-terminal event without waiting for channel capacity.
+    ///
+    /// Citation validation uses this while a database lease is live: a stalled
+    /// client may lose citation metadata, but cannot hold source publication
+    /// locks indefinitely.
+    pub fn try_emit_non_terminal(&self, event: ChatEvent) -> bool {
+        if event.is_terminal() {
+            tracing::warn!(
+                event = event.name(),
+                "Refused terminal event on non-terminal path"
+            );
+            return false;
+        }
+        if matches!(event, ChatEvent::Citation(_) | ChatEvent::Citations(_))
+            && !self.generation_finished.load(Ordering::SeqCst)
+        {
+            tracing::warn!("Dropped citation data before generation finished");
+            return false;
+        }
+        if matches!(event, ChatEvent::Chunk(_)) && self.generation_finished.load(Ordering::SeqCst) {
+            tracing::warn!("Dropped text chunk after citation validation started");
+            return false;
+        }
+        if self.terminated.load(Ordering::SeqCst) {
+            tracing::debug!(
+                event = event.name(),
+                "Dropped chat event emitted after stream termination"
+            );
+            return false;
+        }
+        match self.tx.try_send(event) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(event)) => {
+                tracing::warn!(
+                    event = event.name(),
+                    "Dropped chat event: client is backpressured"
+                );
+                false
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        }
     }
 
     /// Close the text phase and allow validated per-citation events.
@@ -480,11 +523,23 @@ mod tests {
         let source_id = Uuid::new_v4();
         assert!(stream.emit(ChatEvent::chunk("answer [1]")).await);
         assert!(!stream.emit(ChatEvent::citation(1, source_id)).await);
+        assert!(!stream.emit(ChatEvent::citations(Vec::new())).await);
 
         stream.finish_generation();
         assert!(stream.emit(ChatEvent::citation(1, source_id)).await);
+        assert!(stream.emit(ChatEvent::citations(Vec::new())).await);
         assert!(!stream.emit(ChatEvent::chunk("late text")).await);
-        assert_eq!(drain(&mut rx), vec!["chunk", "citation"]);
+        assert_eq!(drain(&mut rx), vec!["chunk", "citation", "citations"]);
+    }
+
+    #[test]
+    fn citation_enqueue_never_waits_for_a_backpressured_client() {
+        let (stream, _rx) = ChatEventStream::channel();
+        for _ in 0..CHAT_EVENT_BUFFER {
+            assert!(stream.try_emit_non_terminal(ChatEvent::chunk("fill")));
+        }
+        stream.finish_generation();
+        assert!(!stream.try_emit_non_terminal(ChatEvent::citations(Vec::new())));
     }
 
     #[tokio::test]

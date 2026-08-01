@@ -8,7 +8,6 @@ use std::collections::{HashMap, HashSet};
 
 use uuid::Uuid;
 
-use crate::core::protocol::{ChatEvent, ChatEventStream};
 use crate::llm::CitableChunk;
 use crate::llm::citations::{
     claim_is_supported_by, extract_citations_verified_against_active, find_code_ranges,
@@ -29,11 +28,23 @@ pub(super) struct CitationResolution<'a> {
     pub notebook_id: Uuid,
 }
 
+pub(super) struct ResolvedCitations {
+    pub citations: Vec<crate::llm::Citation>,
+    pub rejected: usize,
+    pub event_refs: Vec<(usize, Uuid)>,
+    pub lease: Option<ActiveGenerationLease>,
+}
+
+struct CitationCandidate {
+    citation: crate::llm::Citation,
+    event_index: usize,
+    generation_id: Uuid,
+}
+
 pub(super) async fn resolve_citations(
-    out: &ChatEventStream,
     input: &CitationResolution<'_>,
     source_repo: &dyn SourceRepository,
-) -> crate::llm::citations::ExtractedCitations {
+) -> ResolvedCitations {
     let source_ids: HashSet<Uuid> = input
         .context_chunks
         .iter()
@@ -59,20 +70,19 @@ pub(super) async fn resolve_citations(
     }
 
     if input.uses_native_citations && !input.native_citations.is_empty() {
-        resolve_native(out, input, source_repo).await
+        resolve_native(input, source_repo).await
     } else {
-        resolve_prompt_markers(out, input, source_repo, &active_generations).await
+        resolve_prompt_markers(input, source_repo, &active_generations).await
     }
 }
 
 async fn resolve_native(
-    out: &ChatEventStream,
     input: &CitationResolution<'_>,
     source_repo: &dyn SourceRepository,
-) -> crate::llm::citations::ExtractedCitations {
+) -> ResolvedCitations {
     let mut seen_doc_indices = HashSet::new();
     let mut rejected = 0usize;
-    let mut mapped = Vec::new();
+    let mut candidates = Vec::new();
     let code_ranges = find_code_ranges(input.full_response);
     for (native, marker_start) in input
         .native_citations
@@ -106,22 +116,13 @@ async fn resolve_native(
             );
             continue;
         }
-        let Some(lease) = lock_active_generation(
-            source_repo,
-            input.notebook_id,
-            document.source_id,
-            document.generation_id,
-        )
-        .await
-        else {
+        if !seen_doc_indices.insert(native.document_index) {
+            continue;
+        }
+        let Some(event_index) = input.doc_citation_map.get(&native.document_index).copied() else {
             rejected += 1;
             continue;
         };
-
-        if !seen_doc_indices.insert(native.document_index) {
-            release_lease(lease, input.notebook_id, document.source_id).await;
-            continue;
-        }
         let citation = crate::llm::Citation::new(
             document.source_id,
             document.chunk_index,
@@ -129,33 +130,29 @@ async fn resolve_native(
             document.relevance_score,
             provenance,
         );
-        if let Some(number) = input.doc_citation_map.get(&native.document_index) {
-            out.emit(ChatEvent::citation(*number, citation.source_id))
-                .await;
-        }
-        release_lease(lease, input.notebook_id, document.source_id).await;
-        mapped.push(citation);
+        candidates.push(CitationCandidate {
+            citation,
+            event_index,
+            generation_id: document.generation_id,
+        });
     }
 
+    let resolved = finalize_candidates(source_repo, input.notebook_id, candidates, rejected).await;
     tracing::info!(
         notebook_id = %input.notebook_id,
         native_count = input.native_citations.len(),
-        deduped = mapped.len(),
-        rejected,
+        deduped = resolved.citations.len(),
+        rejected = resolved.rejected,
         "Native citation mapping completed"
     );
-    crate::llm::citations::ExtractedCitations {
-        citations: mapped,
-        rejected,
-    }
+    resolved
 }
 
 async fn resolve_prompt_markers(
-    out: &ChatEventStream,
     input: &CitationResolution<'_>,
     source_repo: &dyn SourceRepository,
     active_generations: &HashMap<Uuid, Uuid>,
-) -> crate::llm::citations::ExtractedCitations {
+) -> ResolvedCitations {
     let citable: Vec<CitableChunk> = input
         .context_chunks
         .iter()
@@ -167,83 +164,103 @@ async fn resolve_prompt_markers(
         active_generations,
     );
     let mut rejected = extracted.rejected;
-    let mut citations = Vec::with_capacity(extracted.citations.len());
+    let mut candidates = Vec::with_capacity(extracted.citations.len());
     for citation in extracted.citations {
         if let Some((index, chunk)) = input.context_chunks.iter().enumerate().find(|(_, chunk)| {
             chunk.source_id == citation.source_id && chunk.chunk_index == citation.chunk_index
-        }) && let Some(lease) = lock_active_generation(
-            source_repo,
-            input.notebook_id,
-            chunk.source_id,
-            chunk.generation_id,
-        )
-        .await
-        {
-            out.emit(ChatEvent::citation(index + 1, citation.source_id))
-                .await;
-            release_lease(lease, input.notebook_id, chunk.source_id).await;
-            citations.push(citation);
+        }) {
+            candidates.push(CitationCandidate {
+                citation,
+                event_index: index + 1,
+                generation_id: chunk.generation_id,
+            });
         } else {
             rejected += 1;
         }
     }
+    let resolved = finalize_candidates(source_repo, input.notebook_id, candidates, rejected).await;
     tracing::info!(
         notebook_id = %input.notebook_id,
         context_chunks = input.context_chunks.len(),
-        citations = citations.len(),
-        rejected,
+        citations = resolved.citations.len(),
+        rejected = resolved.rejected,
         response_len = input.full_response.len(),
         "Regex citation extraction completed"
     );
-    crate::llm::citations::ExtractedCitations {
-        citations,
-        rejected,
-    }
+    resolved
 }
 
-async fn lock_active_generation(
+async fn finalize_candidates(
     source_repo: &dyn SourceRepository,
     notebook_id: Uuid,
-    source_id: Uuid,
-    generation_id: Uuid,
-) -> Option<ActiveGenerationLease> {
-    match source_repo
-        .lock_active_generation(source_id, generation_id)
-        .await
-    {
-        Ok(Some(lease)) => Some(lease),
-        Ok(None) => {
-            tracing::warn!(
-                %notebook_id,
-                %source_id,
-                %generation_id,
-                reason = ReasonCode::CitationRejected.as_str(),
-                "Citation generation is no longer active"
-            );
-            None
-        }
+    candidates: Vec<CitationCandidate>,
+    mut rejected: usize,
+) -> ResolvedCitations {
+    if candidates.is_empty() {
+        return ResolvedCitations {
+            citations: Vec::new(),
+            rejected,
+            event_refs: Vec::new(),
+            lease: None,
+        };
+    }
+    let requested: Vec<_> = candidates
+        .iter()
+        .map(|candidate| (candidate.citation.source_id, candidate.generation_id))
+        .collect();
+    let lease = match source_repo.lock_active_generations(&requested).await {
+        Ok(lease) => lease,
         Err(error) => {
             tracing::warn!(
                 %notebook_id,
-                %source_id,
-                %generation_id,
                 error = %error,
                 reason = ReasonCode::CitationRejected.as_str(),
-                "Citation active-generation check failed"
+                "Citation active-generation lease failed"
             );
-            None
+            rejected += candidates.len();
+            return ResolvedCitations {
+                citations: Vec::new(),
+                rejected,
+                event_refs: Vec::new(),
+                lease: None,
+            };
+        }
+    };
+
+    let mut citations = Vec::with_capacity(candidates.len());
+    let mut event_refs = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        if lease.is_active(candidate.citation.source_id, candidate.generation_id) {
+            event_refs.push((candidate.event_index, candidate.citation.source_id));
+            citations.push(candidate.citation);
+        } else {
+            rejected += 1;
+            tracing::warn!(
+                %notebook_id,
+                source_id = %candidate.citation.source_id,
+                generation_id = %candidate.generation_id,
+                reason = ReasonCode::CitationRejected.as_str(),
+                "Citation generation is no longer active"
+            );
         }
     }
-}
 
-async fn release_lease(lease: ActiveGenerationLease, notebook_id: Uuid, source_id: Uuid) {
-    if let Err(error) = lease.release().await {
-        tracing::warn!(
-            %notebook_id,
-            %source_id,
-            error = %error,
-            reason = ReasonCode::CitationRejected.as_str(),
-            "Citation generation lease release failed after event enqueue"
-        );
+    if citations.is_empty() {
+        if let Err(error) = lease.release().await {
+            tracing::warn!(%notebook_id, error = %error, "Empty citation lease release failed");
+        }
+        ResolvedCitations {
+            citations,
+            rejected,
+            event_refs,
+            lease: None,
+        }
+    } else {
+        ResolvedCitations {
+            citations,
+            rejected,
+            event_refs,
+            lease: Some(lease),
+        }
     }
 }

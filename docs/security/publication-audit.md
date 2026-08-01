@@ -78,7 +78,9 @@ exist in this history.
 
 ### Findings
 
-Three findings. Zero unresolved. Zero real or possibly-real credentials.
+Five classified findings. Zero unresolved. Zero real or possibly-real
+credentials. F-004 and F-005 were introduced after the scan above and are dated
+in their own sections.
 
 #### F-001 — `.env.example` sample database password
 
@@ -187,6 +189,44 @@ default is known whatever it is. Removing it entirely was also considered and
 rejected: it breaks the one-command start the PRD treats as the operator-DX
 mitigation, and trades a documented default for a worse failure mode, an
 operator inventing their own `DATABASE_URL` with no working example to copy.
+
+#### F-005 — Credential-shaped probes in the corpus validator test
+
+| Field | Value |
+|---|---|
+| Rules | `openai_key`, `aws_access_key_id` (both HIGH severity patterns) |
+| Path | `backend/src/services/rag/eval/corpus.rs:1439-1440` |
+| Introduced | `f23f34c7d386125e968fd811c3bf9a12336233ec` |
+| Fingerprints | `d67ee745ad52ec11f518527f9dcbd613d798585dad89b4dbe614409be94beb69` (OpenAI), `1a5d44a2dca19669d72edf4c4f1c27c4c1ca4b4408fbb17f6ce4ad452d78ddb3` (AWS) |
+| Classification | **SYNTHETIC_TEST_FIXTURE** |
+
+**Decision: keep, classified. Changing the values cannot resolve this.**
+
+Introduced by EP-001, after the original audit ran, which is why these appear as
+UNRESOLVED on a re-scan rather than in the table above.
+
+Both live inside `production_looking_values_are_rejected`, the test that proves
+`forbidden_value_matches` refuses production-looking identifiers in evaluation
+fixtures. That check exists because the RAG evaluation PRD requires the corpus to
+reject production-looking account IDs, email addresses and credentials, so the
+fixtures cannot smuggle real data into a public repository.
+
+The two findings are therefore a detector being detected. To prove that a
+credential detector fires, the test has to contain something shaped like a
+credential; the history scanner looks for the same shapes, so it finds them.
+Every value that makes the test meaningful will trigger the scan, which makes
+this structural rather than a value that happens to be unlucky.
+
+Neither value is issued. `AKIAIOSFODNN7EXAMPLE` is the example access key id AWS
+publishes in its own documentation, and its `EXAMPLE` suffix is AWS's own marker
+for exactly this purpose. The OpenAI probe is `sk-` followed by the Latin
+alphabet and `012345`, which no issuer would produce.
+
+Splitting the literals so the scanner stops matching them, for instance building
+them by concatenation at runtime, was considered and rejected. It would hide the
+strings from the gate without removing them from the repository, and it teaches
+that the way past a security check is to evade its pattern. A reviewed allowlist
+entry states the same conclusion in a place a reader can audit.
 
 ### Credential rotation
 

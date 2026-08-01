@@ -294,15 +294,26 @@ fn numeric_literal_values(text: &str) -> Vec<String> {
             continue;
         }
         if !run.is_empty()
+            && !matches!(run.as_str(), "-" | "+")
             && is_numeric_separator(character)
             && chars.peek().is_some_and(char::is_ascii_digit)
         {
             run.push(character);
             continue;
         }
+        if (run.is_empty() || matches!(run.as_str(), "-" | "+"))
+            && matches!(character, '.' | ',')
+            && chars.peek().is_some_and(char::is_ascii_digit)
+        {
+            run.push('0');
+            run.push(character);
+            continue;
+        }
         if run.is_empty()
             && matches!(character, '-' | '+')
-            && chars.peek().is_some_and(char::is_ascii_digit)
+            && chars
+                .peek()
+                .is_some_and(|next| next.is_ascii_digit() || matches!(next, '.' | ','))
         {
             run.push(character);
             continue;
@@ -339,7 +350,37 @@ fn normalize_numeric_run(run: &str) -> Vec<String> {
         .chars()
         .filter(|character| is_numeric_separator(*character))
         .collect();
-    let is_grouped_integer = groups[0].len() <= 3
+    let last_separator = separators.last().copied();
+    let has_distinct_separator_before_last = last_separator.is_some_and(|last| {
+        separators[..separators.len() - 1]
+            .iter()
+            .any(|separator| *separator != last)
+    });
+    let decimal_candidate = last_separator.is_some_and(|separator| {
+        matches!(separator, '.' | ',')
+            && (groups.last().is_some_and(|group| group.len() != 3)
+                || groups[0].len() > 3
+                || has_distinct_separator_before_last)
+    });
+    if decimal_candidate {
+        let integer_groups = &groups[..groups.len() - 1];
+        let grouped_prefix = integer_groups.len() == 1
+            || (integer_groups[0].len() <= 3
+                && integer_groups[1..].iter().all(|group| group.len() == 3));
+        if grouped_prefix {
+            return vec![canonical_decimal(
+                &integer_groups.concat(),
+                groups.last().copied().unwrap_or_default(),
+                negative,
+            )];
+        }
+    }
+    let separators_are_unambiguous_grouping = groups.len() > 2
+        || separators
+            .iter()
+            .all(|separator| !matches!(separator, '.' | ','));
+    let is_grouped_integer = separators_are_unambiguous_grouping
+        && groups[0].len() <= 3
         && groups[1..].iter().all(|group| group.len() == 3)
         && separators.len() == groups.len() - 1;
     if is_grouped_integer {
@@ -347,21 +388,10 @@ fn normalize_numeric_run(run: &str) -> Vec<String> {
     }
 
     if groups.len() == 2 && separators.len() == 1 && matches!(separators[0], '.' | ',') {
-        let integer = groups[0].trim_start_matches('0');
-        let fraction = groups[1].trim_end_matches('0');
-        let integer = if integer.is_empty() { "0" } else { integer };
-        if fraction.is_empty() {
-            return vec![canonical_integer(integer, negative)];
-        }
-        let sign = if negative { "-" } else { "" };
-        return vec![format!("{sign}{integer}.{fraction}")];
+        return vec![canonical_decimal(groups[0], groups[1], negative)];
     }
 
-    groups
-        .iter()
-        .enumerate()
-        .map(|(index, group)| canonical_integer(group, negative && index == 0))
-        .collect()
+    vec![format!("literal:{run}")]
 }
 
 fn canonical_integer(digits: &str, negative: bool) -> String {
@@ -372,6 +402,17 @@ fn canonical_integer(digits: &str, negative: bool) -> String {
     } else {
         digits.to_owned()
     }
+}
+
+fn canonical_decimal(integer: &str, fraction: &str, negative: bool) -> String {
+    let integer = integer.trim_start_matches('0');
+    let fraction = fraction.trim_end_matches('0');
+    let integer = if integer.is_empty() { "0" } else { integer };
+    if fraction.is_empty() {
+        return canonical_integer(integer, negative);
+    }
+    let sign = if negative { "-" } else { "" };
+    format!("{sign}{integer}.{fraction}")
 }
 
 fn is_numeric_separator(character: char) -> bool {
@@ -898,7 +939,7 @@ mod tests {
         assert!(unsupported_grouped_number.citations.is_empty());
         assert_eq!(unsupported_grouped_number.rejected, 1);
 
-        chunk.content = "The retry budget is 1,001 attempts before failure.".to_owned();
+        chunk.content = "The retry budget is 1 001 attempts before failure.".to_owned();
         let accepted_group_normalization = extract_citations_verified_against_active(
             "The retry budget is 1001 attempts [1].",
             &[chunk.clone()],
@@ -906,6 +947,26 @@ mod tests {
         );
         assert_eq!(accepted_group_normalization.citations.len(), 1);
         assert_eq!(accepted_group_normalization.rejected, 0);
+
+        chunk.content = "The retry budget is 1,001 attempts before failure.".to_owned();
+        let ambiguous_punctuation_is_not_assumed_to_be_grouping =
+            extract_citations_verified_against_active(
+                "The retry budget is 1001 attempts [1].",
+                &[chunk.clone()],
+                &active,
+            );
+        assert!(
+            ambiguous_punctuation_is_not_assumed_to_be_grouping
+                .citations
+                .is_empty()
+        );
+        assert_eq!(
+            ambiguous_punctuation_is_not_assumed_to_be_grouping.rejected,
+            1
+        );
+
+        assert_eq!(numeric_values(".5 -0,25"), numeric_values("0.5 -0.25"));
+        assert_eq!(numeric_values("1,001.500"), numeric_values("1001.5"));
 
         chunk.content = "The retry budget is thirteen attempts before failure.".to_owned();
         let unsupported_dozen = extract_citations_verified_against_active(

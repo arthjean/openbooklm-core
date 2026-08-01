@@ -3,7 +3,7 @@
     "file": "tasks/prd-rag-reliability-and-quality.md",
     "title": "RAG Reliability and Quality",
     "created_at": "2026-07-31",
-    "status": "IN_PROGRESS"
+    "status": "DONE"
   },
   "epics": [
     {
@@ -33,10 +33,10 @@
     {
       "id": "EP-004",
       "title": "Bounded Context, Trustworthy Citations, and Safe Failure",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "stories_total": 3,
-      "stories_done": 0
+      "stories_done": 3
     }
   ],
   "stories": [
@@ -277,37 +277,37 @@
       "id": "US-018",
       "title": "Enforce one provider-aware context budget",
       "epic": "EP-004",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "size": "L",
       "blocked_by": [
         "US-013",
         "US-014"
       ],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-08-01",
+      "completed_at": "2026-08-01",
+      "reviewed_at": "2026-08-01"
     },
     {
       "id": "US-019",
       "title": "Preserve stable PDF, OCR, and text source spans",
       "epic": "EP-004",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P1",
       "size": "L",
       "blocked_by": [
         "US-001",
         "US-008"
       ],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-08-01",
+      "completed_at": "2026-08-01",
+      "reviewed_at": "2026-08-01"
     },
     {
       "id": "US-020",
       "title": "Isolate untrusted content and distinguish RAG failure states",
       "epic": "EP-004",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "size": "L",
       "blocked_by": [
@@ -315,9 +315,9 @@
         "US-018",
         "US-019"
       ],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-08-01",
+      "completed_at": "2026-08-01",
+      "reviewed_at": "2026-08-01"
     }
   ]
 }

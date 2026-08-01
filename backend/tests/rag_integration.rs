@@ -15,6 +15,7 @@
 
 #![cfg(test)]
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -27,8 +28,8 @@ use openbooklm::core::config::DatabasePoolConfig;
 use openbooklm::core::providers::{EMBEDDING_DIM, EmbeddingProvider};
 use openbooklm::error::AppError;
 use openbooklm::repositories::{
-    ChunkRepository, GenerationRepository, SeaOrmChunkRepository, SeaOrmGenerationRepository,
-    SeaOrmSearchRepository, SearchRepository,
+    APPROVED_STRATEGY, ChunkRepository, GenerationRepository, SeaOrmChunkRepository,
+    SeaOrmGenerationRepository, SeaOrmSearchRepository, SearchRepository, VectorCapabilities,
 };
 use openbooklm::services::rag::provenance::{
     ChunkingProvenance, EmbeddingProvenance, GenerationProvenance, Normalization,
@@ -131,6 +132,54 @@ impl Fixture {
             .expect("claim")
             .expect("no competing build");
         let (chunks, embeddings) = synthetic_chunks(marker, count);
+        self.chunks
+            .store_chunks(generation_id, source_id, &chunks, &embeddings)
+            .await
+            .expect("store chunks");
+        self.generations
+            .record_build_plan(
+                generation_id,
+                i32::try_from(count).expect("fixture size fits i32"),
+                &provenance.chunking,
+            )
+            .await
+            .expect("record build plan");
+        let _published = self
+            .generations
+            .publish(generation_id, source_id, EMBEDDING_DIM)
+            .await
+            .expect("publish");
+        generation_id
+    }
+
+    /// Publish one generation of `count` chunks carrying clustered vectors.
+    ///
+    /// Used by the reduced recall test: `synthetic_chunks` produces one-hot
+    /// vectors, which are equidistant from everything and make a recall
+    /// comparison vacuous. These cluster, the way real embeddings do.
+    async fn seed_dense_source(&self, source_id: Uuid, count: usize, cluster: usize) -> Uuid {
+        let provenance = provenance("dense-recall");
+        let generation_id = self
+            .generations
+            .claim(source_id, &provenance)
+            .await
+            .expect("claim")
+            .expect("no competing build");
+
+        let chunks: Vec<ChunkWithContext> = (0..count)
+            .map(|i| ChunkWithContext {
+                content: format!("dense passage {i} in cluster {cluster}"),
+                context_prefix: None,
+                parent_content: None,
+                metadata: ChunkMetadata {
+                    position: u32::try_from(i).unwrap_or(0),
+                    ..Default::default()
+                },
+                content_hash: format!("dense-{cluster}-{i}"),
+            })
+            .collect();
+        let embeddings: Vec<Vec<f32>> = (0..count).map(|i| dense_vector(i, cluster)).collect();
+
         self.chunks
             .store_chunks(generation_id, source_id, &chunks, &embeddings)
             .await
@@ -2243,4 +2292,252 @@ async fn a_shutdown_signal_stops_ingestion_and_preserves_the_index() {
     assert_eq!(f.active_contents("generation").await.len(), 3);
 
     f.cleanup().await;
+}
+
+// ============================================================================
+// US-016 — the approved filtered-ANN strategy
+// ============================================================================
+
+/// Per-query scan settings must not survive the retrieval transaction.
+///
+/// `SET LOCAL` is transaction-scoped by definition, but the setting is applied
+/// on a *pooled* connection, and a leak here would be invisible: the next
+/// borrower of that connection would silently run someone else's scan mode, and
+/// the only symptom would be a recall number that moves for no reason.
+///
+/// The probes run concurrently and each reports its backend PID. Sequential
+/// probes would prove nothing: the pool hands the same connection back every
+/// time, so a loop of twenty would interrogate one backend twenty times. The
+/// test asserts it reached more than one, then asserts every one of them is
+/// clean.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "Requires PostgreSQL with pgvector (TEST_DATABASE_URL)"]
+async fn per_query_scan_settings_do_not_leak_into_pooled_connections() {
+    let Some(f) = Fixture::setup().await else {
+        return;
+    };
+
+    let source_id = f.create_source("scan settings").await;
+    let provenance = provenance("scan-settings");
+    f.publish_generation(source_id, "leak", 3, &provenance)
+        .await;
+
+    // Retrievals that apply every setting the approved strategy needs, run
+    // concurrently so several pooled connections carry one.
+    let query = vec![0.1_f32; EMBEDDING_DIM];
+    let searches = (0..8).map(|_| f.search.search_similar_chunks(f.notebook_id, &query, 10));
+    for result in futures::future::join_all(searches).await {
+        result.expect("dense search");
+    }
+
+    // `DatabasePoolConfig::default()` allows ten connections. Concurrent
+    // probes force the pool to hand out more than one of them.
+    let probes = (0..8).map(|_| {
+        f.db.query_one(Statement::from_string(
+            DbBackend::Postgres,
+            // `missing_ok` matters: pgvector registers `hnsw.*` when its
+            // library loads into a backend, so a pooled connection that has
+            // never run a vector expression does not know the setting at all.
+            // That is not a leak either, which is why NULL is accepted and any
+            // other value is not.
+            "SELECT pg_backend_pid() AS pid,
+                    current_setting('hnsw.iterative_scan', true) AS iterative_scan,
+                    current_setting('hnsw.ef_search', true) AS ef_search,
+                    current_setting('hnsw.max_scan_tuples', true) AS max_scan_tuples",
+        ))
+    });
+
+    let mut backends: HashSet<i32> = HashSet::new();
+    for probe in futures::future::join_all(probes).await {
+        let row = probe.expect("probe").expect("one row");
+        backends.insert(row.try_get::<i32>("", "pid").expect("backend pid"));
+        for (column, default) in [
+            ("iterative_scan", "off"),
+            ("ef_search", "40"),
+            ("max_scan_tuples", "20000"),
+        ] {
+            let value: Option<String> = row.try_get("", column).expect("setting value");
+            if let Some(value) = value {
+                assert_eq!(
+                    value, default,
+                    "hnsw.{column} leaked out of the retrieval transaction"
+                );
+            }
+        }
+    }
+
+    assert!(
+        backends.len() > 1,
+        "the probes all landed on one backend ({backends:?}), so nothing about \
+         the pool was tested"
+    );
+
+    f.cleanup().await;
+}
+
+/// The reduced recall test CI runs (US-016 AC-4).
+///
+/// The full 100,000-row comparison is `tests/ann_benchmark.rs`, an explicit
+/// performance test. This one seeds 3,000 chunks across two notebooks so that
+/// the notebook under test holds 10% of them, and asserts that the production
+/// dense query returns the same top-10 an exact scan does. It is small enough
+/// for a CI job and still fails if the approved scan strategy is dropped: with
+/// a plain HNSW scan and post-filtering the fill rate collapses long before the
+/// ordering does.
+#[tokio::test]
+#[ignore = "Requires PostgreSQL with pgvector (TEST_DATABASE_URL)"]
+async fn filtered_dense_search_matches_exact_search_on_a_reduced_corpus() {
+    let Some(f) = Fixture::setup().await else {
+        return;
+    };
+
+    // 300 rows in the notebook under test, 2,700 in a second notebook that
+    // shares the index. Filter selectivity is 10% of the seeded rows.
+    let target = f.create_source("target").await;
+    let target_generation = f.seed_dense_source(target, 300, 0).await;
+    let other_notebook = Uuid::new_v4();
+    exec(
+        &f.db,
+        "INSERT INTO notebooks (id, user_id, title) VALUES ($1, $2, 'ann noise')",
+        [other_notebook.into(), f.account_id.into()],
+    )
+    .await;
+    let noise_source = Uuid::new_v4();
+    exec(
+        &f.db,
+        "INSERT INTO sources (id, notebook_id, title, source_type, content, status)
+         VALUES ($1, $2, 'noise', 'text', 'noise', 'pending')",
+        [noise_source.into(), other_notebook.into()],
+    )
+    .await;
+    f.seed_dense_source(noise_source, 2_700, 1).await;
+
+    let queries: Vec<Vec<f32>> = (0..10).map(|i| dense_vector(i * 7, 0)).collect();
+
+    let mut matched = 0usize;
+    let mut returned = 0usize;
+    for query in &queries {
+        let approximate = f
+            .search
+            .search_similar_chunks(f.notebook_id, query, 10)
+            .await
+            .expect("dense search");
+        let exact = exact_top_ids(&f.db, f.notebook_id, query, 10).await;
+
+        returned += approximate.len();
+        matched += approximate.iter().filter(|r| exact.contains(&r.id)).count();
+
+        assert!(
+            approximate
+                .iter()
+                .all(|r| r.generation_id == target_generation),
+            "search must stay inside the active generation"
+        );
+
+        // strict_order is the reason this strategy was chosen over
+        // relaxed_order: the API and the fusion layer both consume dense
+        // results in distance order (US-016 AC-3).
+        for pair in approximate.windows(2) {
+            assert!(
+                pair[0].relevance_score >= pair[1].relevance_score,
+                "dense results came back out of distance order: {} then {}",
+                pair[0].relevance_score,
+                pair[1].relevance_score
+            );
+        }
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    let recall = matched as f64 / (queries.len() * 10) as f64;
+    #[allow(clippy::cast_precision_loss)]
+    let fill = returned as f64 / (queries.len() * 10) as f64;
+    assert!(
+        recall >= 0.95,
+        "Recall@10 against exact search was {recall:.3}, below the approved 0.95"
+    );
+    assert!(
+        fill >= 0.99,
+        "top-k fill was {fill:.3}: the filtered scan came back short"
+    );
+
+    exec(
+        &f.db,
+        "DELETE FROM notebooks WHERE id = $1",
+        [other_notebook.into()],
+    )
+    .await;
+    f.cleanup().await;
+}
+
+/// The pgvector build must offer the strategy the repository applies.
+#[tokio::test]
+#[ignore = "Requires PostgreSQL with pgvector (TEST_DATABASE_URL)"]
+async fn the_deployed_pgvector_supports_the_approved_strategy() {
+    let Some(f) = Fixture::setup().await else {
+        return;
+    };
+
+    let capabilities = VectorCapabilities::probe(&f.db).await.expect("probe");
+    assert!(
+        capabilities.iterative_scan,
+        "pgvector {} cannot run the approved filtered scan",
+        capabilities.extension_version
+    );
+    capabilities
+        .ensure_supports(APPROVED_STRATEGY)
+        .expect("the reference image satisfies the documented minimum");
+
+    f.cleanup().await;
+}
+
+/// A deterministic vector that clusters with `cluster` and varies with `index`.
+fn dense_vector(index: usize, cluster: usize) -> Vec<f32> {
+    (0..EMBEDDING_DIM)
+        .map(|d| {
+            #[allow(clippy::cast_precision_loss)]
+            let base = ((cluster * 13 + d) as f32 * 0.017).sin();
+            #[allow(clippy::cast_precision_loss)]
+            let jitter = ((index * 31 + d) as f32 * 0.0007).cos() * 0.05;
+            base + jitter
+        })
+        .collect()
+}
+
+/// Exact top-`limit` chunk ids for a notebook, bypassing the index.
+///
+/// `+ 0` on the distance is what keeps the planner off the HNSW index without
+/// touching a planner GUC: a session setting applied on a pooled connection is
+/// exactly the leak the test above forbids.
+async fn exact_top_ids(
+    db: &DatabaseConnection,
+    notebook_id: Uuid,
+    query: &[f32],
+    limit: usize,
+) -> Vec<Uuid> {
+    let vector = format!(
+        "[{}]",
+        query
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let rows = db
+        .query_all(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            format!(
+                "SELECT c.id
+                 FROM chunks c
+                 JOIN sources s ON c.source_id = s.id AND s.active_generation_id = c.generation_id
+                 WHERE s.notebook_id = $1
+                 ORDER BY (c.embedding <=> $2::vector) + 0
+                 LIMIT {limit}"
+            ),
+            [notebook_id.into(), vector.into()],
+        ))
+        .await
+        .expect("exact search");
+    rows.into_iter()
+        .map(|row| row.try_get::<Uuid>("", "id").expect("id"))
+        .collect()
 }

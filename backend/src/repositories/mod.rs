@@ -5,6 +5,7 @@
 //! product owns its own repositories, outside this module (US-013).
 
 mod account;
+pub mod ann;
 mod chat;
 mod chunk;
 mod generation;
@@ -25,6 +26,10 @@ pub use traits::{
     NotebookRepository, NotebookWithSourceCount, OcrCacheRepository, PaginatedChatHistory,
     PublicationOutcome, RagLogRepository, RepoResult, SearchRepository, SourceRepository,
 };
+
+// Re-export the filtered-scan strategy: it is how this layer reads vectors, and
+// the server startup check needs the same names.
+pub use ann::{APPROVED_STRATEGY, MIN_PGVECTOR_VERSION, ScanStrategy, VectorCapabilities};
 
 // Re-export SeaORM implementations
 pub use account::{SeaOrmAccountRepository, SeaOrmAccountSettingsRepository};

@@ -117,6 +117,27 @@ top of its release notes.
 Startup validation reports every configuration problem at once, before binding a
 socket. If the server starts, its configuration is complete.
 
+## Database prerequisites
+
+The core requires **pgvector 0.8.0 or newer** since the release that introduced
+filtered dense retrieval. `hnsw.iterative_scan`, which 0.8.0 added, is what
+keeps a notebook-scoped search from receiving a fraction of its own evidence;
+the measurement is in
+[docs/architecture/filtered-ann.md](architecture/filtered-ann.md).
+
+The server probes the extension at startup and refuses to run on an older
+build, naming the version it found. Upgrading the extension is one statement,
+and it needs no migration of the core schema:
+
+```sql
+ALTER EXTENSION vector UPDATE;
+```
+
+On the Compose stack this is already satisfied: `pgvector/pgvector:pg16` ships
+0.8.5. On a managed PostgreSQL, check `SELECT extversion FROM pg_extension
+WHERE extname = 'vector'` before upgrading the server, because a server that
+refuses to start is a harder outage to diagnose than one that never started.
+
 ## Contract changes
 
 Every release publishes `contracts/openapi.json` and the matching SDK. To see

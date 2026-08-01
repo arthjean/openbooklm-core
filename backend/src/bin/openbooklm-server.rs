@@ -43,6 +43,7 @@ use openbooklm::{
         RateLimiter, TaskTracker, build_cors_layer, create_rate_limit_middleware,
         request_id_middleware, security_headers_middleware, shutdown_signal,
     },
+    repositories::{APPROVED_STRATEGY, VectorCapabilities},
     services::source_events::{SourceEventBroadcaster, SseCleanupConfig},
     types::PurgeTaskState,
 };
@@ -90,6 +91,7 @@ async fn main() -> anyhow::Result<()> {
     // 3. Database, then migrations, then the account row the single operator owns.
     let db = db::connect(&config.database_url, &config.database_pool).await?;
     apply_core_migrations(&db).await?;
+    require_vector_capabilities(&db).await?;
     ensure_account(&db, account_id).await?;
 
     let (state, task_tracker) = build_core_state(&config, db);
@@ -151,6 +153,24 @@ async fn apply_core_migrations(db: &sea_orm::DatabaseConnection) -> anyhow::Resu
 
     with_migration_lock(db, async || CoreMigrator::up(db, None).await).await?;
     tracing::info!("Core schema up to date");
+    Ok(())
+}
+
+/// Refuse to start on a pgvector build that cannot run the approved filtered
+/// scan (US-016).
+///
+/// Failing here rather than at query time is the whole point: an unsupported
+/// build does not error on retrieval, it silently returns fewer rows than the
+/// filter had available, which reaches the user as a notebook with less
+/// evidence and reaches the operator as nothing at all.
+async fn require_vector_capabilities(db: &sea_orm::DatabaseConnection) -> anyhow::Result<()> {
+    let capabilities = VectorCapabilities::probe(db).await?;
+    capabilities.ensure_supports(APPROVED_STRATEGY)?;
+    tracing::info!(
+        pgvector = %capabilities.extension_version,
+        strategy = %APPROVED_STRATEGY.label(),
+        "Filtered dense retrieval strategy available"
+    );
     Ok(())
 }
 

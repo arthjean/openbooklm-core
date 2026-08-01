@@ -69,7 +69,7 @@ example — read it if you are embedding the core in your own binary.
 
 ## Quick start
 
-Prerequisites: Rust 1.88+, PostgreSQL 14+ with the `pgvector` extension, a
+Prerequisites: Rust 1.88+, PostgreSQL 14+ with `pgvector` **0.8.0 or newer**, a
 [Voyage AI](https://www.voyageai.com/) key for embeddings, and at least one of
 Anthropic, OpenAI or Mistral for generation.
 
@@ -140,7 +140,7 @@ Every variable is documented in [`.env.example`](.env.example). These matter:
 
 | Variable | |
 |---|---|
-| `DATABASE_URL` | PostgreSQL with pgvector. Required. |
+| `DATABASE_URL` | PostgreSQL with pgvector 0.8.0+. Required. |
 | `VOYAGE_API_KEY` | embeddings. Required — retrieval cannot index without it. |
 | `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `MISTRAL_API_KEY` | at least one required. |
 | `FIRECRAWL_API_KEY` | optional; web sources need it. |
@@ -173,8 +173,15 @@ as a stream error.
 
 ## Database
 
-PostgreSQL with pgvector. HNSW index on chunk embeddings, GIN index on the
-full-text vector, 1024-dimension embeddings.
+PostgreSQL with pgvector 0.8.0 or newer. HNSW index on chunk embeddings, GIN
+index on the full-text vector, 1024-dimension embeddings.
+
+The version floor is filtered dense retrieval. Notebook-scoped search needs
+`hnsw.iterative_scan`, which pgvector added in 0.8.0; without it a notebook
+holding a small share of the corpus silently receives a fraction of its own
+evidence. The server probes the extension at startup and refuses to run on an
+older build. The measurement and the chosen parameters are in
+[docs/architecture/filtered-ann.md](docs/architecture/filtered-ann.md).
 
 ```bash
 cd backend
@@ -221,8 +228,8 @@ and rollback.
 ## Support boundary
 
 What is supported: the reference server on the documented stack — PostgreSQL
-14+ with pgvector, the named providers, Linux x86-64, Docker Compose or a
-single binary.
+14+ with pgvector 0.8.0+, the named providers, Linux x86-64, Docker Compose or
+a single binary.
 
 What is not: multi-tenant hosting, other databases, other vector stores,
 offline local inference, and deployment topologies that are not one process and

@@ -200,6 +200,20 @@ jobs:
           done
           exit $missing
 
+      # The whole database-backed suite: generation publication and rollback
+      # (EP-002), ingestion cancellation (US-010), and the CI-sized filtered-ANN
+      # recall comparison (US-016). The full 100,000-row ANN benchmark stays an
+      # explicit performance test (backend/tests/ann_benchmark.rs).
+      #
+      # Single-threaded on purpose: several cases assert timing bounds or count
+      # provider calls, and a shared database makes them order-dependent.
+      - name: Database integration suite
+        working-directory: backend
+        env:
+          TEST_DATABASE_URL: postgres://openbooklm:openbooklm@localhost:5432/openbooklm
+        run: |
+          cargo test --no-default-features --test rag_integration -- --ignored --test-threads=1
+
   sdk:
     name: TypeScript SDK
     runs-on: ubuntu-latest

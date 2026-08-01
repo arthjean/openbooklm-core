@@ -1,0 +1,676 @@
+{
+  "schema": "rag-ann-benchmark/1",
+  "postgres_version": "PostgreSQL 16.14 (Debian 16.14-1.pgdg12+1) on x86_64-pc-linux-gnu, compiled by gcc (Debian 12.2.0-14+deb12u1) 12.2.0, 64-bit",
+  "pgvector_version": "0.8.5",
+  "iterative_scan_supported": true,
+  "reference_environment": "pgvector/pgvector:pg16 container, HNSW m=16 ef_construction=128, 1024-dimensional vectors, 100000 rows, local loopback connection",
+  "corpus_size": 100000,
+  "dimension": 1024,
+  "clusters": 256,
+  "queries_per_cell": 30,
+  "warmup_queries_per_cell": 30,
+  "top_k": 10,
+  "thresholds": {
+    "min_recall_at_10": 0.95,
+    "min_fill_rate": 0.99,
+    "max_p95_ms": 300.0,
+    "order_tolerance": 1e-6
+  },
+  "cases": [
+    {
+      "label": "100%",
+      "measured_selectivity": 1.0,
+      "matching_rows": 100000,
+      "measurements": [
+        {
+          "strategy": "exact",
+          "recall_at_10": 1.0,
+          "fill_rate": 1.0,
+          "p50_ms": 429.242,
+          "p95_ms": 436.92,
+          "tuples_scanned": 200028,
+          "out_of_order_queries": 0,
+          "max_order_violation": 0.0,
+          "plan": {
+            "shape": "Limit → Sort → Hash Join → Seq Scan → Hash → Seq Scan",
+            "uses_vector_index": false,
+            "actual_rows": 10,
+            "rows_removed_by_filter": 0,
+            "shared_blocks_hit": 2397533,
+            "shared_blocks_read": 207410
+          },
+          "settings": [],
+          "meets_thresholds": false,
+          "blocking": [
+            "p95_ms 436.9 > 300"
+          ]
+        },
+        {
+          "strategy": "hnsw_ef100",
+          "recall_at_10": 0.997,
+          "fill_rate": 1.0,
+          "p50_ms": 2.15,
+          "p95_ms": 2.368,
+          "tuples_scanned": 41,
+          "out_of_order_queries": 0,
+          "max_order_violation": 1.1193572768686266e-7,
+          "plan": {
+            "shape": "Limit → Nested Loop → Index Scan using ann_bench_chunks_embedding → Memoize → Index Scan using ann_bench_sources_pkey",
+            "uses_vector_index": true,
+            "actual_rows": 10,
+            "rows_removed_by_filter": 0,
+            "shared_blocks_hit": 691,
+            "shared_blocks_read": 3027
+          },
+          "settings": [
+            "SET LOCAL hnsw.ef_search = 100"
+          ],
+          "meets_thresholds": true,
+          "blocking": []
+        },
+        {
+          "strategy": "hnsw_strict_order_ef100_max20000",
+          "recall_at_10": 0.997,
+          "fill_rate": 1.0,
+          "p50_ms": 2.18,
+          "p95_ms": 2.627,
+          "tuples_scanned": 41,
+          "out_of_order_queries": 0,
+          "max_order_violation": 1.1193572768686266e-7,
+          "plan": {
+            "shape": "Limit → Nested Loop → Index Scan using ann_bench_chunks_embedding → Memoize → Index Scan using ann_bench_sources_pkey",
+            "uses_vector_index": true,
+            "actual_rows": 10,
+            "rows_removed_by_filter": 0,
+            "shared_blocks_hit": 637,
+            "shared_blocks_read": 3081
+          },
+          "settings": [
+            "SET LOCAL hnsw.ef_search = 100",
+            "SET LOCAL hnsw.iterative_scan = strict_order",
+            "SET LOCAL hnsw.max_scan_tuples = 20000"
+          ],
+          "meets_thresholds": true,
+          "blocking": []
+        },
+        {
+          "strategy": "hnsw_relaxed_order_ef100_max20000",
+          "recall_at_10": 0.997,
+          "fill_rate": 1.0,
+          "p50_ms": 2.296,
+          "p95_ms": 2.584,
+          "tuples_scanned": 41,
+          "out_of_order_queries": 0,
+          "max_order_violation": 1.1193572768686266e-7,
+          "plan": {
+            "shape": "Limit → Nested Loop → Index Scan using ann_bench_chunks_embedding → Memoize → Index Scan using ann_bench_sources_pkey",
+            "uses_vector_index": true,
+            "actual_rows": 10,
+            "rows_removed_by_filter": 0,
+            "shared_blocks_hit": 694,
+            "shared_blocks_read": 3024
+          },
+          "settings": [
+            "SET LOCAL hnsw.ef_search = 100",
+            "SET LOCAL hnsw.iterative_scan = relaxed_order",
+            "SET LOCAL hnsw.max_scan_tuples = 20000"
+          ],
+          "meets_thresholds": false,
+          "blocking": [
+            "the mode does not guarantee distance order, which fusion consumes"
+          ]
+        },
+        {
+          "strategy": "hnsw_strict_order_ef100_max100000",
+          "recall_at_10": 0.997,
+          "fill_rate": 1.0,
+          "p50_ms": 2.394,
+          "p95_ms": 2.718,
+          "tuples_scanned": 41,
+          "out_of_order_queries": 0,
+          "max_order_violation": 1.1193572768686266e-7,
+          "plan": {
+            "shape": "Limit → Nested Loop → Index Scan using ann_bench_chunks_embedding → Memoize → Index Scan using ann_bench_sources_pkey",
+            "uses_vector_index": true,
+            "actual_rows": 10,
+            "rows_removed_by_filter": 0,
+            "shared_blocks_hit": 634,
+            "shared_blocks_read": 3084
+          },
+          "settings": [
+            "SET LOCAL hnsw.ef_search = 100",
+            "SET LOCAL hnsw.iterative_scan = strict_order",
+            "SET LOCAL hnsw.max_scan_tuples = 100000"
+          ],
+          "meets_thresholds": true,
+          "blocking": []
+        },
+        {
+          "strategy": "hnsw_relaxed_order_ef100_max100000",
+          "recall_at_10": 0.997,
+          "fill_rate": 1.0,
+          "p50_ms": 2.402,
+          "p95_ms": 2.819,
+          "tuples_scanned": 41,
+          "out_of_order_queries": 0,
+          "max_order_violation": 1.1193572768686266e-7,
+          "plan": {
+            "shape": "Limit → Nested Loop → Index Scan using ann_bench_chunks_embedding → Memoize → Index Scan using ann_bench_sources_pkey",
+            "uses_vector_index": true,
+            "actual_rows": 10,
+            "rows_removed_by_filter": 0,
+            "shared_blocks_hit": 694,
+            "shared_blocks_read": 3024
+          },
+          "settings": [
+            "SET LOCAL hnsw.ef_search = 100",
+            "SET LOCAL hnsw.iterative_scan = relaxed_order",
+            "SET LOCAL hnsw.max_scan_tuples = 100000"
+          ],
+          "meets_thresholds": false,
+          "blocking": [
+            "the mode does not guarantee distance order, which fusion consumes"
+          ]
+        }
+      ]
+    },
+    {
+      "label": "0.1%",
+      "measured_selectivity": 0.001,
+      "matching_rows": 100,
+      "measurements": [
+        {
+          "strategy": "exact",
+          "recall_at_10": 1.0,
+          "fill_rate": 1.0,
+          "p50_ms": 0.377,
+          "p95_ms": 0.467,
+          "tuples_scanned": 324,
+          "out_of_order_queries": 0,
+          "max_order_violation": 0.0,
+          "plan": {
+            "shape": "Limit → Sort → Nested Loop → Seq Scan → Bitmap Heap Scan → Bitmap Index Scan using ann_bench_chunks_source",
+            "uses_vector_index": false,
+            "actual_rows": 10,
+            "rows_removed_by_filter": 3,
+            "shared_blocks_hit": 2620,
+            "shared_blocks_read": 0
+          },
+          "settings": [],
+          "meets_thresholds": true,
+          "blocking": []
+        },
+        {
+          "strategy": "hnsw_ef100",
+          "recall_at_10": 0.01,
+          "fill_rate": 0.01,
+          "p50_ms": 2.291,
+          "p95_ms": 2.676,
+          "tuples_scanned": 204,
+          "out_of_order_queries": 0,
+          "max_order_violation": 0.0,
+          "plan": {
+            "shape": "Limit → Nested Loop → Index Scan using ann_bench_chunks_embedding → Materialize → Seq Scan",
+            "uses_vector_index": true,
+            "actual_rows": 0,
+            "rows_removed_by_filter": 3,
+            "shared_blocks_hit": 763,
+            "shared_blocks_read": 3135
+          },
+          "settings": [
+            "SET LOCAL hnsw.ef_search = 100"
+          ],
+          "meets_thresholds": false,
+          "blocking": [
+            "recall_at_10 0.010 < 0.95",
+            "fill_rate 0.010 < 0.99"
+          ]
+        },
+        {
+          "strategy": "hnsw_strict_order_ef100_max20000",
+          "recall_at_10": 1.0,
+          "fill_rate": 1.0,
+          "p50_ms": 32.998,
+          "p95_ms": 43.337,
+          "tuples_scanned": 17432,
+          "out_of_order_queries": 0,
+          "max_order_violation": 0.0,
+          "plan": {
+            "shape": "Limit → Nested Loop → Index Scan using ann_bench_chunks_embedding → Materialize → Seq Scan",
+            "uses_vector_index": true,
+            "actual_rows": 10,
+            "rows_removed_by_filter": 3,
+            "shared_blocks_hit": 52797,
+            "shared_blocks_read": 28968
+          },
+          "settings": [
+            "SET LOCAL hnsw.ef_search = 100",
+            "SET LOCAL hnsw.iterative_scan = strict_order",
+            "SET LOCAL hnsw.max_scan_tuples = 20000"
+          ],
+          "meets_thresholds": true,
+          "blocking": []
+        },
+        {
+          "strategy": "hnsw_relaxed_order_ef100_max20000",
+          "recall_at_10": 1.0,
+          "fill_rate": 1.0,
+          "p50_ms": 33.616,
+          "p95_ms": 43.156,
+          "tuples_scanned": 17444,
+          "out_of_order_queries": 0,
+          "max_order_violation": 0.0,
+          "plan": {
+            "shape": "Limit → Nested Loop → Index Scan using ann_bench_chunks_embedding → Materialize → Seq Scan",
+            "uses_vector_index": true,
+            "actual_rows": 10,
+            "rows_removed_by_filter": 3,
+            "shared_blocks_hit": 52815,
+            "shared_blocks_read": 28968
+          },
+          "settings": [
+            "SET LOCAL hnsw.ef_search = 100",
+            "SET LOCAL hnsw.iterative_scan = relaxed_order",
+            "SET LOCAL hnsw.max_scan_tuples = 20000"
+          ],
+          "meets_thresholds": false,
+          "blocking": [
+            "the mode does not guarantee distance order, which fusion consumes"
+          ]
+        },
+        {
+          "strategy": "hnsw_strict_order_ef100_max100000",
+          "recall_at_10": 1.0,
+          "fill_rate": 1.0,
+          "p50_ms": 34.473,
+          "p95_ms": 41.733,
+          "tuples_scanned": 17432,
+          "out_of_order_queries": 0,
+          "max_order_violation": 0.0,
+          "plan": {
+            "shape": "Limit → Nested Loop → Index Scan using ann_bench_chunks_embedding → Materialize → Seq Scan",
+            "uses_vector_index": true,
+            "actual_rows": 10,
+            "rows_removed_by_filter": 3,
+            "shared_blocks_hit": 52797,
+            "shared_blocks_read": 28968
+          },
+          "settings": [
+            "SET LOCAL hnsw.ef_search = 100",
+            "SET LOCAL hnsw.iterative_scan = strict_order",
+            "SET LOCAL hnsw.max_scan_tuples = 100000"
+          ],
+          "meets_thresholds": true,
+          "blocking": []
+        },
+        {
+          "strategy": "hnsw_relaxed_order_ef100_max100000",
+          "recall_at_10": 1.0,
+          "fill_rate": 1.0,
+          "p50_ms": 35.071,
+          "p95_ms": 44.797,
+          "tuples_scanned": 17444,
+          "out_of_order_queries": 0,
+          "max_order_violation": 0.0,
+          "plan": {
+            "shape": "Limit → Nested Loop → Index Scan using ann_bench_chunks_embedding → Materialize → Seq Scan",
+            "uses_vector_index": true,
+            "actual_rows": 10,
+            "rows_removed_by_filter": 3,
+            "shared_blocks_hit": 52815,
+            "shared_blocks_read": 28968
+          },
+          "settings": [
+            "SET LOCAL hnsw.ef_search = 100",
+            "SET LOCAL hnsw.iterative_scan = relaxed_order",
+            "SET LOCAL hnsw.max_scan_tuples = 100000"
+          ],
+          "meets_thresholds": false,
+          "blocking": [
+            "the mode does not guarantee distance order, which fusion consumes"
+          ]
+        }
+      ]
+    },
+    {
+      "label": "1%",
+      "measured_selectivity": 0.01,
+      "matching_rows": 1000,
+      "measurements": [
+        {
+          "strategy": "exact",
+          "recall_at_10": 1.0,
+          "fill_rate": 1.0,
+          "p50_ms": 3.177,
+          "p95_ms": 3.659,
+          "tuples_scanned": 3024,
+          "out_of_order_queries": 0,
+          "max_order_violation": 0.0,
+          "plan": {
+            "shape": "Limit → Sort → Nested Loop → Seq Scan → Bitmap Heap Scan → Bitmap Index Scan using ann_bench_chunks_source",
+            "uses_vector_index": false,
+            "actual_rows": 10,
+            "rows_removed_by_filter": 3,
+            "shared_blocks_hit": 26070,
+            "shared_blocks_read": 0
+          },
+          "settings": [],
+          "meets_thresholds": true,
+          "blocking": []
+        },
+        {
+          "strategy": "hnsw_ef100",
+          "recall_at_10": 0.12,
+          "fill_rate": 0.12,
+          "p50_ms": 2.48,
+          "p95_ms": 2.73,
+          "tuples_scanned": 208,
+          "out_of_order_queries": 0,
+          "max_order_violation": 0.0,
+          "plan": {
+            "shape": "Limit → Nested Loop → Index Scan using ann_bench_chunks_embedding → Materialize → Seq Scan",
+            "uses_vector_index": true,
+            "actual_rows": 2,
+            "rows_removed_by_filter": 3,
+            "shared_blocks_hit": 796,
+            "shared_blocks_read": 3120
+          },
+          "settings": [
+            "SET LOCAL hnsw.ef_search = 100"
+          ],
+          "meets_thresholds": false,
+          "blocking": [
+            "recall_at_10 0.120 < 0.95",
+            "fill_rate 0.120 < 0.99"
+          ]
+        },
+        {
+          "strategy": "hnsw_strict_order_ef100_max20000",
+          "recall_at_10": 1.0,
+          "fill_rate": 1.0,
+          "p50_ms": 5.784,
+          "p95_ms": 6.515,
+          "tuples_scanned": 1624,
+          "out_of_order_queries": 0,
+          "max_order_violation": 0.0,
+          "plan": {
+            "shape": "Limit → Nested Loop → Index Scan using ann_bench_chunks_embedding → Materialize → Seq Scan",
+            "uses_vector_index": true,
+            "actual_rows": 10,
+            "rows_removed_by_filter": 3,
+            "shared_blocks_hit": 5368,
+            "shared_blocks_read": 6145
+          },
+          "settings": [
+            "SET LOCAL hnsw.ef_search = 100",
+            "SET LOCAL hnsw.iterative_scan = strict_order",
+            "SET LOCAL hnsw.max_scan_tuples = 20000"
+          ],
+          "meets_thresholds": true,
+          "blocking": []
+        },
+        {
+          "strategy": "hnsw_relaxed_order_ef100_max20000",
+          "recall_at_10": 1.0,
+          "fill_rate": 1.0,
+          "p50_ms": 5.981,
+          "p95_ms": 6.647,
+          "tuples_scanned": 1634,
+          "out_of_order_queries": 0,
+          "max_order_violation": 0.0,
+          "plan": {
+            "shape": "Limit → Nested Loop → Index Scan using ann_bench_chunks_embedding → Materialize → Seq Scan",
+            "uses_vector_index": true,
+            "actual_rows": 10,
+            "rows_removed_by_filter": 3,
+            "shared_blocks_hit": 5383,
+            "shared_blocks_read": 6145
+          },
+          "settings": [
+            "SET LOCAL hnsw.ef_search = 100",
+            "SET LOCAL hnsw.iterative_scan = relaxed_order",
+            "SET LOCAL hnsw.max_scan_tuples = 20000"
+          ],
+          "meets_thresholds": false,
+          "blocking": [
+            "the mode does not guarantee distance order, which fusion consumes"
+          ]
+        },
+        {
+          "strategy": "hnsw_strict_order_ef100_max100000",
+          "recall_at_10": 1.0,
+          "fill_rate": 1.0,
+          "p50_ms": 6.372,
+          "p95_ms": 7.42,
+          "tuples_scanned": 1624,
+          "out_of_order_queries": 0,
+          "max_order_violation": 0.0,
+          "plan": {
+            "shape": "Limit → Nested Loop → Index Scan using ann_bench_chunks_embedding → Materialize → Seq Scan",
+            "uses_vector_index": true,
+            "actual_rows": 10,
+            "rows_removed_by_filter": 3,
+            "shared_blocks_hit": 5368,
+            "shared_blocks_read": 6145
+          },
+          "settings": [
+            "SET LOCAL hnsw.ef_search = 100",
+            "SET LOCAL hnsw.iterative_scan = strict_order",
+            "SET LOCAL hnsw.max_scan_tuples = 100000"
+          ],
+          "meets_thresholds": true,
+          "blocking": []
+        },
+        {
+          "strategy": "hnsw_relaxed_order_ef100_max100000",
+          "recall_at_10": 1.0,
+          "fill_rate": 1.0,
+          "p50_ms": 6.236,
+          "p95_ms": 7.084,
+          "tuples_scanned": 1634,
+          "out_of_order_queries": 0,
+          "max_order_violation": 0.0,
+          "plan": {
+            "shape": "Limit → Nested Loop → Index Scan using ann_bench_chunks_embedding → Materialize → Seq Scan",
+            "uses_vector_index": true,
+            "actual_rows": 10,
+            "rows_removed_by_filter": 3,
+            "shared_blocks_hit": 5383,
+            "shared_blocks_read": 6145
+          },
+          "settings": [
+            "SET LOCAL hnsw.ef_search = 100",
+            "SET LOCAL hnsw.iterative_scan = relaxed_order",
+            "SET LOCAL hnsw.max_scan_tuples = 100000"
+          ],
+          "meets_thresholds": false,
+          "blocking": [
+            "the mode does not guarantee distance order, which fusion consumes"
+          ]
+        }
+      ]
+    },
+    {
+      "label": "10%",
+      "measured_selectivity": 0.1,
+      "matching_rows": 10000,
+      "measurements": [
+        {
+          "strategy": "exact",
+          "recall_at_10": 1.0,
+          "fill_rate": 1.0,
+          "p50_ms": 31.796,
+          "p95_ms": 35.08,
+          "tuples_scanned": 30024,
+          "out_of_order_queries": 0,
+          "max_order_violation": 0.0,
+          "plan": {
+            "shape": "Limit → Sort → Nested Loop → Seq Scan → Bitmap Heap Scan → Bitmap Index Scan using ann_bench_chunks_source",
+            "uses_vector_index": false,
+            "actual_rows": 10,
+            "rows_removed_by_filter": 3,
+            "shared_blocks_hit": 260552,
+            "shared_blocks_read": 0
+          },
+          "settings": [],
+          "meets_thresholds": true,
+          "blocking": []
+        },
+        {
+          "strategy": "hnsw_ef100",
+          "recall_at_10": 0.877,
+          "fill_rate": 0.88,
+          "p50_ms": 2.429,
+          "p95_ms": 2.778,
+          "tuples_scanned": 194,
+          "out_of_order_queries": 0,
+          "max_order_violation": 0.0,
+          "plan": {
+            "shape": "Limit → Nested Loop → Index Scan using ann_bench_chunks_embedding → Materialize → Seq Scan",
+            "uses_vector_index": true,
+            "actual_rows": 10,
+            "rows_removed_by_filter": 3,
+            "shared_blocks_hit": 737,
+            "shared_blocks_read": 3200
+          },
+          "settings": [
+            "SET LOCAL hnsw.ef_search = 100"
+          ],
+          "meets_thresholds": false,
+          "blocking": [
+            "recall_at_10 0.877 < 0.95",
+            "fill_rate 0.880 < 0.99"
+          ]
+        },
+        {
+          "strategy": "hnsw_strict_order_ef100_max20000",
+          "recall_at_10": 0.983,
+          "fill_rate": 1.0,
+          "p50_ms": 2.474,
+          "p95_ms": 3.474,
+          "tuples_scanned": 194,
+          "out_of_order_queries": 0,
+          "max_order_violation": 0.0,
+          "plan": {
+            "shape": "Limit → Nested Loop → Index Scan using ann_bench_chunks_embedding → Materialize → Seq Scan",
+            "uses_vector_index": true,
+            "actual_rows": 10,
+            "rows_removed_by_filter": 3,
+            "shared_blocks_hit": 751,
+            "shared_blocks_read": 3186
+          },
+          "settings": [
+            "SET LOCAL hnsw.ef_search = 100",
+            "SET LOCAL hnsw.iterative_scan = strict_order",
+            "SET LOCAL hnsw.max_scan_tuples = 20000"
+          ],
+          "meets_thresholds": true,
+          "blocking": []
+        },
+        {
+          "strategy": "hnsw_relaxed_order_ef100_max20000",
+          "recall_at_10": 0.993,
+          "fill_rate": 1.0,
+          "p50_ms": 2.739,
+          "p95_ms": 3.462,
+          "tuples_scanned": 194,
+          "out_of_order_queries": 2,
+          "max_order_violation": 0.000054058718220617585,
+          "plan": {
+            "shape": "Limit → Nested Loop → Index Scan using ann_bench_chunks_embedding → Materialize → Seq Scan",
+            "uses_vector_index": true,
+            "actual_rows": 10,
+            "rows_removed_by_filter": 3,
+            "shared_blocks_hit": 739,
+            "shared_blocks_read": 3198
+          },
+          "settings": [
+            "SET LOCAL hnsw.ef_search = 100",
+            "SET LOCAL hnsw.iterative_scan = relaxed_order",
+            "SET LOCAL hnsw.max_scan_tuples = 20000"
+          ],
+          "meets_thresholds": false,
+          "blocking": [
+            "2/30 queries returned rows out of distance order (largest backward step 5.41e-5 > 1e-6)",
+            "the mode does not guarantee distance order, which fusion consumes"
+          ]
+        },
+        {
+          "strategy": "hnsw_strict_order_ef100_max100000",
+          "recall_at_10": 0.983,
+          "fill_rate": 1.0,
+          "p50_ms": 2.605,
+          "p95_ms": 3.35,
+          "tuples_scanned": 194,
+          "out_of_order_queries": 0,
+          "max_order_violation": 0.0,
+          "plan": {
+            "shape": "Limit → Nested Loop → Index Scan using ann_bench_chunks_embedding → Materialize → Seq Scan",
+            "uses_vector_index": true,
+            "actual_rows": 10,
+            "rows_removed_by_filter": 3,
+            "shared_blocks_hit": 742,
+            "shared_blocks_read": 3195
+          },
+          "settings": [
+            "SET LOCAL hnsw.ef_search = 100",
+            "SET LOCAL hnsw.iterative_scan = strict_order",
+            "SET LOCAL hnsw.max_scan_tuples = 100000"
+          ],
+          "meets_thresholds": true,
+          "blocking": []
+        },
+        {
+          "strategy": "hnsw_relaxed_order_ef100_max100000",
+          "recall_at_10": 0.993,
+          "fill_rate": 1.0,
+          "p50_ms": 2.572,
+          "p95_ms": 3.595,
+          "tuples_scanned": 194,
+          "out_of_order_queries": 2,
+          "max_order_violation": 0.000054058718220617585,
+          "plan": {
+            "shape": "Limit → Nested Loop → Index Scan using ann_bench_chunks_embedding → Materialize → Seq Scan",
+            "uses_vector_index": true,
+            "actual_rows": 10,
+            "rows_removed_by_filter": 3,
+            "shared_blocks_hit": 739,
+            "shared_blocks_read": 3198
+          },
+          "settings": [
+            "SET LOCAL hnsw.ef_search = 100",
+            "SET LOCAL hnsw.iterative_scan = relaxed_order",
+            "SET LOCAL hnsw.max_scan_tuples = 100000"
+          ],
+          "meets_thresholds": false,
+          "blocking": [
+            "2/30 queries returned rows out of distance order (largest backward step 5.41e-5 > 1e-6)",
+            "the mode does not guarantee distance order, which fusion consumes"
+          ]
+        }
+      ]
+    }
+  ],
+  "recommendation": {
+    "strategy": "hnsw_strict_order_ef100_max20000",
+    "settings": [
+      "SET LOCAL hnsw.ef_search = 100",
+      "SET LOCAL hnsw.iterative_scan = strict_order",
+      "SET LOCAL hnsw.max_scan_tuples = 20000"
+    ],
+    "rationale": "hnsw_strict_order_ef100_max20000 is the cheapest strategy, ordered by ScanStrategy::cost_rank, that met Recall@10 >= 0.95, fill >= 0.99, P95 <= 300 ms and exact distance order at every measured selectivity.",
+    "blocking": [
+      "hnsw_relaxed_order_ef100_max20000 @ 100%: the mode does not guarantee distance order, which fusion consumes",
+      "hnsw_relaxed_order_ef100_max100000 @ 100%: the mode does not guarantee distance order, which fusion consumes",
+      "hnsw_ef100 @ 0.1%: recall_at_10 0.010 < 0.95; fill_rate 0.010 < 0.99",
+      "hnsw_relaxed_order_ef100_max20000 @ 0.1%: the mode does not guarantee distance order, which fusion consumes",
+      "hnsw_relaxed_order_ef100_max100000 @ 0.1%: the mode does not guarantee distance order, which fusion consumes",
+      "hnsw_ef100 @ 1%: recall_at_10 0.120 < 0.95; fill_rate 0.120 < 0.99",
+      "hnsw_relaxed_order_ef100_max20000 @ 1%: the mode does not guarantee distance order, which fusion consumes",
+      "hnsw_relaxed_order_ef100_max100000 @ 1%: the mode does not guarantee distance order, which fusion consumes",
+      "hnsw_ef100 @ 10%: recall_at_10 0.877 < 0.95; fill_rate 0.880 < 0.99",
+      "hnsw_relaxed_order_ef100_max20000 @ 10%: 2/30 queries returned rows out of distance order (largest backward step 5.41e-5 > 1e-6); the mode does not guarantee distance order, which fusion consumes",
+      "hnsw_relaxed_order_ef100_max100000 @ 10%: 2/30 queries returned rows out of distance order (largest backward step 5.41e-5 > 1e-6); the mode does not guarantee distance order, which fusion consumes"
+    ]
+  }
+}

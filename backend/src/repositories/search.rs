@@ -17,13 +17,23 @@
 //! there is no way to add a filter to one of these queries and forget the
 //! generation, because the generation is part of how `sources` is reached.
 
+use std::sync::LazyLock;
+
 use async_trait::async_trait;
 use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, Statement, TransactionTrait};
 use uuid::Uuid;
 
 use crate::services::rag::utils::{format_embedding, sanitize_tsquery};
 
+use super::ann::APPROVED_STRATEGY;
 use super::traits::{ChunkSearchResult, RepoResult, SearchRepository};
+
+/// The approved strategy's `SET LOCAL` statements, rendered once.
+///
+/// The strategy is a constant, so the statements are too. Formatting them per
+/// query allocated three strings on the hottest path in the system to produce
+/// the same text every time.
+static SCAN_PREAMBLE: LazyLock<String> = LazyLock::new(|| APPROVED_STRATEGY.session_preamble());
 
 // ============================================================================
 // SQL constants
@@ -41,9 +51,9 @@ const SEARCH_SIMILAR_SQL: &str = r"
     LIMIT $3
 ";
 
-/// Tune HNSW ef_search for 1024-dim embeddings (default 40 is too low
-/// for high-dimensional spaces; 100 balances recall vs latency).
-const SET_HNSW_EF_SEARCH: &str = "SET LOCAL hnsw.ef_search = 100";
+// The scan strategy and its parameters live in [`super::ann`], where the
+// benchmark that selected them and the capability probe that guards them also
+// live (US-016).
 
 const SEARCH_LEXICAL_SQL: &str = r"
     SELECT c.id, c.generation_id, c.source_id, c.chunk_index, c.content, c.parent_content,
@@ -105,15 +115,16 @@ impl SearchRepository for SeaOrmSearchRepository {
     ) -> RepoResult<Vec<ChunkSearchResult>> {
         let embedding_str = format_embedding(query_embedding);
 
-        // Use a transaction to scope SET LOCAL (resets automatically on commit/rollback).
+        // Use a transaction to scope SET LOCAL: the settings revert on commit
+        // or rollback, so a scan mode chosen for this query cannot leak into
+        // the next borrower of this pooled connection (US-016). All of them go
+        // out in one statement, so the scoping costs one round trip and not
+        // one per setting.
         let txn = self.db.begin().await?;
 
-        // Tune HNSW ef_search for 1024-dim embeddings before the search query.
-        txn.execute(Statement::from_string(
-            DbBackend::Postgres,
-            SET_HNSW_EF_SEARCH,
-        ))
-        .await?;
+        if !SCAN_PREAMBLE.is_empty() {
+            txn.execute_unprepared(&SCAN_PREAMBLE).await?;
+        }
 
         let rows = txn
             .query_all(Statement::from_sql_and_values(

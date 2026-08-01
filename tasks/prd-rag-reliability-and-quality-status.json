@@ -25,10 +25,10 @@
     {
       "id": "EP-003",
       "title": "Coherent and Bounded Retrieval",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "stories_total": 6,
-      "stories_done": 0
+      "stories_done": 6
     },
     {
       "id": "EP-004",
@@ -193,85 +193,85 @@
       "id": "US-012",
       "title": "Separate ranking scores from retrieval confidence",
       "epic": "EP-003",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "size": "M",
       "blocked_by": [
         "US-002"
       ],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-08-01",
+      "completed_at": "2026-08-01",
+      "reviewed_at": "2026-08-01"
     },
     {
       "id": "US-013",
       "title": "Enforce one final context cardinality contract",
       "epic": "EP-003",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "size": "S",
       "blocked_by": [
         "US-002"
       ],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-08-01",
+      "completed_at": "2026-08-01",
+      "reviewed_at": "2026-08-01"
     },
     {
       "id": "US-014",
       "title": "Reorder diversification, reranking, preferences, and selection",
       "epic": "EP-003",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P1",
       "size": "M",
       "blocked_by": [
         "US-013"
       ],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-08-01",
+      "completed_at": "2026-08-01",
+      "reviewed_at": "2026-08-01"
     },
     {
       "id": "US-015",
       "title": "Validate filtered HNSW against exact search",
       "epic": "EP-003",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "size": "L",
       "blocked_by": [
         "US-002"
       ],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-08-01",
+      "completed_at": "2026-08-01",
+      "reviewed_at": "2026-08-01"
     },
     {
       "id": "US-016",
       "title": "Implement the approved filtered ANN strategy",
       "epic": "EP-003",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P1",
       "size": "M",
       "blocked_by": [
         "US-015"
       ],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-08-01",
+      "completed_at": "2026-08-01",
+      "reviewed_at": "2026-08-01"
     },
     {
       "id": "US-017",
       "title": "Bound reformulation and isolate query embeddings",
       "epic": "EP-003",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P1",
       "size": "M",
       "blocked_by": [
         "US-012"
       ],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-08-01",
+      "completed_at": "2026-08-01",
+      "reviewed_at": "2026-08-01"
     },
     {
       "id": "US-018",

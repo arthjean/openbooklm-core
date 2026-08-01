@@ -3,6 +3,7 @@
 //! Delegates all data access to repository traits.
 //! Orchestration logic (validation, RAG, memory) lives in [`orchestration`].
 
+pub mod context_budget;
 pub mod orchestration;
 
 use serde::{Deserialize, Serialize};

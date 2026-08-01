@@ -28,7 +28,7 @@ use openbooklm::core::config::DatabasePoolConfig;
 use openbooklm::core::providers::{EMBEDDING_DIM, EmbeddingProvider};
 use openbooklm::error::AppError;
 use openbooklm::repositories::{
-    APPROVED_STRATEGY, ChunkRepository, GenerationRepository, SeaOrmChunkRepository,
+    APPROVED_STRATEGY, ChunkRepository, GenerationRepository, NotebookScope, SeaOrmChunkRepository,
     SeaOrmGenerationRepository, SeaOrmSearchRepository, SearchRepository, VectorCapabilities,
 };
 use openbooklm::services::rag::provenance::{
@@ -103,6 +103,11 @@ impl Fixture {
             account_id,
             notebook_id,
         })
+    }
+
+    /// The owner scope every search in this fixture runs under (US-020).
+    fn scope(&self) -> NotebookScope {
+        NotebookScope::new(self.account_id, self.notebook_id)
     }
 
     async fn create_source(&self, title: &str) -> Uuid {
@@ -203,7 +208,7 @@ impl Fixture {
     /// Every chunk the notebook's active generations expose, via lexical search.
     async fn active_contents(&self, query: &str) -> Vec<String> {
         self.search
-            .search_lexical_chunks(self.notebook_id, query, 500)
+            .search_lexical_chunks(self.scope(), query, 500)
             .await
             .expect("lexical search")
             .into_iter()
@@ -1260,14 +1265,12 @@ async fn a_thousand_publication_schedules_produce_no_mixed_read() {
         // during and after the commit rather than all at the same point.
         let offset = Duration::from_micros((schedule % 16) as u64 * offset_step);
         let search = f.search.clone();
-        let notebook_id = f.notebook_id;
+        let scope = f.scope();
         let reader = tokio::spawn(async move {
             if !offset.is_zero() {
                 tokio::time::sleep(offset).await;
             }
-            search
-                .search_lexical_chunks(notebook_id, "generation", 100)
-                .await
+            search.search_lexical_chunks(scope, "generation", 100).await
         });
 
         let _published = publisher.await.expect("publisher join").expect("publish");
@@ -1507,7 +1510,7 @@ async fn every_read_path_is_scoped_to_the_active_generation() {
 
     assert_eq!(
         f.search
-            .count_chunks_for_notebook(f.notebook_id)
+            .count_chunks_for_notebook(f.scope())
             .await
             .expect("count"),
         3,
@@ -1515,7 +1518,7 @@ async fn every_read_path_is_scoped_to_the_active_generation() {
     );
     assert_eq!(
         f.search
-            .get_all_chunks_for_notebook(f.notebook_id)
+            .get_all_chunks_for_notebook(f.scope())
             .await
             .expect("stuffing load")
             .len(),
@@ -1541,13 +1544,76 @@ async fn every_read_path_is_scoped_to_the_active_generation() {
 
     let dense = f
         .search
-        .search_similar_chunks(f.notebook_id, &vec![0.001_f32; EMBEDDING_DIM], 50)
+        .search_similar_chunks(f.scope(), &vec![0.001_f32; EMBEDDING_DIM], 50)
         .await
         .expect("dense search");
     assert_eq!(
         dense.len(),
         3,
         "dense search must not see the building generation"
+    );
+
+    f.cleanup().await;
+}
+
+/// Every read path is scoped to the owner as well as to the notebook (US-020).
+///
+/// The handler checks access before retrieval, but an embedding call, a
+/// reformulation call and a reranker call sit between that check and this SQL.
+/// A notebook whose ownership changed in that window has to stop returning
+/// content, and the only layer that can be true of is the query itself
+/// (PRD edge case 8).
+#[tokio::test]
+#[ignore = "Requires PostgreSQL with pgvector (TEST_DATABASE_URL)"]
+async fn no_read_path_returns_a_notebook_to_another_account() {
+    let f = fixture_or_skip!();
+    let prov = provenance("model-a");
+    let source_id = f.create_source("owner scope").await;
+    f.publish_generation(source_id, "owned", 4, &prov).await;
+
+    let stranger = NotebookScope::new(Uuid::new_v4(), f.notebook_id);
+    let embedding = vec![0.001_f32; EMBEDDING_DIM];
+
+    // The owner sees the source, so the assertions below are not vacuous.
+    assert_eq!(
+        f.search
+            .count_chunks_for_notebook(f.scope())
+            .await
+            .expect("count"),
+        4
+    );
+
+    assert_eq!(
+        f.search
+            .count_chunks_for_notebook(stranger)
+            .await
+            .expect("count"),
+        0,
+        "counting another account's notebook must return nothing"
+    );
+    assert!(
+        f.search
+            .get_all_chunks_for_notebook(stranger)
+            .await
+            .expect("stuffing load")
+            .is_empty(),
+        "context stuffing must not load another account's notebook"
+    );
+    assert!(
+        f.search
+            .search_similar_chunks(stranger, &embedding, 50)
+            .await
+            .expect("dense search")
+            .is_empty(),
+        "dense search must not read another account's notebook"
+    );
+    assert!(
+        f.search
+            .search_lexical_chunks(stranger, "owned", 50)
+            .await
+            .expect("lexical search")
+            .is_empty(),
+        "lexical search must not read another account's notebook"
     );
 
     f.cleanup().await;
@@ -2325,7 +2391,7 @@ async fn per_query_scan_settings_do_not_leak_into_pooled_connections() {
     // Retrievals that apply every setting the approved strategy needs, run
     // concurrently so several pooled connections carry one.
     let query = vec![0.1_f32; EMBEDDING_DIM];
-    let searches = (0..8).map(|_| f.search.search_similar_chunks(f.notebook_id, &query, 10));
+    let searches = (0..8).map(|_| f.search.search_similar_chunks(f.scope(), &query, 10));
     for result in futures::future::join_all(searches).await {
         result.expect("dense search");
     }
@@ -2419,7 +2485,7 @@ async fn filtered_dense_search_matches_exact_search_on_a_reduced_corpus() {
     for query in &queries {
         let approximate = f
             .search
-            .search_similar_chunks(f.notebook_id, query, 10)
+            .search_similar_chunks(f.scope(), query, 10)
             .await
             .expect("dense search");
         let exact = exact_top_ids(&f.db, f.notebook_id, query, 10).await;

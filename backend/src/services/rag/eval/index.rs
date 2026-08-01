@@ -31,7 +31,7 @@ use uuid::Uuid;
 
 use crate::core::providers::{DeterministicEmbedder, EmbeddingProvider};
 use crate::error::AppError;
-use crate::repositories::{ChunkSearchResult, RepoResult, SearchRepository};
+use crate::repositories::{ChunkSearchResult, NotebookScope, RepoResult, SearchRepository};
 use crate::services::rag::utils::sanitize_tsquery;
 
 use super::corpus::EvalCorpus;
@@ -214,6 +214,28 @@ impl CorpusIndex {
         self.generation_id
     }
 
+    /// The synthetic account that owns every corpus notebook.
+    ///
+    /// The corpus has no accounts of its own, but production retrieval is
+    /// account-scoped (US-020 AC-2), and an offline index that ignored the
+    /// account would exercise a query shape the server does not run. One
+    /// derived owner is enough to keep the seam real.
+    #[must_use]
+    pub fn account_id() -> Uuid {
+        super::corpus::synthetic_uuid("eval-account")
+    }
+
+    /// The scope's notebook, when the scope's account owns this corpus.
+    fn owned(&self, scope: NotebookScope) -> Option<Uuid> {
+        (scope.account_id == Self::account_id()).then_some(scope.notebook_id)
+    }
+
+    /// The scope for one corpus notebook.
+    #[must_use]
+    pub fn scope(notebook_id: Uuid) -> NotebookScope {
+        NotebookScope::new(Self::account_id(), notebook_id)
+    }
+
     /// The embedding provider this index was built with.
     #[must_use]
     pub const fn embedder(&self) -> &DeterministicEmbedder {
@@ -365,23 +387,32 @@ fn take_limit(scored: Vec<(f32, &IndexedChunk)>, limit: i32) -> Vec<ChunkSearchR
 impl SearchRepository for CorpusIndex {
     async fn search_similar_chunks(
         &self,
-        notebook_id: Uuid,
+        scope: NotebookScope,
         query_embedding: &[f32],
         limit: i32,
     ) -> RepoResult<Vec<ChunkSearchResult>> {
+        let Some(notebook_id) = self.owned(scope) else {
+            return Ok(Vec::new());
+        };
         Ok(self.rank_dense(notebook_id, query_embedding, limit))
     }
 
     async fn search_lexical_chunks(
         &self,
-        notebook_id: Uuid,
+        scope: NotebookScope,
         query: &str,
         limit: i32,
     ) -> RepoResult<Vec<ChunkSearchResult>> {
+        let Some(notebook_id) = self.owned(scope) else {
+            return Ok(Vec::new());
+        };
         Ok(self.rank_lexical(notebook_id, query, limit))
     }
 
-    async fn count_chunks_for_notebook(&self, notebook_id: Uuid) -> RepoResult<i64> {
+    async fn count_chunks_for_notebook(&self, scope: NotebookScope) -> RepoResult<i64> {
+        let Some(notebook_id) = self.owned(scope) else {
+            return Ok(0);
+        };
         Ok(i64::try_from(
             self.chunks
                 .iter()
@@ -393,8 +424,11 @@ impl SearchRepository for CorpusIndex {
 
     async fn get_all_chunks_for_notebook(
         &self,
-        notebook_id: Uuid,
+        scope: NotebookScope,
     ) -> RepoResult<Vec<ChunkSearchResult>> {
+        let Some(notebook_id) = self.owned(scope) else {
+            return Ok(Vec::new());
+        };
         let mut chunks: Vec<&IndexedChunk> = self
             .chunks
             .iter()
@@ -499,7 +533,7 @@ mod tests {
         let index = index().await;
         let notebook = index.chunks()[0].notebook_id;
         let hits = index
-            .search_lexical_chunks(notebook, "qwertyuiop", 10)
+            .search_lexical_chunks(CorpusIndex::scope(notebook), "qwertyuiop", 10)
             .await
             .expect("search");
         assert!(
@@ -513,7 +547,7 @@ mod tests {
         let index = index().await;
         let notebook = index.chunks()[0].notebook_id;
         let hits = index
-            .search_lexical_chunks(notebook, "   ", 10)
+            .search_lexical_chunks(CorpusIndex::scope(notebook), "   ", 10)
             .await
             .expect("search");
         assert!(hits.is_empty());
@@ -524,11 +558,11 @@ mod tests {
         let index = index().await;
         let notebook = index.chunks()[0].notebook_id;
         let all = index
-            .get_all_chunks_for_notebook(notebook)
+            .get_all_chunks_for_notebook(CorpusIndex::scope(notebook))
             .await
             .expect("load");
         let count = index
-            .count_chunks_for_notebook(notebook)
+            .count_chunks_for_notebook(CorpusIndex::scope(notebook))
             .await
             .expect("count");
         assert_eq!(i64::try_from(all.len()).unwrap_or(i64::MAX), count);
@@ -549,7 +583,7 @@ mod tests {
                 assert!(hit.relevance_score >= 0.0, "{query}");
             }
             for hit in index
-                .search_lexical_chunks(notebook, query, 20)
+                .search_lexical_chunks(CorpusIndex::scope(notebook), query, 20)
                 .await
                 .expect("l")
             {

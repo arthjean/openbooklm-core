@@ -452,7 +452,7 @@ async fn score_query(
         trace.reasons.insert(ReasonCode::UnderfilledTopK);
     }
     if index
-        .count_chunks_for_notebook(notebook_id)
+        .count_chunks_for_notebook(CorpusIndex::scope(notebook_id))
         .await
         .unwrap_or(0)
         == 0
@@ -681,7 +681,7 @@ async fn retrieve_with(
             let found = search(
                 index,
                 &config.fusion,
-                notebook_id,
+                CorpusIndex::scope(notebook_id),
                 &request,
                 &query_embedder,
             )

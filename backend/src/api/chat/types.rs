@@ -152,17 +152,6 @@ pub struct TeachingModesResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::LlmMessage;
-    use crate::llm::budget::{allocate_token_budget, fit_prompt_to_budget};
-
-    #[test]
-    fn fit_prompt_from_types_module() {
-        let messages = vec![LlmMessage::user("Hello"), LlmMessage::assistant("Hi there")];
-        let budget = allocate_token_budget("anthropic", "claude-sonnet-4-6-20260220");
-        let result = fit_prompt_to_budget("system prompt", "rag context", None, &messages, &budget);
-        assert!(!result.was_truncated);
-        assert_eq!(result.messages.len(), 2);
-    }
 
     // ====================================================================
     // US-013: max_context_chunks is validated, not clamped

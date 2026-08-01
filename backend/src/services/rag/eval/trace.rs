@@ -94,6 +94,25 @@ pub enum ReasonCode {
     ProviderError,
     /// Writing the interaction telemetry failed. Retrieval itself succeeded.
     TelemetryWriteFailed,
+    /// The model's context window is not declared by this build, so no request
+    /// could be budgeted and none was sent (US-018).
+    ContextWindowUnknown,
+    /// The whole notebook fit the requested chunk limit but not the token
+    /// budget, so it was searched instead of stuffed (US-018).
+    StuffingOverBudget,
+    /// Lowest-ranked contexts were removed to fit the token budget (US-018).
+    EvidenceDroppedForBudget,
+    /// A parent passage did not fit, so its matched child was sent in its place
+    /// (US-018).
+    ParentDowngradedToChild,
+    /// The memory block did not fit and was dropped whole (US-018).
+    MemoryDroppedForBudget,
+    /// The instructions and the question alone exceeded the window, or the
+    /// assembled request did, so nothing was sent (US-018).
+    PromptOverBudget,
+    /// A citation marker did not resolve to a verified span and was not emitted
+    /// (US-019).
+    CitationRejected,
 }
 
 impl ReasonCode {
@@ -119,6 +138,13 @@ impl ReasonCode {
             Self::IsolationBreach => "isolation_breach",
             Self::ProviderError => "provider_error",
             Self::TelemetryWriteFailed => "telemetry_write_failed",
+            Self::ContextWindowUnknown => "context_window_unknown",
+            Self::StuffingOverBudget => "stuffing_over_budget",
+            Self::EvidenceDroppedForBudget => "evidence_dropped_for_budget",
+            Self::ParentDowngradedToChild => "parent_downgraded_to_child",
+            Self::MemoryDroppedForBudget => "memory_dropped_for_budget",
+            Self::PromptOverBudget => "prompt_over_budget",
+            Self::CitationRejected => "citation_rejected",
         }
     }
 }

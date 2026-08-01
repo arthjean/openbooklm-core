@@ -16,17 +16,26 @@
 //! It is written as a join predicate rather than a `WHERE` clause on purpose:
 //! there is no way to add a filter to one of these queries and forget the
 //! generation, because the generation is part of how `sources` is reached.
+//!
+//! ## Owner scope (US-020)
+//!
+//! Every query also joins `notebooks` on `user_id`. The handler already checked
+//! access, but that check and this query are separated by an embedding call, a
+//! possible reformulation call and a reranker call; a notebook whose ownership
+//! changed in that window must stop returning content, and the only place that
+//! can be true of is the query itself (PRD edge case 8). The scope arrives as a
+//! [`NotebookScope`](super::traits::NotebookScope), which cannot be built
+//! without an account.
 
 use std::sync::LazyLock;
 
 use async_trait::async_trait;
 use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, Statement, TransactionTrait};
-use uuid::Uuid;
 
 use crate::services::rag::utils::{format_embedding, sanitize_tsquery};
 
 use super::ann::APPROVED_STRATEGY;
-use super::traits::{ChunkSearchResult, RepoResult, SearchRepository};
+use super::traits::{ChunkSearchResult, NotebookScope, RepoResult, SearchRepository};
 
 /// The approved strategy's `SET LOCAL` statements, rendered once.
 ///
@@ -46,9 +55,10 @@ const SEARCH_SIMILAR_SQL: &str = r"
            (c.embedding <=> $1::vector) as distance
     FROM chunks c
     JOIN sources s ON c.source_id = s.id AND s.active_generation_id = c.generation_id
+    JOIN notebooks n ON n.id = s.notebook_id AND n.user_id = $3
     WHERE s.notebook_id = $2
     ORDER BY c.embedding <=> $1::vector
-    LIMIT $3
+    LIMIT $4
 ";
 
 // The scan strategy and its parameters live in [`super::ann`], where the
@@ -62,16 +72,18 @@ const SEARCH_LEXICAL_SQL: &str = r"
            ts_rank_cd(c.content_tsv, plainto_tsquery('simple', $1)) as rank
     FROM chunks c
     JOIN sources s ON c.source_id = s.id AND s.active_generation_id = c.generation_id
+    JOIN notebooks n ON n.id = s.notebook_id AND n.user_id = $3
     WHERE s.notebook_id = $2
       AND c.content_tsv @@ plainto_tsquery('simple', $1)
     ORDER BY rank DESC
-    LIMIT $3
+    LIMIT $4
 ";
 
 const COUNT_CHUNKS_FOR_NOTEBOOK_SQL: &str = r"
     SELECT COUNT(*) as total
     FROM chunks c
     JOIN sources s ON c.source_id = s.id AND s.active_generation_id = c.generation_id
+    JOIN notebooks n ON n.id = s.notebook_id AND n.user_id = $2
     WHERE s.notebook_id = $1
 ";
 
@@ -80,6 +92,7 @@ const GET_ALL_CHUNKS_FOR_NOTEBOOK_SQL: &str = r"
            s.title as source_title
     FROM chunks c
     JOIN sources s ON c.source_id = s.id AND s.active_generation_id = c.generation_id
+    JOIN notebooks n ON n.id = s.notebook_id AND n.user_id = $2
     WHERE s.notebook_id = $1
     ORDER BY s.id, c.chunk_index
 ";
@@ -106,10 +119,10 @@ impl SeaOrmSearchRepository {
 
 #[async_trait]
 impl SearchRepository for SeaOrmSearchRepository {
-    #[tracing::instrument(skip(self, query_embedding), fields(%notebook_id, %limit))]
+    #[tracing::instrument(skip(self, query_embedding), fields(notebook_id = %scope.notebook_id, %limit))]
     async fn search_similar_chunks(
         &self,
-        notebook_id: Uuid,
+        scope: NotebookScope,
         query_embedding: &[f32],
         limit: i32,
     ) -> RepoResult<Vec<ChunkSearchResult>> {
@@ -130,7 +143,12 @@ impl SearchRepository for SeaOrmSearchRepository {
             .query_all(Statement::from_sql_and_values(
                 DbBackend::Postgres,
                 SEARCH_SIMILAR_SQL,
-                [embedding_str.into(), notebook_id.into(), limit.into()],
+                [
+                    embedding_str.into(),
+                    scope.notebook_id.into(),
+                    scope.account_id.into(),
+                    limit.into(),
+                ],
             ))
             .await?;
 
@@ -155,10 +173,10 @@ impl SearchRepository for SeaOrmSearchRepository {
             .collect()
     }
 
-    #[tracing::instrument(skip(self), fields(%notebook_id, %limit))]
+    #[tracing::instrument(skip(self), fields(notebook_id = %scope.notebook_id, %limit))]
     async fn search_lexical_chunks(
         &self,
-        notebook_id: Uuid,
+        scope: NotebookScope,
         query: &str,
         limit: i32,
     ) -> RepoResult<Vec<ChunkSearchResult>> {
@@ -171,7 +189,12 @@ impl SearchRepository for SeaOrmSearchRepository {
             .db
             .query_all(self.stmt(
                 SEARCH_LEXICAL_SQL,
-                [sanitized.into(), notebook_id.into(), limit.into()],
+                [
+                    sanitized.into(),
+                    scope.notebook_id.into(),
+                    scope.account_id.into(),
+                    limit.into(),
+                ],
             ))
             .await?;
 
@@ -193,11 +216,14 @@ impl SearchRepository for SeaOrmSearchRepository {
             .collect()
     }
 
-    #[tracing::instrument(skip(self), fields(%notebook_id))]
-    async fn count_chunks_for_notebook(&self, notebook_id: Uuid) -> RepoResult<i64> {
+    #[tracing::instrument(skip(self), fields(notebook_id = %scope.notebook_id))]
+    async fn count_chunks_for_notebook(&self, scope: NotebookScope) -> RepoResult<i64> {
         let rows = self
             .db
-            .query_all(self.stmt(COUNT_CHUNKS_FOR_NOTEBOOK_SQL, [notebook_id.into()]))
+            .query_all(self.stmt(
+                COUNT_CHUNKS_FOR_NOTEBOOK_SQL,
+                [scope.notebook_id.into(), scope.account_id.into()],
+            ))
             .await?;
 
         let total: i64 = rows
@@ -208,14 +234,17 @@ impl SearchRepository for SeaOrmSearchRepository {
         Ok(total)
     }
 
-    #[tracing::instrument(skip(self), fields(%notebook_id))]
+    #[tracing::instrument(skip(self), fields(notebook_id = %scope.notebook_id))]
     async fn get_all_chunks_for_notebook(
         &self,
-        notebook_id: Uuid,
+        scope: NotebookScope,
     ) -> RepoResult<Vec<ChunkSearchResult>> {
         let rows = self
             .db
-            .query_all(self.stmt(GET_ALL_CHUNKS_FOR_NOTEBOOK_SQL, [notebook_id.into()]))
+            .query_all(self.stmt(
+                GET_ALL_CHUNKS_FOR_NOTEBOOK_SQL,
+                [scope.notebook_id.into(), scope.account_id.into()],
+            ))
             .await?;
 
         rows.into_iter()

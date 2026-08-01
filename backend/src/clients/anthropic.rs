@@ -413,6 +413,11 @@ impl LlmProvider for AnthropicClient {
         true
     }
 
+    /// The `max_tokens` every request below sends.
+    fn max_output_tokens(&self) -> usize {
+        usize::try_from(MAX_TOKENS).unwrap_or(4096)
+    }
+
     fn supported_models(&self) -> Vec<String> {
         [
             "claude-opus-4-6-20260220",

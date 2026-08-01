@@ -24,12 +24,10 @@ mod stuffing;
 mod transforms;
 pub mod types;
 
-use uuid::Uuid;
-
 use crate::core::config::HybridSearchConfig;
 use crate::core::providers::EmbeddingProvider;
 use crate::error::AppError;
-use crate::repositories::SearchRepository;
+use crate::repositories::{NotebookScope, SearchRepository};
 use crate::services::embeddings;
 use crate::services::rag::embedding_cache::EmbeddingCache;
 use crate::services::rag::eval::trace::query_hash;
@@ -58,7 +56,10 @@ pub use context::{
     CORRECTIVE_RAG_MAX_RETRIES, CorrectiveRetrievalParams, InsufficiencyReason, PipelineOutcome,
     RetrievalConfidence, RetrievalParams, retrieve_context, retrieve_context_corrective,
 };
-pub use formatting::{build_rag_documents, format_context_for_llm};
+pub use formatting::{
+    REGION_CLOSE, REGION_OPEN, RenderedEvidence, build_rag_documents, entry_tokens, evidence_body,
+    format_context_for_llm, region_overhead_tokens, render_evidence,
+};
 pub use fusion::reciprocal_rank_fusion;
 pub use preference::{PreferenceBoost, extract_preference_keywords};
 pub use stuffing::max_context_stuffing_chunks;
@@ -140,24 +141,20 @@ fn lookup_kinds(
 /// reformulation of one, or a working-memory lookup. It is not a search
 /// parameter — it selects the embedding cache namespace, so a reformulation
 /// cannot be served the original question's vector (US-011).
-#[tracing::instrument(skip(search_repo, config, request, embedder), fields(%notebook_id, kind = embedder.kind.as_str()))]
+#[tracing::instrument(skip(search_repo, config, request, embedder), fields(notebook_id = %scope.notebook_id, kind = embedder.kind.as_str()))]
 pub async fn search(
     search_repo: &dyn SearchRepository,
     config: &HybridSearchConfig,
-    notebook_id: Uuid,
+    scope: NotebookScope,
     request: &SearchRequest,
     embedder: &QueryEmbedder<'_>,
 ) -> Result<SearchOutcome, AppError> {
     let mode = effective_mode(config, request.mode);
 
     match mode {
-        SearchMode::Hybrid => {
-            hybrid_search(search_repo, config, notebook_id, request, embedder).await
-        }
-        SearchMode::Dense => {
-            semantic_search_with_hyde(search_repo, notebook_id, request, embedder).await
-        }
-        SearchMode::Lexical => lexical_search(search_repo, notebook_id, request).await,
+        SearchMode::Hybrid => hybrid_search(search_repo, config, scope, request, embedder).await,
+        SearchMode::Dense => semantic_search_with_hyde(search_repo, scope, request, embedder).await,
+        SearchMode::Lexical => lexical_search(search_repo, scope, request).await,
     }
 }
 
@@ -166,15 +163,15 @@ pub async fn search(
 /// When a [`HydeService`] is provided and the query is short (< 20 words),
 /// HyDE generates a hypothetical document and uses its embedding for search,
 /// which bridges the query-document embedding gap.
-#[tracing::instrument(skip(search_repo, request, embedder), fields(%notebook_id))]
+#[tracing::instrument(skip(search_repo, request, embedder), fields(notebook_id = %scope.notebook_id))]
 pub async fn semantic_search(
     search_repo: &dyn SearchRepository,
-    notebook_id: Uuid,
+    scope: NotebookScope,
     request: &SearchRequest,
     embedder: &QueryEmbedder<'_>,
 ) -> Result<Vec<SearchResult>, AppError> {
     Ok(
-        semantic_search_with_hyde(search_repo, notebook_id, request, embedder)
+        semantic_search_with_hyde(search_repo, scope, request, embedder)
             .await?
             .results,
     )
@@ -183,10 +180,10 @@ pub async fn semantic_search(
 /// Semantic search with optional HyDE enhancement.
 ///
 /// Scores are cosine similarities: [`ScoreDomain::DenseSimilarity`].
-#[tracing::instrument(skip(search_repo, request, embedder), fields(%notebook_id))]
+#[tracing::instrument(skip(search_repo, request, embedder), fields(notebook_id = %scope.notebook_id))]
 pub async fn semantic_search_with_hyde(
     search_repo: &dyn SearchRepository,
-    notebook_id: Uuid,
+    scope: NotebookScope,
     request: &SearchRequest,
     embedder: &QueryEmbedder<'_>,
 ) -> Result<SearchOutcome, AppError> {
@@ -233,7 +230,7 @@ pub async fn semantic_search_with_hyde(
         let (embedding, stored_kind) = if let Some(hyde_svc) = hyde {
             if let Some(hyde_result) = hyde_svc.generate(query).await {
                 tracing::debug!(
-                    %notebook_id,
+                    notebook_id = %scope.notebook_id,
                     query_hash = %query_hash(query),
                     hyde_doc_len = hyde_result.document.len(),
                     "Using HyDE-generated document for embedding"
@@ -265,28 +262,28 @@ pub async fn semantic_search_with_hyde(
     } else {
         embed_start.elapsed().as_millis()
     };
-    tracing::info!(embed_ms, cache_hit, %notebook_id, "Embedding completed");
+    tracing::info!(embed_ms, cache_hit, notebook_id = %scope.notebook_id, "Embedding completed");
 
     // --- Search stage ---
     let search_start = std::time::Instant::now();
     let chunks = search_repo
-        .search_similar_chunks(notebook_id, &query_embedding, request.clamped_limit())
+        .search_similar_chunks(scope, &query_embedding, request.clamped_limit())
         .await?;
     let search_ms = search_start.elapsed().as_millis();
-    tracing::info!(search_ms, %notebook_id, "Dense search completed");
+    tracing::info!(search_ms, notebook_id = %scope.notebook_id, "Dense search completed");
 
     let (results, dropped_non_finite) =
         filter_and_convert(chunks, request.min_relevance, ScoreDomain::DenseSimilarity);
     if dropped_non_finite > 0 {
         tracing::warn!(
-            %notebook_id,
+            notebook_id = %scope.notebook_id,
             dropped_non_finite,
             "Dense candidates carried non-finite scores and were rejected"
         );
     }
 
     tracing::debug!(
-        %notebook_id,
+        notebook_id = %scope.notebook_id,
         query_hash = %query_hash(query),
         count = results.len(),
         used_hyde = hyde.is_some(),
@@ -309,17 +306,17 @@ pub async fn semantic_search_with_hyde(
 /// Perform lexical (full-text) search across a notebook's sources.
 ///
 /// Scores are `ts_rank_cd` values: [`ScoreDomain::LexicalRank`].
-#[tracing::instrument(skip(search_repo, request), fields(%notebook_id))]
+#[tracing::instrument(skip(search_repo, request), fields(notebook_id = %scope.notebook_id))]
 pub async fn lexical_search(
     search_repo: &dyn SearchRepository,
-    notebook_id: Uuid,
+    scope: NotebookScope,
     request: &SearchRequest,
 ) -> Result<SearchOutcome, AppError> {
     let query = request.validated_query()?;
 
     let search_start = std::time::Instant::now();
     let chunks = search_repo
-        .search_lexical_chunks(notebook_id, query, request.clamped_limit())
+        .search_lexical_chunks(scope, query, request.clamped_limit())
         .await?;
     let search_ms = search_start.elapsed().as_millis();
 
@@ -327,7 +324,7 @@ pub async fn lexical_search(
         filter_and_convert(chunks, request.min_relevance, ScoreDomain::LexicalRank);
 
     tracing::debug!(
-        %notebook_id,
+        notebook_id = %scope.notebook_id,
         query_hash = %query_hash(query),
         count = results.len(),
         dropped_non_finite,
@@ -350,11 +347,11 @@ pub async fn lexical_search(
 /// Executes both searches in parallel, then fuses results using RRF. The fused
 /// scores are [`ScoreDomain::RrfRank`] values, which are not comparable with
 /// the dense similarities or lexical ranks they were derived from (US-012).
-#[tracing::instrument(skip(search_repo, config, request, embedder), fields(%notebook_id))]
+#[tracing::instrument(skip(search_repo, config, request, embedder), fields(notebook_id = %scope.notebook_id))]
 pub async fn hybrid_search(
     search_repo: &dyn SearchRepository,
     config: &HybridSearchConfig,
-    notebook_id: Uuid,
+    scope: NotebookScope,
     request: &SearchRequest,
     embedder: &QueryEmbedder<'_>,
 ) -> Result<SearchOutcome, AppError> {
@@ -370,8 +367,8 @@ pub async fn hybrid_search(
 
     // Execute both searches in parallel (dense returns timing info)
     let (dense_res, lexical_res) = tokio::join!(
-        semantic_search_with_hyde(search_repo, notebook_id, &dense_req, embedder),
-        lexical_search(search_repo, notebook_id, &lexical_req)
+        semantic_search_with_hyde(search_repo, scope, &dense_req, embedder),
+        lexical_search(search_repo, scope, &lexical_req)
     );
 
     let dense = dense_res?;
@@ -400,7 +397,7 @@ pub async fn hybrid_search(
         .collect();
 
     tracing::debug!(
-        %notebook_id,
+        notebook_id = %scope.notebook_id,
         query_hash = %query_hash(query),
         dense = dense.results.len(),
         lexical = lexical.results.len(),

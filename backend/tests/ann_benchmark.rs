@@ -92,8 +92,7 @@ const MAX_P95_MS: f64 = 300.0;
 const ORDER_TOLERANCE: f64 = 1e-6;
 
 /// The reference environment this recommendation is valid for.
-const REFERENCE_ENVIRONMENT: &str =
-    "pgvector/pgvector:pg16 container, HNSW m=16 ef_construction=128, \
+const REFERENCE_ENVIRONMENT: &str = "pgvector/pgvector:pg16 container, HNSW m=16 ef_construction=128, \
      1024-dimensional vectors, 100000 rows, local loopback connection";
 
 // ============================================================================
@@ -251,7 +250,11 @@ impl Bench {
         )
         .await;
         let existing = if seeded > 0 {
-            scalar_i64(&db, "SELECT count(*)::bigint AS value FROM ann_bench_chunks").await
+            scalar_i64(
+                &db,
+                "SELECT count(*)::bigint AS value FROM ann_bench_chunks",
+            )
+            .await
         } else {
             0
         };
@@ -314,7 +317,10 @@ impl Bench {
             ("nb_0_1", CORPUS_SIZE / 1000),
             ("nb_1", CORPUS_SIZE / 100),
             ("nb_10", CORPUS_SIZE / 10),
-            ("nb_rest", CORPUS_SIZE - CORPUS_SIZE / 1000 - CORPUS_SIZE / 100 - CORPUS_SIZE / 10),
+            (
+                "nb_rest",
+                CORPUS_SIZE - CORPUS_SIZE / 1000 - CORPUS_SIZE / 100 - CORPUS_SIZE / 10,
+            ),
         ];
 
         // `max_parallel_maintenance_workers = 0` is not a performance choice.
@@ -648,7 +654,11 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
     if sorted.is_empty() {
         return 0.0;
     }
-    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
     let rank = ((p / 100.0) * sorted.len() as f64).ceil().max(1.0) as usize;
     sorted[rank.min(sorted.len()) - 1]
 }

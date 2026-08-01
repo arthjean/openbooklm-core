@@ -136,8 +136,11 @@ fn fit_history<'a>(history: &'a [ChatTurn], query: &str) -> (Vec<&'a ChatTurn>, 
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss
     )]
+    // An undeclared window means the call cannot be sized, so it is sized at
+    // zero: the current query still goes (it is charged first and never
+    // dropped), and no history rides along unmeasured (US-017, US-018).
     let token_budget = (context_window_for_model(REFORMULATION_PROVIDER, REFORMULATION_MODEL)
-        as f64
+        .unwrap_or(0) as f64
         * INPUT_BUDGET_SHARE) as usize;
 
     // The current query is never dropped. A reformulation call without it has
@@ -357,7 +360,7 @@ mod tests {
         // Each turn is far larger than 20% of the Haiku input window, so not
         // one of them fits alongside the query.
         let window = context_window_for_model(REFORMULATION_PROVIDER, REFORMULATION_MODEL);
-        let oversized = "word ".repeat(window);
+        let oversized = "word ".repeat(window.expect("the reformulation model declares a window"));
         let history = vec![
             ChatTurn {
                 role: "user".into(),
@@ -385,7 +388,8 @@ mod tests {
             clippy::cast_possible_truncation,
             clippy::cast_sign_loss
         )]
-        let budget = (window as f64 * INPUT_BUDGET_SHARE) as usize;
+        let budget = (window.expect("the reformulation model declares a window") as f64
+            * INPUT_BUDGET_SHARE) as usize;
 
         // One turn just under the budget fits; the same turn plus a second one
         // does not, which is what makes the limit a budget and not a count.

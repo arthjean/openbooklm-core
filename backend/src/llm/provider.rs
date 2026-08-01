@@ -35,6 +35,17 @@ pub trait LlmProvider: Send + Sync {
         false
     }
 
+    /// Output tokens this provider asks the model to be able to write.
+    ///
+    /// Part of the one budgeting pass (US-018): the answer occupies the same
+    /// context window as the prompt, so a request assembled without counting it
+    /// is a request that fits until the model starts writing. Each client
+    /// returns the `max_tokens` it actually sends, which is what keeps the
+    /// budget and the wire from disagreeing.
+    fn max_output_tokens(&self) -> usize {
+        4096
+    }
+
     /// List of supported models.
     fn supported_models(&self) -> Vec<String> {
         vec![self.default_model().to_owned()]

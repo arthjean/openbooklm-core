@@ -17,13 +17,13 @@
 //! skipped. Diversification and selection are not skipped, because "one passage
 //! is one context" holds however the passage was loaded.
 
-use uuid::Uuid;
-
+use super::formatting::{entry_tokens, evidence_body, region_overhead_tokens};
 use super::types::{CorrectiveResult, SearchResult};
 use crate::core::config::CoreConfig;
 use crate::core::providers::{EmbeddingProvider, Reranker};
 use crate::error::AppError;
-use crate::repositories::SearchRepository;
+use crate::llm::prompts::EvidenceFormat;
+use crate::repositories::{NotebookScope, SearchRepository};
 use crate::services::rag::embedding_cache::EmbeddingCache;
 use crate::services::rag::eval::trace::{ReasonCode, ReasonSet, StageCounts, query_hash};
 use crate::services::rag::hyde::HydeService;
@@ -149,7 +149,8 @@ impl Default for RetrievalConfidence {
 pub struct RetrievalParams<'a> {
     pub search_repo: &'a dyn SearchRepository,
     pub config: &'a CoreConfig,
-    pub notebook_id: Uuid,
+    /// The account and notebook this retrieval may read (US-020 AC-2).
+    pub scope: NotebookScope,
     pub query: &'a str,
     pub max_chunks: i32,
     pub embeddings: Option<&'a dyn EmbeddingProvider>,
@@ -163,6 +164,15 @@ pub struct RetrievalParams<'a> {
     pub provider: &'a str,
     pub model: &'a str,
     pub preference_boost: Option<&'a PreferenceBoost>,
+    /// Tokens the caller's prompt budget leaves for retrieved evidence.
+    ///
+    /// Only context stuffing consults it, and only to refuse: a notebook that
+    /// fits the requested chunk limit but not the token budget is searched
+    /// instead of loaded whole (US-018 AC-2). The authoritative pass still runs
+    /// at prompt assembly; this is the same number, computed by
+    /// [`evidence_allowance`](crate::services::chat::context_budget::evidence_allowance),
+    /// so the two cannot disagree.
+    pub evidence_token_budget: usize,
 }
 
 /// Whether a candidate pool carries an ordering worth acting on.
@@ -194,7 +204,7 @@ pub async fn retrieve_context(
     params: &RetrievalParams<'_>,
 ) -> Result<(Vec<SearchResult>, PipelineOutcome), AppError> {
     tracing::info!(
-        notebook_id = %params.notebook_id,
+        notebook_id = %params.scope.notebook_id,
         "rag_pipeline: starting retrieval"
     );
 
@@ -209,7 +219,7 @@ pub async fn retrieve_context(
     // the underfill verdict. Single DB round-trip instead of three.
     let chunk_count = params
         .search_repo
-        .count_chunks_for_notebook(params.notebook_id)
+        .count_chunks_for_notebook(params.scope)
         .await?;
     if chunk_count == 0 {
         outcome.reasons.insert(ReasonCode::EmptyCorpus);
@@ -237,6 +247,29 @@ pub async fn retrieve_context(
 /// cardinality contract in the pipeline (US-013), and the guard is also what
 /// US-018 will extend with the token budget.
 ///
+/// What a whole notebook would cost as an evidence region, if it is too much.
+///
+/// `Some(cost)` when the candidates exceed `budget`, `None` when they fit. The
+/// running total stops at the first chunk that blows the budget, so an
+/// over-budget notebook is not measured to the end just to be refused, and the
+/// pricing itself allocates nothing: the renderer writes into a token meter
+/// rather than into a string that would be dropped on the next line.
+fn stuffed_cost_over(candidates: &[SearchResult], budget: usize) -> Option<usize> {
+    let mut total = region_overhead_tokens(EvidenceFormat::Inline);
+    for (position, candidate) in candidates.iter().enumerate() {
+        total += entry_tokens(
+            EvidenceFormat::Inline,
+            position + 1,
+            candidate,
+            evidence_body(candidate),
+        );
+        if total > budget {
+            return Some(total);
+        }
+    }
+    None
+}
+
 /// Returns `None` when stuffing does not apply, which is the signal to search.
 async fn stuff_notebook(
     params: &RetrievalParams<'_>,
@@ -256,7 +289,7 @@ async fn stuff_notebook(
     let ceiling = threshold.min(i64::try_from(final_limit).unwrap_or(i64::MAX));
     if chunk_count > ceiling {
         tracing::debug!(
-            notebook_id = %params.notebook_id,
+            notebook_id = %params.scope.notebook_id,
             chunk_count,
             threshold,
             final_limit,
@@ -265,10 +298,18 @@ async fn stuff_notebook(
         return Ok(None);
     }
 
+    // A turn with no evidence allowance cannot stuff anything, and finding that
+    // out costs nothing here but a full notebook load below.
+    let budget = params.evidence_token_budget;
+    if budget == 0 {
+        outcome.reasons.insert(ReasonCode::StuffingOverBudget);
+        return Ok(None);
+    }
+
     let load_start = std::time::Instant::now();
     let all_chunks = params
         .search_repo
-        .get_all_chunks_for_notebook(params.notebook_id)
+        .get_all_chunks_for_notebook(params.scope)
         .await?;
     outcome.stuffing_load_ms = load_start.elapsed().as_millis();
 
@@ -277,8 +318,30 @@ async fn stuff_notebook(
         .filter_map(|c| SearchResult::from_chunk(c, ScoreDomain::StuffingUniform))
         .collect();
 
+    // Stuffing means "all of it, or none of it". A notebook whose chunks fit
+    // the requested count but not the token budget would be loaded here and
+    // trimmed at prompt assembly, which is a stuffed context that is not the
+    // whole notebook — the one thing stuffing promises (US-018 AC-2). Searching
+    // it instead at least ranks what survives.
+    //
+    // Priced with the inline renderer even for providers that take native
+    // document blocks. The XML envelope is the larger of the two, so a native
+    // provider is refused stuffing slightly earlier than it strictly needs to
+    // be; the error is on the side that never overflows a window.
+    if let Some(stuffed_tokens) = stuffed_cost_over(candidates.as_slice(), budget) {
+        tracing::debug!(
+            notebook_id = %params.scope.notebook_id,
+            chunk_count,
+            stuffed_tokens,
+            evidence_token_budget = budget,
+            "Context stuffing skipped: the notebook exceeds the token budget"
+        );
+        outcome.reasons.insert(ReasonCode::StuffingOverBudget);
+        return Ok(None);
+    }
+
     tracing::info!(
-        notebook_id = %params.notebook_id,
+        notebook_id = %params.scope.notebook_id,
         chunk_count,
         threshold,
         final_limit,
@@ -311,7 +374,7 @@ async fn search_notebook(
 ) -> Result<Option<Pool>, AppError> {
     let Some(embeddings) = params.embeddings else {
         tracing::warn!(
-            notebook_id = %params.notebook_id,
+            notebook_id = %params.scope.notebook_id,
             "No embedding provider configured, skipping context retrieval"
         );
         outcome.reasons.insert(ReasonCode::ProviderError);
@@ -324,7 +387,7 @@ async fn search_notebook(
         .with_mode(SearchMode::Hybrid);
 
     tracing::debug!(
-        notebook_id = %params.notebook_id,
+        notebook_id = %params.scope.notebook_id,
         query_len = params.query.len(),
         retrieval_pool_size = pool_size,
         final_limit,
@@ -340,7 +403,7 @@ async fn search_notebook(
     let found = search(
         params.search_repo,
         &params.config.hybrid_search,
-        params.notebook_id,
+        params.scope,
         &request,
         &query_embedder,
     )
@@ -446,7 +509,7 @@ async fn rerank_pool(
 ) -> Vec<SearchResult> {
     if chunk_count < i64::from(params.config.rerank_min_chunks) {
         tracing::debug!(
-            notebook_id = %params.notebook_id,
+            notebook_id = %params.scope.notebook_id,
             chunk_count,
             rerank_min_chunks = params.config.rerank_min_chunks,
             "Reranking skipped: chunk count below threshold"
@@ -466,7 +529,7 @@ async fn rerank_pool(
             outcome.score_domain = Some(ScoreDomain::RerankerRelevance);
             tracing::info!(
                 rerank_ms = outcome.rerank_ms,
-                notebook_id = %params.notebook_id,
+                notebook_id = %params.scope.notebook_id,
                 "Reranking completed"
             );
             reranked
@@ -480,7 +543,7 @@ async fn rerank_pool(
             outcome.rerank_ms = rerank_start.elapsed().as_millis();
             outcome.reasons.insert(ReasonCode::RerankerFailed);
             tracing::warn!(
-                notebook_id = %params.notebook_id,
+                notebook_id = %params.scope.notebook_id,
                 error = %e,
                 pool = diversified.len(),
                 rerank_ms = outcome.rerank_ms,
@@ -606,7 +669,7 @@ async fn corrective_pass(
     }
 
     tracing::debug!(
-        notebook_id = %params.base.notebook_id,
+        notebook_id = %params.base.scope.notebook_id,
         query_hash = %query_hash(query),
         confidence = ?outcome.confidence,
         result_count = results.len(),
@@ -620,7 +683,7 @@ async fn corrective_pass(
     };
     if params.already_reformulated {
         tracing::debug!(
-            notebook_id = %params.base.notebook_id,
+            notebook_id = %params.base.scope.notebook_id,
             "Skipping corrective reformulation: this turn already reformulated once"
         );
         turn_reasons.insert(ReasonCode::ReformulationSkipped);
@@ -647,7 +710,7 @@ async fn corrective_pass(
     let (corrected_results, corrected_outcome) = retrieve_context(&corrected_params).await?;
 
     tracing::debug!(
-        notebook_id = %params.base.notebook_id,
+        notebook_id = %params.base.scope.notebook_id,
         query_hash = %query_hash(query),
         reformulated_query_hash = %query_hash(&reformulation.query),
         original_contexts = outcome.unique_parents,
@@ -682,6 +745,8 @@ async fn corrective_pass(
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use uuid::Uuid;
 
     use async_trait::async_trait;
 
@@ -746,7 +811,7 @@ mod tests {
     impl SearchRepository for FakeRepo {
         async fn search_similar_chunks(
             &self,
-            _notebook_id: Uuid,
+            _scope: NotebookScope,
             _query_embedding: &[f32],
             limit: i32,
         ) -> RepoResult<Vec<ChunkSearchResult>> {
@@ -757,7 +822,7 @@ mod tests {
 
         async fn search_lexical_chunks(
             &self,
-            _notebook_id: Uuid,
+            _scope: NotebookScope,
             _query: &str,
             limit: i32,
         ) -> RepoResult<Vec<ChunkSearchResult>> {
@@ -769,13 +834,13 @@ mod tests {
                 .collect())
         }
 
-        async fn count_chunks_for_notebook(&self, _notebook_id: Uuid) -> RepoResult<i64> {
+        async fn count_chunks_for_notebook(&self, _scope: NotebookScope) -> RepoResult<i64> {
             Ok(i64::try_from(self.chunks.len()).unwrap_or(i64::MAX))
         }
 
         async fn get_all_chunks_for_notebook(
             &self,
-            _notebook_id: Uuid,
+            _scope: NotebookScope,
         ) -> RepoResult<Vec<ChunkSearchResult>> {
             Ok(self.chunks.clone())
         }
@@ -845,7 +910,7 @@ mod tests {
         RetrievalParams {
             search_repo: repo,
             config,
-            notebook_id: Uuid::new_v4(),
+            scope: NotebookScope::new(Uuid::new_v4(), Uuid::new_v4()),
             query: "retention policy",
             max_chunks,
             embeddings: Some(embedder),
@@ -856,6 +921,9 @@ mod tests {
             provider,
             model,
             preference_boost: None,
+            // Large enough that these cases exercise the cardinality contract
+            // rather than the token budget, which has its own tests.
+            evidence_token_budget: usize::MAX,
         }
     }
 
@@ -944,6 +1012,60 @@ mod tests {
             "a stuffed chunk carries no ranking information"
         );
         assert!(outcome.confidence.is_sufficient());
+    }
+
+    /// A notebook that fits the requested count but not the token budget is
+    /// searched, not stuffed: a "stuffed" context the prompt then trims is not
+    /// the whole notebook, which is the only thing stuffing promises
+    /// (US-018 AC-2).
+    #[tokio::test]
+    async fn stuffing_is_skipped_when_the_notebook_exceeds_the_token_budget() {
+        let repo = FakeRepo::with_parents(8, 1);
+        let mut config = valid_core_config();
+        config.context_stuffing_max_chunks = 150;
+        let embedder = DeterministicEmbedder::new();
+
+        let generous = params(
+            &repo,
+            &config,
+            &embedder,
+            None,
+            15,
+            "anthropic",
+            "claude-haiku-4-5-20251001",
+        );
+        let (_, generous_outcome) = retrieve_context(&generous)
+            .await
+            .expect("retrieval succeeds");
+        assert!(
+            generous_outcome.stuffed,
+            "the same notebook stuffs when the budget allows it"
+        );
+
+        let starved = RetrievalParams {
+            evidence_token_budget: 10,
+            ..params(
+                &repo,
+                &config,
+                &embedder,
+                None,
+                15,
+                "anthropic",
+                "claude-haiku-4-5-20251001",
+            )
+        };
+        let (results, outcome) = retrieve_context(&starved)
+            .await
+            .expect("retrieval succeeds");
+
+        assert!(!outcome.stuffed, "the token budget refused the whole load");
+        assert!(outcome.reasons.contains(ReasonCode::StuffingOverBudget));
+        assert_eq!(
+            outcome.score_domain,
+            Some(ScoreDomain::RrfRank),
+            "it fell back to search, which ranks"
+        );
+        assert!(!results.is_empty());
     }
 
     #[tokio::test]

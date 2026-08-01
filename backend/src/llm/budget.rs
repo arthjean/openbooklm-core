@@ -1,16 +1,45 @@
-//! Token budget management for LLM prompt assembly.
+//! One token budget for the whole provider request (US-018).
 //!
-//! Handles context window sizing, token estimation, per-message truncation,
-//! and fitting all prompt segments within the model's token budget.
+//! Every component that reaches a provider is counted here: the system
+//! instructions, the retrieved evidence (as prompt text or as provider-native
+//! document blocks), the memory block, the conversation history, the current
+//! question, the tokens the answer is allowed to use, and a reserve.
+//!
+//! # Why a declared window and not a default
+//!
+//! [`context_window_for_model`] returns `Option`. A provider whose window this
+//! build does not know has no budget, and a request that cannot be measured is
+//! not sent: the previous 128,000-token fallback was a guess that happened to be
+//! wrong in the only direction that matters, since a model with a smaller window
+//! rejects the request after the prompt has been assembled and paid for
+//! (US-018 AC-5).
+//!
+//! # Allocation order
+//!
+//! The window is spent in a fixed priority order, and each step takes what it
+//! needs from what the previous ones left:
+//!
+//! 1. **Reserve** — `max(1,024, 5% of the window)`, never spent. Tokenizer
+//!    disagreement is real: this module estimates, the provider counts.
+//! 2. **Output** — what the client asks the model to be able to write.
+//! 3. **Instructions and the current question** — mandatory. When they do not
+//!    fit, nothing is sent.
+//! 4. **Memory**, capped at [`MEMORY_PERCENT`] of the window; dropped whole
+//!    rather than truncated mid-fact.
+//! 5. **Evidence**, capped at [`EVIDENCE_PERCENT`] of the window.
+//! 6. **History**, which gets the remainder, oldest turns dropped first.
+//!
+//! Steps 4 to 6 are applied by [`crate::services::chat::context_budget`], which
+//! is where the evidence is visible. This module owns the arithmetic, the two
+//! pure fitting primitives, and [`TokenMeter`] — the sink the evidence renderer
+//! writes into when it is being priced rather than sent.
 
 use std::borrow::Cow;
+use std::fmt::{self, Write as _};
 
 use super::types::LlmMessage;
 
-/// Default fallback context window for unknown models (tokens).
-const DEFAULT_CONTEXT_WINDOW: usize = 128_000;
-
-/// Maximum tokens per individual history message (US-006).
+/// Maximum tokens per individual history message.
 ///
 /// Prevents a single oversized assistant response from consuming the entire
 /// history budget. Full content is preserved in the database.
@@ -19,71 +48,39 @@ pub const MAX_TOKENS_PER_HISTORY_MESSAGE: usize = 2000;
 /// Truncation marker appended to per-message truncated content.
 const TRUNCATION_MARKER: &str = "\n\n[...truncated, full response available in history]";
 
-// ============================================================================
-// Token budget allocation (US-001)
-// ============================================================================
-
-/// Token budget allocation for each prompt segment.
+/// Floor of the reserve held back from every request.
 ///
-/// Ratios: system 15%, RAG 35%, history 25%, memory 10%, buffer 15%.
-/// Unused budget from non-history segments is reallocated to history.
+/// The PRD fixes it: a reserve of `max(1,024 tokens, 5% of the context window)`.
+pub const MIN_RESERVE_TOKENS: usize = 1024;
+
+/// Share of the window that forms the reserve, when it exceeds the floor.
+const RESERVE_PERCENT: usize = 5;
+
+/// Ceiling on retrieved evidence, as a share of the window.
 ///
-/// Note: `history_tokens` is the nominal allocation. [`fit_prompt_to_budget`]
-/// computes the actual history budget dynamically as
-/// `total_window - system_actual - buffer_tokens`, reclaiming unused
-/// RAG/memory budget when those segments are small.
-#[derive(Debug, Clone)]
-pub struct TokenBudget {
-    pub total_window: usize,
-    pub system_tokens: usize,
-    pub rag_tokens: usize,
-    pub memory_tokens: usize,
-    pub history_tokens: usize,
-    pub buffer_tokens: usize,
-}
+/// Evidence is bounded even when the window is nearly empty, so that a long
+/// conversation does not lose all of its history to one oversized passage. With
+/// a 20-context limit and 1,024-token parents the cap only binds on the smallest
+/// windows, which is the case it exists for.
+const EVIDENCE_PERCENT: usize = 60;
 
-/// Actual token usage per segment (for logging/debugging).
-#[derive(Debug, Clone)]
-pub struct BudgetUsage {
-    pub system_actual: usize,
-    pub rag_actual: usize,
-    pub memory_actual: usize,
-    pub history_actual: usize,
-    pub buffer_reserved: usize,
-    pub total_used: usize,
-    pub total_window: usize,
-}
-
-/// Result of fitting all prompt segments within the token budget.
-pub struct FittedPrompt {
-    pub system_prompt: String,
-    pub messages: Vec<LlmMessage>,
-    pub was_truncated: bool,
-    pub budget_usage: BudgetUsage,
-    /// Messages dropped from the oldest end of history due to budget limits (US-002).
-    pub dropped_messages: Vec<LlmMessage>,
-}
-
-/// Result of token-aware history truncation.
-///
-/// Kept for backward compatibility. New code should use [`fit_prompt_to_budget`].
-pub struct TruncatedHistory {
-    /// The truncated messages (newest messages kept).
-    pub messages: Vec<LlmMessage>,
-    /// Whether any messages were dropped.
-    pub was_truncated: bool,
-}
+/// Ceiling on the memory block, as a share of the window.
+const MEMORY_PERCENT: usize = 10;
 
 // ============================================================================
 // Context window sizing
 // ============================================================================
 
-/// Get the context window size for a specific `(provider, model)` pair.
+/// Declared context window for a `(provider, model)` pair, in tokens.
+///
+/// `None` means this build cannot state the window, which is a refusal to
+/// generate rather than a licence to guess (US-018 AC-5).
 ///
 /// Uses `starts_with` prefix matching so versioned model IDs (e.g.
 /// `claude-opus-4-6-20260220`) resolve correctly.
-pub fn context_window_for_model(provider: &str, model: &str) -> usize {
-    match provider {
+#[must_use]
+pub fn context_window_for_model(provider: &str, model: &str) -> Option<usize> {
+    Some(match provider {
         "anthropic" => 200_000, // claude-opus-4-6, claude-sonnet-4-6, claude-haiku-4-5
         "openai" => {
             if model.starts_with("gpt-5.2") || model.starts_with("gpt-5-mini") {
@@ -99,25 +96,149 @@ pub fn context_window_for_model(provider: &str, model: &str) -> usize {
                 128_000 // mistral-small and other Mistral models
             }
         }
-        _ => DEFAULT_CONTEXT_WINDOW,
+        // The in-process model behind the offline evaluator and the CI smoke
+        // path. Declared explicitly for the same reason as the hosted ones: a
+        // provider with no entry here cannot be budgeted, and the evaluator
+        // exercises the same assembly code as production.
+        "deterministic" => 128_000,
+        _ => return None,
+    })
+}
+
+// ============================================================================
+// Budget
+// ============================================================================
+
+/// The token arithmetic of one provider request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PromptBudget {
+    window: usize,
+    reserve: usize,
+    output: usize,
+}
+
+impl PromptBudget {
+    /// Build a budget for a declared window and a requested output size.
+    #[must_use]
+    pub fn new(window: usize, output: usize) -> Self {
+        let reserve = MIN_RESERVE_TOKENS.max(window * RESERVE_PERCENT / 100);
+        Self {
+            window,
+            reserve,
+            output,
+        }
     }
+
+    /// Build a budget for a model, or `None` when its window is not declared.
+    #[must_use]
+    pub fn for_model(provider: &str, model: &str, output: usize) -> Option<Self> {
+        context_window_for_model(provider, model).map(|window| Self::new(window, output))
+    }
+
+    #[must_use]
+    pub const fn window(&self) -> usize {
+        self.window
+    }
+
+    #[must_use]
+    pub const fn reserve(&self) -> usize {
+        self.reserve
+    }
+
+    #[must_use]
+    pub const fn output(&self) -> usize {
+        self.output
+    }
+
+    /// Tokens the prompt itself may occupy.
+    #[must_use]
+    pub const fn prompt_allowance(&self) -> usize {
+        self.window
+            .saturating_sub(self.reserve)
+            .saturating_sub(self.output)
+    }
+
+    /// Ceiling on retrieved evidence.
+    #[must_use]
+    pub const fn evidence_cap(&self) -> usize {
+        self.window * EVIDENCE_PERCENT / 100
+    }
+
+    /// Ceiling on the memory block.
+    #[must_use]
+    pub const fn memory_cap(&self) -> usize {
+        self.window * MEMORY_PERCENT / 100
+    }
+
+    /// Whether an assembled request fits, with its reserve intact.
+    ///
+    /// The assertion US-018 AC-4 asks for. It is a check and not a
+    /// `debug_assert`: a release build must refuse an oversized request rather
+    /// than send it.
+    #[must_use]
+    pub fn admits(&self, system_prompt: &str, messages: &[LlmMessage]) -> bool {
+        request_tokens(system_prompt, messages) + self.output + self.reserve <= self.window
+    }
+}
+
+/// Estimated tokens of an assembled request, excluding output and reserve.
+#[must_use]
+pub fn request_tokens(system_prompt: &str, messages: &[LlmMessage]) -> usize {
+    estimate_tokens(system_prompt)
+        + messages
+            .iter()
+            .map(|m| estimate_tokens(&m.content))
+            .sum::<usize>()
 }
 
 // ============================================================================
 // Token estimation
 // ============================================================================
 
+/// Counts the tokens of everything written into it, without building a string.
+///
+/// The single definition of the estimate: bytes/4 for Latin/ASCII text, plus one
+/// token per CJK character on top of its bytes/4 contribution. That yields ~1.75
+/// tokens per CJK character where a real tokenizer gives ~1. The overestimate is
+/// deliberate: a budget that errs high keeps fewer messages, a budget that errs
+/// low overflows a context window.
+///
+/// It is a [`fmt::Write`] sink, which is what makes it interchangeable with the
+/// `String` the evidence renderer writes into. Pricing an entry means running
+/// the renderer against a meter instead of against a buffer: same code, same
+/// bytes, no allocation. An estimate computed by any other route is an estimate
+/// that eventually disagrees with what is sent.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TokenMeter {
+    bytes: usize,
+    cjk: usize,
+}
+
+impl TokenMeter {
+    /// Tokens written into this meter so far.
+    #[must_use]
+    pub const fn tokens(&self) -> usize {
+        self.bytes / 4 + self.cjk
+    }
+}
+
+impl fmt::Write for TokenMeter {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        self.bytes += s.len();
+        self.cjk += s.chars().filter(|c| is_cjk(*c)).count();
+        Ok(())
+    }
+}
+
 /// Estimate token count for a string.
 ///
-/// Uses bytes/4 as a rough approximation for Latin/ASCII text.
-/// CJK characters get an extra token each on top of their bytes/4
-/// contribution. This is conservative — actual tokenizers give ~1
-/// token per CJK char, but our formula yields ~1.75 (0.75 from
-/// bytes/4 + 1.0 correction). The overestimate is safe for budget
-/// enforcement (errs toward keeping fewer messages, never overflow).
+/// One string fed through [`TokenMeter`], so the standalone estimate and the
+/// renderer's price can never drift apart.
+#[must_use]
 pub fn estimate_tokens(text: &str) -> usize {
-    let cjk_count = text.chars().filter(|c| is_cjk(*c)).count();
-    text.len() / 4 + cjk_count
+    let mut meter = TokenMeter::default();
+    let _ = meter.write_str(text);
+    meter.tokens()
 }
 
 fn is_cjk(ch: char) -> bool {
@@ -131,28 +252,19 @@ fn is_cjk(ch: char) -> bool {
 }
 
 // ============================================================================
-// Budget allocation & prompt fitting
+// History fitting
 // ============================================================================
 
-/// Compute segment budgets from the model's context window.
-///
-/// Ratios: system 15%, RAG 35%, history 25%, memory 10%, buffer 15%.
-pub fn allocate_token_budget(provider: &str, model: &str) -> TokenBudget {
-    let total = context_window_for_model(provider, model);
-    let system_tokens = total * 15 / 100;
-    let rag_tokens = total * 35 / 100;
-    let history_tokens = total * 25 / 100;
-    let memory_tokens = total * 10 / 100;
-    // Buffer absorbs integer rounding so all segments sum exactly to total.
-    let buffer_tokens = total - system_tokens - rag_tokens - history_tokens - memory_tokens;
-    TokenBudget {
-        total_window: total,
-        system_tokens,
-        rag_tokens,
-        history_tokens,
-        memory_tokens,
-        buffer_tokens,
-    }
+/// Conversation history cut to a token budget.
+#[derive(Debug, Clone, Default)]
+pub struct FittedHistory {
+    /// Kept messages, in chronological order.
+    pub messages: Vec<LlmMessage>,
+    /// Messages dropped from the oldest end, for summarization.
+    pub dropped: Vec<LlmMessage>,
+    pub was_truncated: bool,
+    /// Estimated tokens of `messages`.
+    pub tokens: usize,
 }
 
 /// Truncate a single message's content to fit within a token budget.
@@ -164,6 +276,7 @@ pub fn allocate_token_budget(provider: &str, model: &str) -> TokenBudget {
 /// allocation only while the borrow is live.
 ///
 /// Truncation respects UTF-8 character boundaries.
+#[must_use]
 pub fn truncate_message_content(content: &str, max_tokens: usize) -> Cow<'_, str> {
     if estimate_tokens(content) <= max_tokens {
         return Cow::Borrowed(content);
@@ -198,158 +311,44 @@ pub fn truncate_message_content(content: &str, max_tokens: usize) -> Cow<'_, str
     Cow::Owned(truncated)
 }
 
-/// Fit all prompt segments within the model's token budget.
+/// Keep the newest history that fits `budget_tokens`.
 ///
-/// Measures each segment's actual token count and dynamically allocates
-/// remaining tokens to history (reclaiming unused budget from other segments).
-///
-/// The system prompt (including RAG context and memory) is passed pre-built.
-/// `rag_context` and `memory_block` are passed separately for per-segment
-/// measurement and logging — their tokens are already included in `system_prompt`.
-///
-/// Individual history messages are truncated to [`MAX_TOKENS_PER_HISTORY_MESSAGE`]
-/// before measuring total history tokens (US-006).
-pub fn fit_prompt_to_budget(
-    system_prompt: &str,
-    rag_context: &str,
-    memory_block: Option<&str>,
-    history: &[LlmMessage],
-    budget: &TokenBudget,
-) -> FittedPrompt {
-    // 1. Measure actual segment sizes
-    let system_actual = estimate_tokens(system_prompt);
-    let rag_actual = estimate_tokens(rag_context);
-    let memory_actual = memory_block.map_or(0, estimate_tokens);
-
-    // 2. Log warnings for oversized segments
-    if rag_actual > budget.rag_tokens {
-        tracing::warn!(
-            rag_actual,
-            budget = budget.rag_tokens,
-            "RAG context exceeds segment budget"
-        );
-    }
-    if memory_actual > budget.memory_tokens {
-        tracing::warn!(
-            memory_actual,
-            budget = budget.memory_tokens,
-            "Memory block exceeds segment budget"
-        );
-    }
-    if system_actual > budget.system_tokens + budget.rag_tokens + budget.memory_tokens {
-        tracing::warn!(
-            system_actual,
-            budget_combined = budget.system_tokens + budget.rag_tokens + budget.memory_tokens,
-            "System prompt (with RAG + memory) exceeds combined segment budget"
-        );
-    }
-
-    // 3. Compute remaining budget for history.
-    //    remaining = total - actual_system - buffer
-    //    This dynamically reclaims unused budget: if RAG/memory are small,
-    //    history gets the surplus automatically.
-    let non_history = system_actual + budget.buffer_tokens;
-    let history_budget = budget.total_window.saturating_sub(non_history);
-
-    // 4. Truncate individual messages (US-006) and fit to history budget
+/// Individual messages are first truncated to
+/// [`MAX_TOKENS_PER_HISTORY_MESSAGE`], then the oldest are dropped until the
+/// remainder fits.
+#[must_use]
+pub fn fit_history(history: &[LlmMessage], budget_tokens: usize) -> FittedHistory {
     let mut total_tokens = 0;
-    let mut keep_count = 0;
-    let mut kept_messages: Vec<LlmMessage> = Vec::new();
+    let mut kept: Vec<LlmMessage> = Vec::new();
 
     for msg in history.iter().rev() {
         let content = truncate_message_content(&msg.content, MAX_TOKENS_PER_HISTORY_MESSAGE);
         let msg_tokens = estimate_tokens(&content);
-        if total_tokens + msg_tokens > history_budget {
+        if total_tokens + msg_tokens > budget_tokens {
             break;
         }
         total_tokens += msg_tokens;
-        keep_count += 1;
-        kept_messages.push(LlmMessage {
+        kept.push(LlmMessage {
             role: msg.role,
             content: content.into_owned(),
         });
     }
 
-    // Reverse to restore chronological order (we iterated newest-first)
-    kept_messages.reverse();
+    // Reverse to restore chronological order (we iterated newest-first).
+    kept.reverse();
 
-    let was_truncated = keep_count < history.len();
-
-    // Collect dropped messages (oldest end of history) for potential summarization (US-002)
-    let dropped_messages = if was_truncated {
-        let drop_count = history.len() - keep_count;
-        history[..drop_count].to_vec()
+    let was_truncated = kept.len() < history.len();
+    let dropped = if was_truncated {
+        history[..history.len() - kept.len()].to_vec()
     } else {
-        vec![]
+        Vec::new()
     };
 
-    let budget_usage = BudgetUsage {
-        system_actual,
-        rag_actual,
-        memory_actual,
-        history_actual: total_tokens,
-        buffer_reserved: budget.buffer_tokens,
-        total_used: system_actual + total_tokens + budget.buffer_tokens,
-        total_window: budget.total_window,
-    };
-
-    tracing::debug!(
-        system = budget_usage.system_actual,
-        rag = budget_usage.rag_actual,
-        memory = budget_usage.memory_actual,
-        history = budget_usage.history_actual,
-        buffer = budget_usage.buffer_reserved,
-        total_used = budget_usage.total_used,
-        total_window = budget_usage.total_window,
-        history_budget,
-        was_truncated,
-        kept = kept_messages.len(),
-        original = history.len(),
-        "Token budget usage"
-    );
-
-    FittedPrompt {
-        system_prompt: system_prompt.to_string(),
-        messages: kept_messages,
-        was_truncated,
-        budget_usage,
-        dropped_messages,
-    }
-}
-
-/// Truncate conversation history to fit within a fixed token budget.
-///
-/// Keeps the most recent messages, dropping oldest first.
-/// Budget is 25% of the model's context window (the history segment ratio).
-///
-/// **Prefer [`fit_prompt_to_budget`]** for the chat handler — it accounts for
-/// all prompt segments and dynamically reallocates unused budget to history.
-pub fn truncate_history_to_budget(
-    messages: &[LlmMessage],
-    provider_name: &str,
-    model: &str,
-) -> TruncatedHistory {
-    let budget = allocate_token_budget(provider_name, model);
-
-    let mut total_tokens = 0;
-    let mut keep_count = 0;
-
-    for msg in messages.iter().rev() {
-        let msg_tokens = estimate_tokens(&msg.content);
-        if total_tokens + msg_tokens > budget.history_tokens {
-            break;
-        }
-        total_tokens += msg_tokens;
-        keep_count += 1;
-    }
-
-    let was_truncated = keep_count < messages.len();
-    let start = messages.len() - keep_count;
-    let kept = messages[start..].to_vec();
-
-    TruncatedHistory {
+    FittedHistory {
         messages: kept,
+        dropped,
         was_truncated,
+        tokens: total_tokens,
     }
 }
 
@@ -363,72 +362,57 @@ mod tests {
     use crate::llm::types::LlmMessage;
 
     #[test]
-    fn context_window_anthropic_opus() {
+    fn context_window_anthropic_models_share_one_window() {
+        for model in [
+            "claude-opus-4-6-20260220",
+            "claude-sonnet-4-6-20260220",
+            "claude-haiku-4-5-20251001",
+        ] {
+            assert_eq!(context_window_for_model("anthropic", model), Some(200_000));
+        }
+    }
+
+    #[test]
+    fn context_window_openai_variants() {
         assert_eq!(
-            context_window_for_model("anthropic", "claude-opus-4-6-20260220"),
-            200_000
+            context_window_for_model("openai", "gpt-5.2-turbo"),
+            Some(400_000)
         );
-    }
-
-    #[test]
-    fn context_window_anthropic_sonnet() {
-        assert_eq!(
-            context_window_for_model("anthropic", "claude-sonnet-4-6-20260220"),
-            200_000
-        );
-    }
-
-    #[test]
-    fn context_window_anthropic_haiku() {
-        assert_eq!(
-            context_window_for_model("anthropic", "claude-haiku-4-5-20251001"),
-            200_000
-        );
-    }
-
-    #[test]
-    fn context_window_openai_gpt52() {
-        assert_eq!(context_window_for_model("openai", "gpt-5.2-turbo"), 400_000);
-    }
-
-    #[test]
-    fn context_window_openai_gpt5_mini() {
         assert_eq!(
             context_window_for_model("openai", "gpt-5-mini-2025"),
-            400_000
+            Some(400_000)
         );
-    }
-
-    #[test]
-    fn context_window_mistral_large() {
         assert_eq!(
-            context_window_for_model("mistral", "mistral-large-latest"),
-            256_000
+            context_window_for_model("openai", "gpt-4o-mini"),
+            Some(128_000)
         );
     }
 
     #[test]
-    fn context_window_mistral_small() {
-        assert_eq!(
-            context_window_for_model("mistral", "mistral-small-latest"),
-            128_000
-        );
-    }
-
-    #[test]
-    fn context_window_unknown_uses_default() {
-        assert_eq!(context_window_for_model("unknown", "some-model"), 128_000);
-    }
-
-    #[test]
-    fn context_window_prefix_matching_works() {
+    fn context_window_mistral_variants() {
         assert_eq!(
             context_window_for_model("mistral", "mistral-large-2026-01"),
-            256_000
+            Some(256_000)
         );
         assert_eq!(
-            context_window_for_model("openai", "gpt-5.2-latest"),
-            400_000
+            context_window_for_model("mistral", "mistral-small-latest"),
+            Some(128_000)
+        );
+    }
+
+    /// The defect US-018 AC-5 names: an unknown provider used to be budgeted
+    /// against an invented 128,000-token window.
+    #[test]
+    fn an_undeclared_provider_has_no_window_rather_than_a_default() {
+        assert_eq!(context_window_for_model("unknown", "some-model"), None);
+        assert!(PromptBudget::for_model("unknown", "some-model", 4096).is_none());
+    }
+
+    #[test]
+    fn the_offline_provider_declares_its_window() {
+        assert_eq!(
+            context_window_for_model("deterministic", "deterministic-echo-v1"),
+            Some(128_000)
         );
     }
 
@@ -441,102 +425,87 @@ mod tests {
 
     #[test]
     fn estimate_tokens_cjk_higher_density() {
-        let tokens_cjk = estimate_tokens("你好世界");
-        let tokens_eng = estimate_tokens("abcd");
-        assert!(tokens_cjk > tokens_eng);
+        assert!(estimate_tokens("你好世界") > estimate_tokens("abcd"));
     }
 
+    /// The property the evidence renderer relies on: writing the pieces of a
+    /// string into a meter prices the same string, minus only the truncation
+    /// the integer division loses at each boundary.
     #[test]
-    fn budget_allocation_anthropic() {
-        let budget = allocate_token_budget("anthropic", "claude-sonnet-4-6-20260220");
-        assert_eq!(budget.total_window, 200_000);
-        assert_eq!(budget.system_tokens, 30_000); // 15%
-        assert_eq!(budget.rag_tokens, 70_000); // 35%
-        assert_eq!(budget.history_tokens, 50_000); // 25%
-        assert_eq!(budget.memory_tokens, 20_000); // 10%
-        assert_eq!(budget.buffer_tokens, 30_000); // 15%
-    }
-
-    #[test]
-    fn budget_allocation_openai_gpt52() {
-        let budget = allocate_token_budget("openai", "gpt-5.2-turbo");
-        assert_eq!(budget.total_window, 400_000);
-        assert_eq!(budget.system_tokens, 60_000);
-        assert_eq!(budget.rag_tokens, 140_000);
-        assert_eq!(budget.history_tokens, 100_000);
-        assert_eq!(budget.memory_tokens, 40_000);
-        assert_eq!(budget.buffer_tokens, 60_000);
-    }
-
-    #[test]
-    fn budget_allocation_mistral_small() {
-        let budget = allocate_token_budget("mistral", "mistral-small-latest");
-        assert_eq!(budget.total_window, 128_000);
-        assert_eq!(budget.system_tokens, 19_200);
-        assert_eq!(budget.rag_tokens, 44_800);
-        assert_eq!(budget.history_tokens, 32_000);
-        assert_eq!(budget.memory_tokens, 12_800);
-        assert_eq!(budget.buffer_tokens, 19_200);
-    }
-
-    #[test]
-    fn budget_allocation_unknown_provider() {
-        let budget = allocate_token_budget("unknown", "some-model");
-        assert_eq!(budget.total_window, 128_000);
-        let sum = budget.system_tokens
-            + budget.rag_tokens
-            + budget.history_tokens
-            + budget.memory_tokens
-            + budget.buffer_tokens;
-        assert_eq!(sum, budget.total_window);
-    }
-
-    #[test]
-    fn truncate_keeps_all_when_within_budget() {
-        let messages = vec![
-            LlmMessage::user("Hello"),
-            LlmMessage::assistant("Hi there"),
-            LlmMessage::user("How are you?"),
+    fn a_meter_fed_in_pieces_prices_the_whole() {
+        let pieces = [
+            "<source index=\"1\" ",
+            "title=\"Notes\">",
+            "中文とか",
+            "</source>",
         ];
-        let result =
-            truncate_history_to_budget(&messages, "anthropic", "claude-sonnet-4-6-20260220");
-        assert!(!result.was_truncated);
-        assert_eq!(result.messages.len(), 3);
+        let joined: String = pieces.concat();
+
+        let mut meter = TokenMeter::default();
+        for piece in pieces {
+            let _ = meter.write_str(piece);
+        }
+
+        let whole = estimate_tokens(&joined);
+        assert!(meter.tokens() <= whole);
+        assert!(whole - meter.tokens() < pieces.len());
     }
 
     #[test]
-    fn truncate_drops_oldest_first() {
-        let long_msg = "x".repeat(600_000);
-        let messages = vec![
-            LlmMessage::user(long_msg),
-            LlmMessage::user("recent message"),
-        ];
-        let result = truncate_history_to_budget(&messages, "mistral", "mistral-small-latest");
-        assert!(result.was_truncated);
-        assert_eq!(result.messages.len(), 1);
-        assert_eq!(result.messages[0].content, "recent message");
+    fn the_reserve_is_the_larger_of_the_floor_and_five_percent() {
+        // 5% of 200,000 is 10,000, which exceeds the 1,024 floor.
+        let large = PromptBudget::new(200_000, 8192);
+        assert_eq!(large.reserve(), 10_000);
+
+        // 5% of 8,000 is 400, so the floor applies.
+        let small = PromptBudget::new(8_000, 1_000);
+        assert_eq!(small.reserve(), MIN_RESERVE_TOKENS);
     }
 
     #[test]
-    fn truncate_exceeding_budget_keeps_newest() {
-        let big = "a".repeat(400_000);
-        let messages = vec![
-            LlmMessage::user(big.clone()),
-            LlmMessage::assistant(big.clone()),
-            LlmMessage::user("latest question"),
-        ];
-        let result = truncate_history_to_budget(&messages, "unknown", "some-model");
-        assert!(result.was_truncated);
-        assert!(result.messages.len() <= 2);
-        assert_eq!(result.messages.last().unwrap().content, "latest question");
+    fn the_prompt_allowance_excludes_the_reserve_and_the_answer() {
+        let budget = PromptBudget::new(100_000, 4_000);
+        assert_eq!(budget.reserve(), 5_000);
+        assert_eq!(budget.prompt_allowance(), 100_000 - 5_000 - 4_000);
+    }
+
+    #[test]
+    fn an_output_request_larger_than_the_window_leaves_no_allowance() {
+        let budget = PromptBudget::new(8_000, 32_000);
+        assert_eq!(budget.prompt_allowance(), 0);
+    }
+
+    #[test]
+    fn the_evidence_and_memory_caps_are_shares_of_the_window() {
+        let budget = PromptBudget::new(200_000, 8192);
+        assert_eq!(budget.evidence_cap(), 120_000);
+        assert_eq!(budget.memory_cap(), 20_000);
+    }
+
+    #[test]
+    fn admits_rejects_a_request_that_would_eat_the_reserve() {
+        let budget = PromptBudget::new(10_000, 1_000);
+        // reserve 1,024 + output 1,000 leaves 7,976 tokens for the prompt.
+        let fits = "x".repeat(4 * 7_000);
+        assert!(budget.admits(&fits, &[]));
+
+        let overflows = "x".repeat(4 * 8_000);
+        assert!(!budget.admits(&overflows, &[]));
+    }
+
+    #[test]
+    fn admits_counts_the_messages_too() {
+        let budget = PromptBudget::new(10_000, 1_000);
+        let system = "x".repeat(4 * 7_000);
+        let message = LlmMessage::user("y".repeat(4 * 2_000));
+        assert!(budget.admits(&system, &[]));
+        assert!(!budget.admits(&system, std::slice::from_ref(&message)));
     }
 
     #[test]
     fn truncate_message_under_budget_returns_borrowed() {
-        let content = "short message";
-        let result = truncate_message_content(content, 2000);
+        let result = truncate_message_content("short message", 2000);
         assert!(matches!(result, Cow::Borrowed(_)));
-        assert_eq!(&*result, content);
     }
 
     #[test]
@@ -545,212 +514,89 @@ mod tests {
         let result = truncate_message_content(&content, 2000);
         assert!(matches!(result, Cow::Owned(_)));
         assert!(result.contains("[...truncated, full response available in history]"));
-        let result_tokens = estimate_tokens(&result);
-        assert!(
-            result_tokens <= 2000,
-            "Truncated message should be <= 2000 tokens, got {result_tokens}"
-        );
+        assert!(estimate_tokens(&result) <= 2000);
     }
 
     #[test]
     fn truncate_message_utf8_boundary_2byte() {
         let content = "é".repeat(10_000);
         let result = truncate_message_content(&content, 500);
-        assert!(matches!(result, Cow::Owned(_)));
-        let char_count = result.chars().count();
-        assert!(char_count > 0);
-        let marker_pos = result.find("[...truncated").unwrap();
-        let prefix = &result[..marker_pos];
-        assert!(prefix.chars().all(|c| c == 'é' || c == '\n'));
-        assert!(result.contains("[...truncated"));
+        let marker_pos = result.find("[...truncated").expect("marker");
+        assert!(result[..marker_pos].chars().all(|c| c == 'é' || c == '\n'));
     }
 
     #[test]
-    fn truncate_message_utf8_boundary_cjk() {
-        let content = "中".repeat(5_000);
-        let result = truncate_message_content(&content, 500);
-        assert!(matches!(result, Cow::Owned(_)));
-        let _ = result.chars().count();
-        assert!(result.contains("[...truncated"));
-        let result_tokens = estimate_tokens(&result);
-        assert!(
-            result_tokens <= 500,
-            "CJK truncated message should be <= 500 tokens, got {result_tokens}"
-        );
-    }
-
-    #[test]
-    fn truncate_message_utf8_boundary_emoji() {
-        let content = "😀".repeat(5_000);
-        let result = truncate_message_content(&content, 500);
-        assert!(matches!(result, Cow::Owned(_)));
-        let _ = result.chars().count();
-        assert!(result.contains("[...truncated"));
-        let result_tokens = estimate_tokens(&result);
-        assert!(
-            result_tokens <= 500,
-            "Emoji truncated message should be <= 500 tokens, got {result_tokens}"
-        );
-    }
-
-    #[test]
-    fn truncate_message_empty_returns_borrowed() {
-        let result = truncate_message_content("", 2000);
-        assert!(matches!(result, Cow::Borrowed(_)));
-        assert_eq!(&*result, "");
-    }
-
-    #[test]
-    fn truncate_message_exact_budget_returns_borrowed() {
-        let content = "a".repeat(8000);
-        assert_eq!(estimate_tokens(&content), 2000);
-        let result = truncate_message_content(&content, 2000);
-        assert!(matches!(result, Cow::Borrowed(_)));
-    }
-
-    #[test]
-    fn fit_prompt_keeps_all_when_within_budget() {
-        let messages = vec![
-            LlmMessage::user("Hello"),
-            LlmMessage::assistant("Hi there"),
-            LlmMessage::user("How are you?"),
-        ];
-        let budget = allocate_token_budget("anthropic", "claude-sonnet-4-6-20260220");
-        let result = fit_prompt_to_budget("system prompt", "rag context", None, &messages, &budget);
-        assert!(!result.was_truncated);
-        assert_eq!(result.messages.len(), 3);
-        assert!(result.budget_usage.total_used < budget.total_window);
-    }
-
-    #[test]
-    fn fit_prompt_history_reclaims_unused_budget() {
-        let budget = allocate_token_budget("mistral", "mistral-small-latest");
-        let result = fit_prompt_to_budget("hi", "", None, &[], &budget);
-        let expected_budget = 128_000 - estimate_tokens("hi") - 19_200;
-        assert_eq!(result.budget_usage.system_actual, estimate_tokens("hi"));
-        assert!(expected_budget > budget.history_tokens);
-    }
-
-    #[test]
-    fn fit_prompt_truncates_with_large_system_prompt() {
-        let large_system = "x".repeat(450_000); // ~112,500 tokens
-        let messages: Vec<LlmMessage> = (0..5)
-            .map(|i| LlmMessage::user(format!("message {i}")))
-            .collect();
-        let budget = allocate_token_budget("mistral", "mistral-small-latest");
-        let result = fit_prompt_to_budget(&large_system, &large_system, None, &messages, &budget);
-        assert!(result.was_truncated);
-        assert!(result.messages.len() < 5);
-    }
-
-    #[test]
-    fn fit_prompt_logs_oversized_rag() {
-        let budget = allocate_token_budget("mistral", "mistral-small-latest");
-        let large_rag = "x".repeat(200_000); // ~50K tokens, budget.rag_tokens = 44,800
-        let result = fit_prompt_to_budget("system", &large_rag, None, &[], &budget);
-        assert!(result.budget_usage.rag_actual > budget.rag_tokens);
-    }
-
-    #[test]
-    fn fit_prompt_logs_oversized_memory() {
-        let budget = allocate_token_budget("mistral", "mistral-small-latest");
-        let large_memory = "x".repeat(60_000); // ~15K tokens, budget.memory_tokens = 12,800
-        let result = fit_prompt_to_budget("system", "", Some(&large_memory), &[], &budget);
-        assert!(result.budget_usage.memory_actual > budget.memory_tokens);
-    }
-
-    #[test]
-    fn fit_prompt_budget_usage_tracks_all_segments() {
-        let budget = allocate_token_budget("anthropic", "claude-sonnet-4-6-20260220");
-        let messages = vec![LlmMessage::user("Hello world")];
-        let result = fit_prompt_to_budget(
-            "system prompt here",
-            "rag context",
-            Some("<memory>facts</memory>"),
-            &messages,
-            &budget,
-        );
-        assert_eq!(
-            result.budget_usage.system_actual,
-            estimate_tokens("system prompt here")
-        );
-        assert_eq!(
-            result.budget_usage.rag_actual,
-            estimate_tokens("rag context")
-        );
-        assert_eq!(
-            result.budget_usage.memory_actual,
-            estimate_tokens("<memory>facts</memory>")
-        );
-        assert!(result.budget_usage.history_actual > 0);
-        assert_eq!(result.budget_usage.buffer_reserved, budget.buffer_tokens);
-        assert_eq!(result.budget_usage.total_window, 200_000);
-    }
-
-    #[test]
-    fn fit_prompt_no_dropped_messages_when_all_fit() {
-        let messages = vec![
-            LlmMessage::user("Hello"),
-            LlmMessage::assistant("Hi there"),
-            LlmMessage::user("How are you?"),
-        ];
-        let budget = allocate_token_budget("anthropic", "claude-sonnet-4-6-20260220");
-        let result = fit_prompt_to_budget("system", "", None, &messages, &budget);
-        assert!(result.dropped_messages.is_empty());
-        assert!(!result.was_truncated);
-    }
-
-    #[test]
-    fn fit_prompt_dropped_messages_when_truncated() {
-        let large_system = "x".repeat(450_000); // ~112.5K tokens
-        let messages: Vec<LlmMessage> = (0..10)
-            .map(|i| LlmMessage::user(format!("message {i}")))
-            .collect();
-        let budget = allocate_token_budget("mistral", "mistral-small-latest");
-        let result = fit_prompt_to_budget(&large_system, "", None, &messages, &budget);
-        assert!(result.was_truncated);
-        assert_eq!(
-            result.dropped_messages.len() + result.messages.len(),
-            messages.len()
-        );
-        if !result.dropped_messages.is_empty() {
-            assert_eq!(result.dropped_messages[0].content, "message 0");
+    fn truncate_message_utf8_boundary_cjk_and_emoji() {
+        for content in ["中".repeat(5_000), "😀".repeat(5_000)] {
+            let result = truncate_message_content(&content, 500);
+            assert!(result.contains("[...truncated"));
+            assert!(estimate_tokens(&result) <= 500);
         }
     }
 
     #[test]
-    fn fit_prompt_dropped_messages_are_oldest() {
-        let system = "y".repeat(150_000); // ~37,500 tokens
-        let messages: Vec<LlmMessage> = (0..50)
-            .map(|i| LlmMessage::user(format!("msg-{i}: {}", "w".repeat(8000)))) // ~2000 tokens each
-            .collect();
-        let budget = allocate_token_budget("mistral", "mistral-small-latest");
-        let result = fit_prompt_to_budget(&system, "", None, &messages, &budget);
-        assert!(result.was_truncated);
-        assert!(!result.dropped_messages.is_empty());
-        assert!(result.dropped_messages[0].content.starts_with("msg-0:"));
-        assert!(
-            result
-                .messages
-                .last()
-                .unwrap()
-                .content
-                .starts_with("msg-49:")
-        );
+    fn truncate_message_empty_and_exact_budget_return_borrowed() {
+        assert!(matches!(
+            truncate_message_content("", 2000),
+            Cow::Borrowed(_)
+        ));
+        let exact = "a".repeat(8000);
+        assert_eq!(estimate_tokens(&exact), 2000);
+        assert!(matches!(
+            truncate_message_content(&exact, 2000),
+            Cow::Borrowed(_)
+        ));
     }
 
     #[test]
-    fn fit_prompt_applies_per_message_truncation() {
-        let huge_msg = "x".repeat(100_000); // ~25K tokens
-        let messages = vec![LlmMessage::assistant(huge_msg)];
-        let budget = allocate_token_budget("anthropic", "claude-sonnet-4-6-20260220");
-        let result = fit_prompt_to_budget("system", "", None, &messages, &budget);
-        assert_eq!(result.messages.len(), 1);
+    fn history_that_fits_is_kept_whole_and_in_order() {
+        let history = vec![
+            LlmMessage::user("Hello"),
+            LlmMessage::assistant("Hi there"),
+            LlmMessage::user("How are you?"),
+        ];
+        let fitted = fit_history(&history, 10_000);
+        assert!(!fitted.was_truncated);
+        assert_eq!(fitted.messages.len(), 3);
+        assert_eq!(fitted.messages[0].content, "Hello");
+        assert!(fitted.dropped.is_empty());
+        assert!(fitted.tokens > 0);
+    }
+
+    #[test]
+    fn history_drops_the_oldest_first() {
+        let history: Vec<LlmMessage> = (0..10)
+            .map(|i| LlmMessage::user(format!("msg-{i}: {}", "w".repeat(4_000)))) // ~1,000 tokens
+            .collect();
+        // Each message costs ~1,002 tokens, so two fit and a third would not.
+        let fitted = fit_history(&history, 3_000);
+        assert!(fitted.was_truncated);
+        assert_eq!(fitted.messages.len(), 2);
+        assert!(fitted.messages[0].content.starts_with("msg-8:"));
+        assert!(fitted.messages[1].content.starts_with("msg-9:"));
+        assert_eq!(fitted.dropped.len(), 8);
+        assert!(fitted.dropped[0].content.starts_with("msg-0:"));
+    }
+
+    #[test]
+    fn one_oversized_message_is_truncated_before_it_is_weighed() {
+        let history = vec![LlmMessage::assistant("x".repeat(100_000))]; // ~25,000 tokens
+        let fitted = fit_history(&history, 3_000);
+        assert_eq!(fitted.messages.len(), 1);
         assert!(
-            result.messages[0]
+            fitted.messages[0]
                 .content
                 .contains("[...truncated, full response available in history]")
         );
-        assert!(result.budget_usage.history_actual <= 2100);
+        assert!(fitted.tokens <= MAX_TOKENS_PER_HISTORY_MESSAGE + 1);
+    }
+
+    #[test]
+    fn a_zero_budget_keeps_no_history() {
+        let history = vec![LlmMessage::user("Hello")];
+        let fitted = fit_history(&history, 0);
+        assert!(fitted.messages.is_empty());
+        assert_eq!(fitted.dropped.len(), 1);
+        assert!(fitted.was_truncated);
     }
 }

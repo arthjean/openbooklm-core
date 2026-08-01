@@ -397,28 +397,54 @@ pub trait ChunkRepository: Send + Sync {
 // Search (raw SQL: pgvector + tsvector)
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// The account and notebook a retrieval is allowed to read.
+///
+/// Every search takes ownership as data instead of trusting a check that ran
+/// earlier in the request. Between the handler's access check and the SQL there
+/// is an embedding call, possibly a reformulation call and a reranker call;
+/// ownership can be revoked in that window, and a query scoped only by notebook
+/// would still return the content (US-020 AC-2, PRD edge case 8).
+///
+/// It is a struct rather than two parameters so that no implementation can
+/// accept a notebook without an account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NotebookScope {
+    pub account_id: Uuid,
+    pub notebook_id: Uuid,
+}
+
+impl NotebookScope {
+    #[must_use]
+    pub const fn new(account_id: Uuid, notebook_id: Uuid) -> Self {
+        Self {
+            account_id,
+            notebook_id,
+        }
+    }
+}
+
 #[async_trait]
 pub trait SearchRepository: Send + Sync {
-    /// Notebook-scoped vector similarity search using pgvector `<=>` operator.
+    /// Owner-scoped vector similarity search using pgvector `<=>` operator.
     async fn search_similar_chunks(
         &self,
-        notebook_id: Uuid,
+        scope: NotebookScope,
         query_embedding: &[f32],
         limit: i32,
     ) -> RepoResult<Vec<ChunkSearchResult>>;
 
-    /// Notebook-scoped full-text (lexical) search using PostgreSQL tsvector.
+    /// Owner-scoped full-text (lexical) search using PostgreSQL tsvector.
     async fn search_lexical_chunks(
         &self,
-        notebook_id: Uuid,
+        scope: NotebookScope,
         query: &str,
         limit: i32,
     ) -> RepoResult<Vec<ChunkSearchResult>>;
 
-    /// Count total chunks belonging to a notebook.
+    /// Count the owner's active-generation chunks in a notebook.
     ///
     /// Used to decide whether reranking should be applied (skip for small notebooks).
-    async fn count_chunks_for_notebook(&self, notebook_id: Uuid) -> RepoResult<i64>;
+    async fn count_chunks_for_notebook(&self, scope: NotebookScope) -> RepoResult<i64>;
 
     /// Load all chunks for a notebook with source titles, ordered by document structure.
     ///
@@ -426,7 +452,7 @@ pub trait SearchRepository: Send + Sync {
     /// All results have `relevance_score = 1.0` (equally relevant when stuffing).
     async fn get_all_chunks_for_notebook(
         &self,
-        notebook_id: Uuid,
+        scope: NotebookScope,
     ) -> RepoResult<Vec<ChunkSearchResult>>;
 }
 

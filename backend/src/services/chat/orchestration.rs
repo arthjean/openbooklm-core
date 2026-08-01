@@ -16,8 +16,8 @@ use crate::core::principal::Principal;
 use crate::core::protocol::{ChatEvent, ChatEventStream, ThinkingStage, WarningKind};
 use crate::entities::chat_message;
 use crate::error::AppError;
-use crate::llm::{LlmMessage, LlmProvider, TeachingMode, build_system_prompt};
-use crate::repositories::{MemoryRepository, RagLogRepository, SearchRepository};
+use crate::llm::{LlmMessage, LlmProvider};
+use crate::repositories::{MemoryRepository, NotebookScope, RagLogRepository, SearchRepository};
 use crate::services::memory::{format_memory_for_prompt, select_core_memories};
 use crate::services::rag::eval::trace::{ReasonCode, ReasonSet, query_hash};
 use crate::services::rag::provenance::QueryEmbeddingKind;
@@ -35,6 +35,12 @@ use crate::types::{ScoreDomain, SearchResult};
 /// Validated and authorized chat request data.
 pub(crate) struct ValidatedRequest {
     pub message: String,
+    /// The account and notebook every retrieval for this turn may read.
+    ///
+    /// Built once, here, from the principal that was just authorized, and
+    /// carried instead of a bare notebook id so that no downstream call can
+    /// search without an owner (US-020 AC-2).
+    pub scope: NotebookScope,
     /// The context cardinality the caller asked for, already checked against
     /// the server contract (US-013).
     pub max_context_chunks: i32,
@@ -71,6 +77,49 @@ pub(crate) struct RetrievedContext {
     /// The standalone query retrieval actually used, when it differs from what
     /// the user typed.
     pub reformulated_query: Option<String>,
+    /// Why this turn has no evidence, when it has none.
+    ///
+    /// `None` means evidence was retrieved. The three failure kinds are
+    /// classified here, at the point where the outcome is still whole, rather
+    /// than re-derived by the handler from an empty vector (US-020 AC-4).
+    pub failure: Option<RetrievalFailure>,
+}
+
+/// Why a turn has no evidence to answer from (US-020 AC-4).
+///
+/// Three distinct incidents that all produce an empty result set, and that must
+/// not produce the same behaviour: two of them are answers, the third is an
+/// error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RetrievalFailure {
+    /// The notebook has no source to search.
+    NoSources,
+    /// Sources exist, retrieval ran, nothing relevant came back.
+    NoEvidence,
+    /// Retrieval did not run: provider, database, or no embedder configured.
+    Infrastructure,
+}
+
+impl RetrievalFailure {
+    /// The reason code this incident contributes to the trace.
+    pub(crate) const fn reason_code(self) -> ReasonCode {
+        match self {
+            Self::NoSources => ReasonCode::EmptyCorpus,
+            Self::NoEvidence => ReasonCode::NoCandidates,
+            Self::Infrastructure => ReasonCode::ProviderError,
+        }
+    }
+
+    /// Classify a retrieval that produced no chunk.
+    fn classify(outcome: &PipelineOutcome) -> Self {
+        if outcome.reasons.contains(ReasonCode::ProviderError) {
+            Self::Infrastructure
+        } else if outcome.reasons.contains(ReasonCode::EmptyCorpus) {
+            Self::NoSources
+        } else {
+            Self::NoEvidence
+        }
+    }
 }
 
 impl RetrievedContext {
@@ -87,6 +136,24 @@ impl RetrievedContext {
             chunks: Vec::new(),
             outcome,
             reformulated_query: None,
+            failure: Some(RetrievalFailure::Infrastructure),
+        }
+    }
+
+    /// A retrieval that ran, with whatever it produced.
+    fn completed(
+        chunks: Vec<SearchResult>,
+        outcome: PipelineOutcome,
+        reformulated_query: Option<String>,
+    ) -> Self {
+        let failure = chunks
+            .is_empty()
+            .then(|| RetrievalFailure::classify(&outcome));
+        Self {
+            chunks,
+            outcome,
+            reformulated_query,
+            failure,
         }
     }
 }
@@ -95,7 +162,7 @@ impl RetrievedContext {
 pub(crate) struct RagContextParams<'a> {
     pub search_repo: &'a dyn SearchRepository,
     pub config: &'a CoreConfig,
-    pub notebook_id: Uuid,
+    pub scope: NotebookScope,
     pub query: &'a str,
     pub max_chunks: i32,
     pub embeddings: &'a Option<crate::core::providers::SharedEmbeddingProvider>,
@@ -109,6 +176,8 @@ pub(crate) struct RagContextParams<'a> {
     pub model: &'a str,
     /// Pre-computed preference boost signals.
     pub preference_boost: Option<PreferenceBoost>,
+    /// Tokens the prompt budget leaves for retrieved evidence (US-018 AC-2).
+    pub evidence_token_budget: usize,
 }
 
 // ============================================================================
@@ -203,25 +272,6 @@ pub(crate) fn needs_proactive_reformulation(query: &str) -> bool {
         .any(|marker| lower.contains(marker))
 }
 
-/// Build the final system prompt with memory when present.
-///
-/// Memory is injected between `</sources>` and `<role>` by appending to the
-/// context string. This avoids modifying all prompt templates individually.
-pub(crate) fn build_system_prompt_for_chat(
-    context: &str,
-    teaching_mode: TeachingMode,
-    locale: &str,
-    memory: Option<&str>,
-) -> String {
-    // Append <memory> block to context so it appears between </sources> and <role>
-    let context_with_memory: std::borrow::Cow<'_, str> = match memory {
-        Some(mem) => format!("{context}\n\n{mem}").into(),
-        None => context.into(),
-    };
-
-    build_system_prompt(&context_with_memory, teaching_mode, locale)
-}
-
 // ============================================================================
 // Async helpers
 // ============================================================================
@@ -306,6 +356,7 @@ pub(crate) async fn validate_and_authorize(
 
     Ok(ValidatedRequest {
         message,
+        scope: NotebookScope::new(principal.account_id, notebook_id),
         max_context_chunks,
         permit,
         provider: selection.provider,
@@ -455,7 +506,7 @@ pub(crate) async fn retrieve_rag_context(params: &RagContextParams<'_>) -> Retri
     let RagContextParams {
         search_repo,
         config,
-        notebook_id,
+        scope,
         query,
         max_chunks,
         embeddings,
@@ -468,10 +519,13 @@ pub(crate) async fn retrieve_rag_context(params: &RagContextParams<'_>) -> Retri
         provider,
         model,
         preference_boost,
+        evidence_token_budget,
     } = params;
     let search_repo = *search_repo;
-    let notebook_id = *notebook_id;
+    let scope = *scope;
+    let notebook_id = scope.notebook_id;
     let max_chunks = *max_chunks;
+    let evidence_token_budget = *evidence_token_budget;
     if let Some(reformulator) = reformulator {
         let chat_turns: Vec<ChatTurn> = history
             .iter()
@@ -525,7 +579,7 @@ pub(crate) async fn retrieve_rag_context(params: &RagContextParams<'_>) -> Retri
             base: RetrievalParams {
                 search_repo,
                 config,
-                notebook_id,
+                scope,
                 query: &effective_query,
                 max_chunks,
                 embeddings: embeddings.as_deref(),
@@ -536,6 +590,7 @@ pub(crate) async fn retrieve_rag_context(params: &RagContextParams<'_>) -> Retri
                 provider,
                 model,
                 preference_boost: preference_boost.as_ref(),
+                evidence_token_budget,
             },
             reformulator: Some(reformulator),
             chat_history: &chat_turns,
@@ -569,11 +624,7 @@ pub(crate) async fn retrieve_rag_context(params: &RagContextParams<'_>) -> Retri
                 let reformulated_query = (corrective.effective_query != *query)
                     .then(|| corrective.effective_query.clone());
 
-                RetrievedContext {
-                    chunks: corrective.results,
-                    outcome,
-                    reformulated_query,
-                }
+                RetrievedContext::completed(corrective.results, outcome, reformulated_query)
             }
             Err(e) => {
                 tracing::warn!(%notebook_id, error = %e, "Corrective RAG failed, proceeding without context");
@@ -585,7 +636,7 @@ pub(crate) async fn retrieve_rag_context(params: &RagContextParams<'_>) -> Retri
         let retrieval_params = RetrievalParams {
             search_repo,
             config,
-            notebook_id,
+            scope,
             query,
             max_chunks,
             embeddings: embeddings.as_deref(),
@@ -596,6 +647,7 @@ pub(crate) async fn retrieve_rag_context(params: &RagContextParams<'_>) -> Retri
             provider,
             model,
             preference_boost: preference_boost.as_ref(),
+            evidence_token_budget,
         };
         match retrieve_context(&retrieval_params).await {
             Ok((chunks, outcome)) => {
@@ -611,11 +663,7 @@ pub(crate) async fn retrieve_rag_context(params: &RagContextParams<'_>) -> Retri
                         .emit(ChatEvent::warning(WarningKind::LowRetrievalQuality))
                         .await;
                 }
-                RetrievedContext {
-                    chunks,
-                    outcome,
-                    reformulated_query: None,
-                }
+                RetrievedContext::completed(chunks, outcome, None)
             }
             Err(e) => {
                 tracing::warn!(%notebook_id, error = %e, "Failed to retrieve context, proceeding without");
@@ -1171,37 +1219,75 @@ mod tests {
     }
 
     // ════════════════════════════════════════════════════════════════════
-    // build_system_prompt_for_chat
+    // RetrievalFailure
     // ════════════════════════════════════════════════════════════════════
 
-    #[test]
-    fn system_prompt_without_memory() {
-        let prompt =
-            build_system_prompt_for_chat("<sources>doc</sources>", TeachingMode::Deep, "en", None);
-        assert!(!prompt.contains("<memory>"));
-        assert!(!prompt.is_empty());
+    fn outcome_with(reason: ReasonCode) -> PipelineOutcome {
+        let mut outcome = PipelineOutcome::default();
+        outcome.reasons.insert(reason);
+        outcome
     }
 
     #[test]
-    fn system_prompt_with_memory() {
-        let memory = "<memory>\n<core>User is a Rust developer</core>\n</memory>";
-        let prompt = build_system_prompt_for_chat(
-            "<sources>doc</sources>",
-            TeachingMode::Deep,
-            "en",
-            Some(memory),
+    fn an_empty_notebook_and_an_outage_are_not_the_same_incident() {
+        assert_eq!(
+            RetrievalFailure::classify(&outcome_with(ReasonCode::EmptyCorpus)),
+            RetrievalFailure::NoSources
         );
-        assert!(prompt.contains("<memory>"));
-        assert!(prompt.contains("User is a Rust developer"));
+        assert_eq!(
+            RetrievalFailure::classify(&outcome_with(ReasonCode::ProviderError)),
+            RetrievalFailure::Infrastructure
+        );
+        assert_eq!(
+            RetrievalFailure::classify(&PipelineOutcome::default()),
+            RetrievalFailure::NoEvidence
+        );
+    }
+
+    /// An outage that also reports an empty corpus is still an outage: a
+    /// notebook that cannot be read cannot be said to be empty.
+    #[test]
+    fn an_outage_outranks_every_other_explanation() {
+        let mut outcome = outcome_with(ReasonCode::ProviderError);
+        outcome.reasons.insert(ReasonCode::EmptyCorpus);
+        assert_eq!(
+            RetrievalFailure::classify(&outcome),
+            RetrievalFailure::Infrastructure
+        );
     }
 
     #[test]
-    fn system_prompt_quiz_mode() {
-        let prompt =
-            build_system_prompt_for_chat("<sources>doc</sources>", TeachingMode::Quiz, "en", None);
-        let deep_prompt =
-            build_system_prompt_for_chat("<sources>doc</sources>", TeachingMode::Deep, "en", None);
-        assert_ne!(prompt, deep_prompt);
+    fn each_failure_carries_its_own_reason_code() {
+        assert_eq!(
+            RetrievalFailure::NoSources.reason_code(),
+            ReasonCode::EmptyCorpus
+        );
+        assert_eq!(
+            RetrievalFailure::NoEvidence.reason_code(),
+            ReasonCode::NoCandidates
+        );
+        assert_eq!(
+            RetrievalFailure::Infrastructure.reason_code(),
+            ReasonCode::ProviderError
+        );
+    }
+
+    #[test]
+    fn a_retrieval_that_returned_evidence_has_no_failure() {
+        let chunk = SearchResult {
+            chunk_id: Uuid::new_v4(),
+            generation_id: Uuid::nil(),
+            source_id: Uuid::new_v4(),
+            source_title: "Doc".to_owned(),
+            chunk_index: 0,
+            content: "text".to_owned(),
+            parent_content: None,
+            score: crate::types::RetrievalScore::Rrf(0.5),
+            metadata: None,
+            collapsed_children: Vec::new(),
+        };
+        let retrieved = RetrievedContext::completed(vec![chunk], PipelineOutcome::default(), None);
+        assert!(retrieved.failure.is_none());
     }
 
     // ════════════════════════════════════════════════════════════════════

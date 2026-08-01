@@ -51,18 +51,18 @@ use super::retrieval::{RetrievalRunConfig, retrieve_for_query};
 /// Bumped whenever the report shape changes.
 pub const GROUNDING_REPORT_SCHEMA: &str = "rag-grounding-eval/1";
 
-/// Sentences that mean "I am not answering from these sources".
+/// Sentences a *model* writes that mean "I am not answering from these sources".
 ///
-/// The first two are the fallbacks the PRD's edge-case table specifies for an
-/// empty corpus and for insufficient evidence; US-020 is what makes the chat
-/// path emit them. The third is what the in-process deterministic model says
-/// when retrieval handed it nothing. Matching is on a normalized prefix so that
-/// a trailing clause does not defeat it.
-pub const ABSTENTION_MARKERS: &[&str] = &[
-    "aucune source n'est disponible",
-    "les sources disponibles ne permettent pas de répondre",
-    "no source was retrieved",
-];
+/// The documented fallbacks are not in this list: the chat path emits them
+/// verbatim, so they are recognized from
+/// [`FALLBACK_TEXTS`](crate::llm::fallbacks::FALLBACK_TEXTS) instead. That
+/// separation is what lets each locale answer in its own language — this list
+/// used to hold the French sentences, and every locale's fallback had to embed
+/// them to be scored as an abstention.
+///
+/// What remains is what the in-process deterministic model says when retrieval
+/// handed it nothing.
+pub const ABSTENTION_MARKERS: &[&str] = &["no source was retrieved"];
 
 fn round(value: f64) -> f64 {
     if value.is_finite() {
@@ -320,12 +320,20 @@ pub fn run_grounding_eval(
 }
 
 /// Whether a text reads as an abstention.
+///
+/// Two sources, in this order: the sentences the chat path emits verbatim in any
+/// locale, then the phrasings a model produces. Matching is on a normalized
+/// substring so a trailing clause ("… Add a source to continue.") does not
+/// defeat it.
 #[must_use]
 pub fn reads_as_abstention(text: &str) -> bool {
     let normalized = text.trim().to_lowercase();
-    ABSTENTION_MARKERS
+    crate::llm::fallbacks::FALLBACK_TEXTS
         .iter()
-        .any(|marker| normalized.contains(marker))
+        .any(|sentence| normalized.contains(&sentence.to_lowercase()))
+        || ABSTENTION_MARKERS
+            .iter()
+            .any(|marker| normalized.contains(marker))
 }
 
 fn score_case(

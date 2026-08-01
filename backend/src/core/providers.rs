@@ -339,18 +339,20 @@ impl EmbeddingProvider for DeterministicEmbedder {
 // Deterministic LLM
 // ============================================================================
 
-/// Opening tag of a retrieved chunk in the RAG system prompt.
+/// Delimiters of a retrieved chunk's text in the RAG system prompt.
 ///
 /// The deterministic provider reads the corpus out of the prompt so its answer
 /// depends on what was ingested. A fixture that answered the same thing
 /// regardless would let a smoke path pass against an empty index.
 ///
-/// It tracks `format_context_for_llm`, which is the only producer of this
-/// shape. `answer_for` degrades to "no source" rather than panicking if the
-/// two ever drift, and the smoke path fails on the missing citation — loudly,
-/// which is the point.
-const SOURCE_OPEN: &str = "<source ";
-const SOURCE_CLOSE: &str = "</source>";
+/// They track `format_context_for_llm`, which is the only producer of this
+/// shape: since US-020 provenance is carried by the `<source>` attributes and
+/// the document's own bytes live inside `<content>`, so quoting the element
+/// would quote the markup. `answer_for` degrades to "no source" rather than
+/// panicking if the two ever drift, and the smoke path fails on the missing
+/// citation — loudly, which is the point.
+const CONTENT_OPEN: &str = "<content>";
+const CONTENT_CLOSE: &str = "</content>";
 
 /// Longest snippet the deterministic provider quotes back.
 const SNIPPET_CHARS: usize = 240;
@@ -389,12 +391,11 @@ impl DeterministicLlm {
     }
 }
 
-/// Text of the first `<source>` element in the RAG context, unescaped.
+/// Text of the first retrieved chunk in the RAG context, unescaped.
 fn first_source_text(system_prompt: &str) -> Option<String> {
-    let open = system_prompt.find(SOURCE_OPEN)?;
-    // Skip the attribute list: content starts after the tag closes.
-    let content_start = open + system_prompt[open..].find('>')? + 1;
-    let content_end = content_start + system_prompt[content_start..].find(SOURCE_CLOSE)?;
+    let open = system_prompt.find(CONTENT_OPEN)?;
+    let content_start = open + CONTENT_OPEN.len();
+    let content_end = content_start + system_prompt[content_start..].find(CONTENT_CLOSE)?;
 
     let raw = system_prompt[content_start..content_end].trim();
     // `format_context_for_llm` escapes the five XML entities; undo them so the
@@ -539,16 +540,29 @@ mod tests {
     /// against an invented shape is how the first end-to-end run found this
     /// provider answering "no source" over a populated index.
     fn rag_prompt(chunks: &[&str]) -> String {
-        let mut s = String::from("You are a helpful assistant.\n\n<sources>\n");
-        for (i, c) in chunks.iter().enumerate() {
-            s.push_str(&format!(
-                "<source index=\"{}\" source_id=\"11111111-1111-4111-8111-111111111111\" \
-                 title=\"Notes\">\n{c}\n</source>\n\n",
-                i + 1
-            ));
-        }
-        s.push_str("</sources>");
-        s
+        use crate::services::rag::search::format_context_for_llm;
+        use crate::types::{RetrievalScore, SearchResult};
+
+        let results: Vec<SearchResult> = chunks
+            .iter()
+            .enumerate()
+            .map(|(i, c)| SearchResult {
+                chunk_id: uuid::Uuid::nil(),
+                generation_id: uuid::Uuid::nil(),
+                source_id: uuid::Uuid::nil(),
+                source_title: "Notes".to_owned(),
+                chunk_index: i32::try_from(i).unwrap_or(0),
+                content: (*c).to_owned(),
+                parent_content: None,
+                score: RetrievalScore::Rrf(1.0),
+                metadata: None,
+                collapsed_children: Vec::new(),
+            })
+            .collect();
+        format!(
+            "You are a helpful assistant.\n\n{}",
+            format_context_for_llm(&results)
+        )
     }
 
     #[test]
@@ -564,7 +578,7 @@ mod tests {
             "must not reach past chunk 1: {answer}"
         );
         assert!(
-            !answer.contains("<source"),
+            !answer.contains("<source") && !answer.contains("<content"),
             "must not quote the markup: {answer}"
         );
     }
@@ -576,7 +590,9 @@ mod tests {
 
     #[test]
     fn escaped_entities_are_restored_in_the_quote() {
-        let prompt = rag_prompt(&["Use &lt;source&gt; tags &amp; nothing else."]);
+        // The renderer escapes these five characters on the way in; the quote
+        // has to read as the document wrote them.
+        let prompt = rag_prompt(&["Use <source> tags & nothing else."]);
         let answer = DeterministicLlm::answer_for(&prompt);
         assert!(
             answer.contains("Use <source> tags & nothing else."),
@@ -599,8 +615,10 @@ mod tests {
     }
 
     #[test]
-    fn an_unterminated_source_element_produces_no_citation() {
-        let answer = DeterministicLlm::answer_for("<sources>\n<source index=\"1\">dangling");
+    fn an_unterminated_content_element_produces_no_citation() {
+        let answer = DeterministicLlm::answer_for(
+            "<untrusted_source_data>\n<source index=\"1\">\n<content>\ndangling",
+        );
         assert!(!answer.contains("[1]"), "{answer}");
     }
 

@@ -217,9 +217,9 @@ const SEED_SENTENCES: &[&str] = &[
 async fn database_latency_baseline() {
     use openbooklm::core::config::DatabasePoolConfig;
     use openbooklm::repositories::{
-        ChunkRepository, GenerationRepository, NotebookRepository, SeaOrmChunkRepository,
-        SeaOrmGenerationRepository, SeaOrmNotebookRepository, SeaOrmSearchRepository,
-        SeaOrmSourceRepository, SearchRepository, SourceRepository,
+        ChunkRepository, GenerationRepository, NotebookRepository, NotebookScope,
+        SeaOrmChunkRepository, SeaOrmGenerationRepository, SeaOrmNotebookRepository,
+        SeaOrmSearchRepository, SeaOrmSourceRepository, SearchRepository, SourceRepository,
     };
     use openbooklm::services::rag::provenance::{
         ChunkingProvenance, EmbeddingProvenance, GenerationProvenance, Normalization,
@@ -348,7 +348,7 @@ async fn database_latency_baseline() {
     // Fail loudly rather than record a meaningless number: a lexical baseline
     // over an empty result set is not a baseline.
     let hits = search
-        .search_lexical_chunks(notebook_id, "retrieval", 15)
+        .search_lexical_chunks(NotebookScope::new(user_id, notebook_id), "retrieval", 15)
         .await
         .expect("lexical search");
     assert!(
@@ -373,7 +373,7 @@ async fn database_latency_baseline() {
 
     let lexical = measure_async("lexical_search", || async {
         search
-            .search_lexical_chunks(notebook_id, "retrieval", 15)
+            .search_lexical_chunks(NotebookScope::new(user_id, notebook_id), "retrieval", 15)
             .await
             .expect("lexical search");
     })

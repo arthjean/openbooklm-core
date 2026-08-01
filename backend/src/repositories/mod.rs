@@ -23,8 +23,9 @@ pub use traits::{
     AccountRepository, AccountSettingsRepository, ChatRepository, ChunkRepository,
     ChunkSearchResult, ChunkWithContext, DEFAULT_CHAT_HISTORY_LIMIT, GenerationRepository,
     MAX_CHAT_HISTORY_LIMIT, MemoryRepository, MemorySearchResult, NoteRepository,
-    NotebookRepository, NotebookWithSourceCount, OcrCacheRepository, PaginatedChatHistory,
-    PublicationOutcome, RagLogRepository, RepoResult, SearchRepository, SourceRepository,
+    NotebookRepository, NotebookScope, NotebookWithSourceCount, OcrCacheRepository,
+    PaginatedChatHistory, PublicationOutcome, RagLogRepository, RepoResult, SearchRepository,
+    SourceRepository,
 };
 
 // Re-export the filtered-scan strategy: it is how this layer reads vectors, and

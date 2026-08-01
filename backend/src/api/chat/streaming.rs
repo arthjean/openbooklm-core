@@ -23,14 +23,16 @@ use crate::core::events::{DomainEvent, SharedEventSink};
 use crate::core::principal::Principal;
 use crate::core::protocol::{ChatEvent, ChatEventStream};
 use crate::error::AppError;
-use crate::llm::{CitableChunk, LlmProvider, LlmStreamEvent, TeachingMode, extract_citations};
+use crate::llm::citations::{extract_citations, extract_citations_verified};
+use crate::llm::types::ChunkProvenance;
+use crate::llm::{CitableChunk, LlmProvider, LlmStreamEvent, TeachingMode};
 use crate::repositories::{ChatRepository, MemoryRepository, RagLogRepository, SourceRepository};
 use crate::services::chat::{CreateMessageParams, create_message};
 use crate::services::memory::{
     MIN_DROPPED_FOR_SUMMARY, apply_memory_actions, decay_memories, extract_memories,
     store_conversation_summary, summarize_truncated_history,
 };
-use crate::services::rag::eval::trace::{ReasonCode, RetrievalTrace, StageDurations};
+use crate::services::rag::eval::trace::{ReasonCode, RetrievalTrace, StageDurations, TokenCounts};
 use crate::services::rag::rag_log::{ChunkLogEntry, RagLogEntry, create_rag_log};
 use crate::services::rag::search::{PipelineOutcome, mean_relevance};
 use crate::types::MemoryDecayTracker;
@@ -81,6 +83,12 @@ pub(super) struct StreamContext {
     /// What the RAG pipeline produced besides the contexts: timings, per-stage
     /// candidate counts, reason codes and the score domain that ordered them.
     pub rag_outcome: PipelineOutcome,
+    /// Evidence tokens the budgeting pass selected and dropped (US-018 AC-4).
+    ///
+    /// Measured where the decision was made. Recomputing it here could only
+    /// describe what survived, which is the half of the number that never
+    /// explains a truncated answer.
+    pub evidence_tokens: TokenCounts,
     /// The standalone query retrieval used, when reformulation changed it.
     /// Reaches the trace as a hash and is never logged as text.
     pub reformulated_query: Option<String>,
@@ -135,6 +143,7 @@ pub(super) async fn stream_llm_response(
         user_question,
         locale,
         rag_outcome,
+        evidence_tokens,
         reformulated_query,
         memory_enabled,
         embeddings,
@@ -321,23 +330,8 @@ pub(super) async fn stream_llm_response(
         }
     }
 
-    // Emit the per-request retrieval trace (US-004). This replaces the timing
-    // summary that used to live here: the timings are still in it, alongside the
-    // stage counts, score domain and reason codes that make a latency number
-    // interpretable — and without the query text the old log did not carry
-    // either, which the type now makes impossible to add back.
-    build_retrieval_trace(
-        notebook_id,
-        &user_question,
-        reformulated_query.as_deref(),
-        &context_chunks,
-        &rag_outcome,
-        llm_ttft_ms.unwrap_or(0),
-    )
-    .emit();
-
     // Extract citations: native (Anthropic Citations API) or regex-based [N] fallback.
-    let citations = resolve_citations(
+    let resolved = resolve_citations(
         out,
         uses_native_citations,
         &native_citations,
@@ -347,6 +341,24 @@ pub(super) async fn stream_llm_response(
         notebook_id,
     )
     .await;
+    let citations = resolved.citations;
+
+    // Emit the per-request retrieval trace (US-004), after citation resolution
+    // so that a refused marker is part of the record. The timings are in it
+    // alongside the stage counts, score domain and reason codes that make a
+    // latency number interpretable — and without the query text the old log did
+    // not carry either, which the type now makes impossible to add back.
+    build_retrieval_trace(
+        notebook_id,
+        &user_question,
+        reformulated_query.as_deref(),
+        &context_chunks,
+        &rag_outcome,
+        evidence_tokens,
+        resolved.rejected,
+        llm_ttft_ms.unwrap_or(0),
+    )
+    .emit();
 
     out.emit(ChatEvent::citations(citations.clone())).await;
 
@@ -461,12 +473,15 @@ pub(super) async fn stream_llm_response(
 /// Split out of the streaming function so it can be tested directly: the
 /// property that matters — that nothing here can carry source text or the user's
 /// question — is worth an assertion, and an assertion needs a seam.
+#[allow(clippy::too_many_arguments)] // one record, assembled from one turn
 fn build_retrieval_trace(
     notebook_id: Uuid,
     query: &str,
     reformulated: Option<&str>,
     context_chunks: &[SearchResult],
     outcome: &PipelineOutcome,
+    evidence_tokens: TokenCounts,
+    rejected_citations: usize,
     llm_ttft_ms: u128,
 ) -> RetrievalTrace {
     // The domain comes from the pipeline rather than being guessed from the
@@ -492,12 +507,11 @@ fn build_retrieval_trace(
     // stage a recall regression did *not* happen in (US-004).
     trace.candidates = outcome.counts;
     trace.unique_parents = outcome.unique_parents;
-    trace.tokens.selected = context_chunks
-        .iter()
-        .map(|c| {
-            crate::llm::budget::estimate_tokens(c.parent_content.as_deref().unwrap_or(&c.content))
-        })
-        .sum();
+    // Both halves come from the budgeting pass. "How much evidence reached the
+    // model" and "how much was cut to make it fit" are the pair that explains a
+    // thin answer, and only the pass that made the cut knows the second
+    // (US-018 AC-4).
+    trace.tokens = evidence_tokens;
 
     let ms = |value: u128| u64::try_from(value).unwrap_or(u64::MAX);
     trace.durations = StageDurations {
@@ -515,6 +529,9 @@ fn build_retrieval_trace(
     trace.reasons.extend(&outcome.reasons);
     if context_chunks.is_empty() {
         trace.reasons.insert(ReasonCode::NoCandidates);
+    }
+    if rejected_citations > 0 {
+        trace.reasons.insert(ReasonCode::CitationRejected);
     }
     trace.finish();
     trace
@@ -564,6 +581,9 @@ pub(super) fn chat_error_type(error: &AppError) -> &'static str {
 // ============================================================================
 
 /// Resolve citations from native (Anthropic Citations API) or regex-based extraction.
+///
+/// Both paths emit a citation only for evidence that was retrieved this turn,
+/// and both count what they refuse (US-019 AC-5).
 async fn resolve_citations(
     out: &ChatEventStream,
     uses_native_citations: bool,
@@ -572,46 +592,61 @@ async fn resolve_citations(
     context_chunks: &[SearchResult],
     full_response: &str,
     notebook_id: Uuid,
-) -> Vec<crate::llm::Citation> {
+) -> crate::llm::citations::ExtractedCitations {
     if uses_native_citations && !native_citations.is_empty() {
         let mut seen_doc_indices = HashSet::new();
+        let mut rejected = 0usize;
         let mapped: Vec<crate::llm::Citation> = native_citations
             .iter()
             .filter(|nc| seen_doc_indices.insert(nc.document_index))
             .filter_map(|nc| {
-                rag_documents.get(nc.document_index).map(|doc| {
-                    let source_id = doc.source_id;
-                    let meta = doc.metadata.as_ref();
-                    crate::llm::Citation {
-                        source_id,
-                        chunk_index: doc.chunk_index,
-                        text: crate::llm::citations::truncate_text(&nc.cited_text, 200)
-                            .into_owned(),
-                        relevance_score: doc.relevance_score,
-                        section_header: meta
-                            .and_then(|m| m.get("section_header"))
-                            .and_then(|v| v.as_str())
-                            .map(String::from),
-                        page_number: meta
-                            .and_then(|m| m.get("page_number"))
-                            .and_then(|v| v.as_u64())
-                            .and_then(|v| u32::try_from(v).ok()),
-                        timestamp_start: meta
-                            .and_then(|m| m.get("timestamp_start"))
-                            .and_then(|v| v.as_f64()),
-                        timestamp_end: meta
-                            .and_then(|m| m.get("timestamp_end"))
-                            .and_then(|v| v.as_f64()),
-                        video_id: meta
-                            .and_then(|m| m.get("video_id"))
-                            .and_then(|v| v.as_str())
-                            .map(String::from),
-                        citation_url: meta
-                            .and_then(|m| m.get("citation_url"))
-                            .and_then(|v| v.as_str())
-                            .map(String::from),
-                    }
-                })
+                // A document index the request never sent, or a quote the
+                // document does not contain, is a citation pointing at nothing.
+                let Some(doc) = rag_documents.get(nc.document_index) else {
+                    rejected += 1;
+                    tracing::warn!(
+                        %notebook_id,
+                        document_index = nc.document_index,
+                        available = rag_documents.len(),
+                        reason = ReasonCode::CitationRejected.as_str(),
+                        "Native citation names a document that was not sent"
+                    );
+                    return None;
+                };
+                if !crate::llm::citations::quote_belongs_to(&doc.content, &nc.cited_text) {
+                    rejected += 1;
+                    tracing::warn!(
+                        %notebook_id,
+                        document_index = nc.document_index,
+                        source_id = %doc.source_id,
+                        reason = ReasonCode::CitationRejected.as_str(),
+                        "Native citation quotes a span the document does not contain"
+                    );
+                    return None;
+                }
+                // The same span check the regex path applies: a chunk whose
+                // recorded passage cannot exist was not written by the chunker,
+                // and a citation into it opens nothing (US-019 AC-3).
+                let provenance = ChunkProvenance::read(doc.metadata.as_ref());
+                if !provenance.is_coherent() {
+                    rejected += 1;
+                    tracing::warn!(
+                        %notebook_id,
+                        document_index = nc.document_index,
+                        source_id = %doc.source_id,
+                        reason = ReasonCode::CitationRejected.as_str(),
+                        "Native citation resolves to a document with an incoherent span"
+                    );
+                    return None;
+                }
+
+                Some(crate::llm::Citation::new(
+                    doc.source_id,
+                    doc.chunk_index,
+                    crate::llm::citations::truncate_text(&nc.cited_text, 200).into_owned(),
+                    doc.relevance_score,
+                    provenance,
+                ))
             })
             .collect();
 
@@ -624,16 +659,21 @@ async fn resolve_citations(
             %notebook_id,
             native_count = native_citations.len(),
             deduped = mapped.len(),
+            rejected,
             "Native citation mapping completed (Anthropic Citations API)"
         );
-        mapped
+        crate::llm::citations::ExtractedCitations {
+            citations: mapped,
+            rejected,
+        }
     } else {
         let citable: Vec<CitableChunk> = context_chunks.iter().map(CitableChunk::from).collect();
-        let extracted = extract_citations(full_response, &citable);
+        let extracted = extract_citations_verified(full_response, &citable);
         tracing::info!(
             %notebook_id,
             context_chunks = context_chunks.len(),
-            citations = extracted.len(),
+            citations = extracted.citations.len(),
+            rejected = extracted.rejected,
             response_len = full_response.len(),
             "Regex citation extraction completed"
         );
@@ -1535,6 +1575,11 @@ mod tests {
                 reasons: [ReasonCode::DedupShortfall].into_iter().collect(),
                 ..outcome(3, 2)
             },
+            TokenCounts {
+                selected: 512,
+                dropped: 128,
+            },
+            0,
             100,
         );
 
@@ -1543,7 +1588,14 @@ mod tests {
         assert_eq!(trace.score_domain, Some(crate::types::ScoreDomain::RrfRank));
         assert_eq!(trace.candidates.selected, 3);
         assert_eq!(trace.unique_parents, 2, "two children share one parent");
-        assert!(trace.tokens.selected > 0);
+        assert_eq!(
+            trace.tokens.selected, 512,
+            "the selected count comes from the budgeting pass"
+        );
+        assert_eq!(
+            trace.tokens.dropped, 128,
+            "and so does what the budget cut, which is the half that explains a thin answer"
+        );
         assert_eq!(trace.durations.embed_ms, 12);
         assert_eq!(trace.durations.search_ms, 30);
         assert_eq!(trace.durations.rerank_ms, 40);
@@ -1567,6 +1619,8 @@ mod tests {
                 "the child passage",
             )],
             &outcome(1, 1),
+            TokenCounts::default(),
+            0,
             0,
         );
         let rendered = serde_json::to_string(&trace).expect("trace serializes");
@@ -1598,6 +1652,8 @@ mod tests {
                 reasons: [ReasonCode::StuffingApplied].into_iter().collect(),
                 ..outcome(1, 1)
             },
+            TokenCounts::default(),
+            0,
             0,
         );
         assert_eq!(
@@ -1617,6 +1673,8 @@ mod tests {
             None,
             &[],
             &PipelineOutcome::default(),
+            TokenCounts::default(),
+            0,
             0,
         );
         assert_eq!(trace.candidates.selected, 0);

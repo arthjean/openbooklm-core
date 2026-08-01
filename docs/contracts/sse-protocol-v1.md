@@ -57,13 +57,35 @@ disconnected client starts a new exchange.
   timeout (5 s) in time-to-`done`; before US-009 suggestions arrived after
   `done` and any client honoring the documented contract never saw them.
 - `error` is unconditionally terminal. The response-size-limit path emits
-  `error` and stops; it no longer appends `done`.
+  `error` and stops; it no longer appends `done`. Since US-018 and US-020 two
+  more conditions take the same path:
+
+  - Retrieval itself did not run: provider, database, or no embedding provider
+    configured.
+  - The request could not be measured against the model's context window: the
+    window is not declared by this build, or the instructions and the question
+    alone overflow it.
+
+  Both end the turn with `error` and generate nothing. They are *not* answered
+  with an abstention: the sources are fine in both cases, and telling the user
+  otherwise would be a false statement about their notebook, one that would also
+  let a broken deployment report a completed chat for every turn. Event names,
+  payloads and ordering are unchanged; only the set of conditions reaching the
+  terminal error grew, which is why `v1` still holds.
 - `shutdown` replaces `done` when graceful shutdown interrupts a live stream.
   The partial answer is persisted with a `[server shutdown]` marker. It is
   distinct from `error` so a client can offer a retry rather than report a
   provider failure.
 - Absence of any terminal event means the connection dropped. Treat it as a
   failure, not as success.
+
+- **A turn can end normally without a provider call.** An empty notebook and a
+  retrieval that returned nothing relevant are answered with a documented
+  sentence rather than by a model (US-020). Such a turn emits the same sequence
+  a generated one does — `chunk`, `citations`, `metrics`, `done` — and consumes
+  no message quota. Clients need no change: an answer is an answer. The sentence
+  is written in the caller's locale; the full table is
+  `llm::fallbacks::FALLBACK_TEXTS`.
 
 ### Optionality
 

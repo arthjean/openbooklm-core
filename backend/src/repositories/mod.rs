@@ -20,12 +20,12 @@ mod traits;
 
 // Re-export traits and types
 pub use traits::{
-    AccountRepository, AccountSettingsRepository, ChatRepository, ChunkRepository,
-    ChunkSearchResult, ChunkWithContext, DEFAULT_CHAT_HISTORY_LIMIT, GenerationRepository,
-    HybridChunkSearchResult, MAX_CHAT_HISTORY_LIMIT, MemoryRepository, MemorySearchResult,
-    NoteRepository, NotebookRepository, NotebookScope, NotebookWithSourceCount, OcrCacheRepository,
-    PaginatedChatHistory, PublicationOutcome, RagLogRepository, RepoResult, SearchRepository,
-    SourceRepository,
+    AccountRepository, AccountSettingsRepository, ActiveGenerationLease, ChatRepository,
+    ChunkRepository, ChunkSearchResult, ChunkWithContext, DEFAULT_CHAT_HISTORY_LIMIT,
+    GenerationRepository, HybridChunkSearchResult, MAX_CHAT_HISTORY_LIMIT, MemoryRepository,
+    MemorySearchResult, NoteRepository, NotebookRepository, NotebookScope, NotebookWithSourceCount,
+    OcrCacheRepository, PaginatedChatHistory, PublicationOutcome, RagLogRepository, RepoResult,
+    SearchRepository, SourceRepository,
 };
 
 // Re-export the filtered-scan strategy: it is how this layer reads vectors, and

@@ -126,6 +126,8 @@ generation, a claim without lexical support in the cited passage, a
 provider-native quote the document does not contain, and a marker written inside
 a code fence. Refusals are counted and reach the trace as `citation_rejected`,
 so a regression appears as refusals rather than as silently lower coverage.
+The active source row stays locked through event enqueue. Partial responses
+persist no citations because they never reach this validation boundary.
 
 ### Abstention
 

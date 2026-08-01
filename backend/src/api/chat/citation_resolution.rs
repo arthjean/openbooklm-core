@@ -14,7 +14,7 @@ use crate::llm::citations::{
     claim_is_supported_by, extract_citations_verified_against_active, find_code_ranges,
 };
 use crate::llm::types::ChunkProvenance;
-use crate::repositories::SourceRepository;
+use crate::repositories::{ActiveGenerationLease, SourceRepository};
 use crate::services::rag::eval::trace::ReasonCode;
 use crate::types::SearchResult;
 
@@ -79,9 +79,6 @@ async fn resolve_native(
         .iter()
         .zip(input.native_marker_starts.iter().copied())
     {
-        if seen_doc_indices.contains(&native.document_index) {
-            continue;
-        }
         let Some(document) = input.rag_documents.get(native.document_index) else {
             rejected += 1;
             continue;
@@ -94,25 +91,12 @@ async fn resolve_native(
             .iter()
             .any(|&(start, end)| marker_start >= start && marker_start < end);
         let provenance = ChunkProvenance::read(document.metadata.as_ref());
-        let current = generation_is_active(
-            source_repo,
-            input.notebook_id,
-            document.source_id,
-            document.generation_id,
-        )
-        .await;
-        if !current
-            || !quote_owned
-            || !claim_linked
-            || !marker_outside_code
-            || !provenance.is_coherent()
-        {
+        if !quote_owned || !claim_linked || !marker_outside_code || !provenance.is_coherent() {
             rejected += 1;
             tracing::warn!(
                 notebook_id = %input.notebook_id,
                 document_index = native.document_index,
                 source_id = %document.source_id,
-                generation_current = current,
                 quote_owned,
                 claim_linked,
                 marker_outside_code,
@@ -122,8 +106,22 @@ async fn resolve_native(
             );
             continue;
         }
+        let Some(lease) = lock_active_generation(
+            source_repo,
+            input.notebook_id,
+            document.source_id,
+            document.generation_id,
+        )
+        .await
+        else {
+            rejected += 1;
+            continue;
+        };
 
-        seen_doc_indices.insert(native.document_index);
+        if !seen_doc_indices.insert(native.document_index) {
+            release_lease(lease, input.notebook_id, document.source_id).await;
+            continue;
+        }
         let citation = crate::llm::Citation::new(
             document.source_id,
             document.chunk_index,
@@ -135,6 +133,7 @@ async fn resolve_native(
             out.emit(ChatEvent::citation(*number, citation.source_id))
                 .await;
         }
+        release_lease(lease, input.notebook_id, document.source_id).await;
         mapped.push(citation);
     }
 
@@ -172,7 +171,7 @@ async fn resolve_prompt_markers(
     for citation in extracted.citations {
         if let Some((index, chunk)) = input.context_chunks.iter().enumerate().find(|(_, chunk)| {
             chunk.source_id == citation.source_id && chunk.chunk_index == citation.chunk_index
-        }) && generation_is_active(
+        }) && let Some(lease) = lock_active_generation(
             source_repo,
             input.notebook_id,
             chunk.source_id,
@@ -182,6 +181,7 @@ async fn resolve_prompt_markers(
         {
             out.emit(ChatEvent::citation(index + 1, citation.source_id))
                 .await;
+            release_lease(lease, input.notebook_id, chunk.source_id).await;
             citations.push(citation);
         } else {
             rejected += 1;
@@ -201,17 +201,27 @@ async fn resolve_prompt_markers(
     }
 }
 
-async fn generation_is_active(
+async fn lock_active_generation(
     source_repo: &dyn SourceRepository,
     notebook_id: Uuid,
     source_id: Uuid,
     generation_id: Uuid,
-) -> bool {
+) -> Option<ActiveGenerationLease> {
     match source_repo
-        .generation_is_active(source_id, generation_id)
+        .lock_active_generation(source_id, generation_id)
         .await
     {
-        Ok(current) => current,
+        Ok(Some(lease)) => Some(lease),
+        Ok(None) => {
+            tracing::warn!(
+                %notebook_id,
+                %source_id,
+                %generation_id,
+                reason = ReasonCode::CitationRejected.as_str(),
+                "Citation generation is no longer active"
+            );
+            None
+        }
         Err(error) => {
             tracing::warn!(
                 %notebook_id,
@@ -221,7 +231,19 @@ async fn generation_is_active(
                 reason = ReasonCode::CitationRejected.as_str(),
                 "Citation active-generation check failed"
             );
-            false
+            None
         }
+    }
+}
+
+async fn release_lease(lease: ActiveGenerationLease, notebook_id: Uuid, source_id: Uuid) {
+    if let Err(error) = lease.release().await {
+        tracing::warn!(
+            %notebook_id,
+            %source_id,
+            error = %error,
+            reason = ReasonCode::CitationRejected.as_str(),
+            "Citation generation lease release failed after event enqueue"
+        );
     }
 }

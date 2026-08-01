@@ -325,6 +325,7 @@ pub const CHAT_EVENT_BUFFER: usize = 100;
 pub struct ChatEventStream {
     tx: mpsc::Sender<ChatEvent>,
     terminated: AtomicBool,
+    generation_finished: AtomicBool,
 }
 
 impl ChatEventStream {
@@ -333,6 +334,7 @@ impl ChatEventStream {
         Self {
             tx,
             terminated: AtomicBool::new(false),
+            generation_finished: AtomicBool::new(false),
         }
     }
 
@@ -346,6 +348,16 @@ impl ChatEventStream {
     /// Emit an event. Returns `false` when the event was dropped because the
     /// client is gone or the stream already terminated.
     pub async fn emit(&self, event: ChatEvent) -> bool {
+        if matches!(event, ChatEvent::Citation(_))
+            && !self.generation_finished.load(Ordering::SeqCst)
+        {
+            tracing::warn!("Dropped citation event before generation finished");
+            return false;
+        }
+        if matches!(event, ChatEvent::Chunk(_)) && self.generation_finished.load(Ordering::SeqCst) {
+            tracing::warn!("Dropped text chunk after citation validation started");
+            return false;
+        }
         if event.is_terminal() {
             // `swap` makes the first terminal event win even if two failure
             // paths race: the loser is dropped rather than appended.
@@ -368,6 +380,11 @@ impl ChatEventStream {
             return false;
         }
         self.tx.send(event).await.is_ok()
+    }
+
+    /// Close the text phase and allow validated per-citation events.
+    pub fn finish_generation(&self) {
+        self.generation_finished.store(true, Ordering::SeqCst);
     }
 
     /// Whether the client has disconnected.
@@ -455,6 +472,19 @@ mod tests {
         assert!(!stream.emit(ChatEvent::chunk("late")).await);
         assert!(stream.is_terminated());
         assert_eq!(drain(&mut rx), vec!["done"]);
+    }
+
+    #[tokio::test]
+    async fn citation_events_are_allowed_only_after_the_text_phase() {
+        let (stream, mut rx) = ChatEventStream::channel();
+        let source_id = Uuid::new_v4();
+        assert!(stream.emit(ChatEvent::chunk("answer [1]")).await);
+        assert!(!stream.emit(ChatEvent::citation(1, source_id)).await);
+
+        stream.finish_generation();
+        assert!(stream.emit(ChatEvent::citation(1, source_id)).await);
+        assert!(!stream.emit(ChatEvent::chunk("late text")).await);
+        assert_eq!(drain(&mut rx), vec!["chunk", "citation"]);
     }
 
     #[tokio::test]

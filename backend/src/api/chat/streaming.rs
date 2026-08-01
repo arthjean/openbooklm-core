@@ -3,8 +3,8 @@
 //! Contains the streaming loop, cancellation handling, and the
 //! `CancellableStream` wrapper that cleans up when clients disconnect.
 
+use std::collections::HashMap;
 use std::collections::HashSet;
-use std::fmt::Write;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -23,8 +23,7 @@ use crate::core::events::{DomainEvent, SharedEventSink};
 use crate::core::principal::Principal;
 use crate::core::protocol::{ChatEvent, ChatEventStream};
 use crate::error::AppError;
-use crate::llm::citations::extract_citations;
-use crate::llm::{CitableChunk, LlmProvider, LlmStreamEvent, TeachingMode};
+use crate::llm::{LlmProvider, LlmStreamEvent, TeachingMode};
 use crate::repositories::{ChatRepository, MemoryRepository, RagLogRepository, SourceRepository};
 use crate::services::chat::{CreateMessageParams, create_message};
 use crate::services::memory::{
@@ -202,15 +201,7 @@ pub(super) async fn stream_llm_response(
     let model_name = model.as_deref().unwrap_or_else(|| provider.default_model());
     let mut message_counted = false;
     let mut llm_ttft_ms: Option<u128> = None;
-    // Accumulate native citations from `NativeCitation` stream events.
-    let mut native_citations: Vec<crate::llm::NativeCitation> = Vec::new();
-    // Track document_index → citation number for native citation marker injection.
-    // When a native citation arrives, we inject `[N]` into the response text so the
-    // frontend sees the same inline markers as with prompt-based citations.
-    let mut doc_citation_map: std::collections::HashMap<usize, usize> =
-        std::collections::HashMap::new();
-    let mut processed_native_count: usize = 0;
-    let mut native_marker_starts: Vec<usize> = Vec::new();
+    let mut native_citations = NativeCitationStream::default();
 
     // Process stream with cancellation and shutdown support
     'stream: loop {
@@ -225,7 +216,7 @@ pub(super) async fn stream_llm_response(
                     "SSE stream cancelled by client"
                 );
                 if !full_response.is_empty() {
-                    save_partial_response(chat_repo.as_ref(), notebook_id, &full_response, &context_chunks, model_name, "[interrupted]", None, Some(session_id)).await;
+                    save_partial_response(chat_repo.as_ref(), notebook_id, &full_response, model_name, "[interrupted]", None, Some(session_id)).await;
                 }
                 return Ok(());
             }
@@ -239,7 +230,7 @@ pub(super) async fn stream_llm_response(
                 );
                 out.emit(ChatEvent::shutdown("Server shutting down")).await;
                 if !full_response.is_empty() {
-                    save_partial_response(chat_repo.as_ref(), notebook_id, &full_response, &context_chunks, model_name, "[server shutdown]", None, Some(session_id)).await;
+                    save_partial_response(chat_repo.as_ref(), notebook_id, &full_response, model_name, "[server shutdown]", None, Some(session_id)).await;
                 }
                 return Ok(());
             }
@@ -247,7 +238,13 @@ pub(super) async fn stream_llm_response(
             chunk = stream.next() => {
                 match chunk {
                     Some(Ok(bytes)) => {
-                        match process_chunk(&bytes, provider.as_ref(), &mut full_response, out, &mut native_citations).await? {
+                        match process_chunk(
+                            &bytes,
+                            provider.as_ref(),
+                            &mut full_response,
+                            out,
+                            uses_native_citations.then_some(&mut native_citations),
+                        ).await? {
                             ChunkResult::Continue => {
                                 // Record LLM TTFT on first text delta
                                 if llm_ttft_ms.is_none() && !full_response.is_empty() {
@@ -270,30 +267,6 @@ pub(super) async fn stream_llm_response(
                                         return Err(e);
                                     }
                                 }
-
-                                if uses_native_citations {
-                                    // Native citations: inject [N] markers into the response
-                                    // text based on NativeCitation events from the Anthropic
-                                    // Citations API. This produces the same inline markers
-                                    // that prompt-based citations do, so the frontend UX is
-                                    // identical regardless of the citation mechanism.
-                                    // Process any new native citations from this chunk.
-                                    while processed_native_count < native_citations.len() {
-                                        let nc = &native_citations[processed_native_count];
-                                        let next_num = doc_citation_map.len() + 1;
-                                        let number = *doc_citation_map
-                                            .entry(nc.document_index)
-                                            .or_insert(next_num);
-
-                                        // Inject [N] marker into response text and stream it
-                                        let marker_start = full_response.len();
-                                        native_marker_starts.push(marker_start);
-                                        write!(full_response, " [{number}]").expect("write to String");
-                                        out.emit(ChatEvent::chunk(&full_response[marker_start..])).await;
-
-                                        processed_native_count += 1;
-                                    }
-                                }
                             }
                             ChunkResult::Done => break 'stream,
                             ChunkResult::Truncated => {
@@ -303,7 +276,7 @@ pub(super) async fn stream_llm_response(
                                     max_size = MAX_RESPONSE_SIZE,
                                     "LLM response truncated: size limit exceeded"
                                 );
-                                save_partial_response(chat_repo.as_ref(), notebook_id, &full_response, &context_chunks, model_name, "[truncated]", None, Some(session_id)).await;
+                                save_partial_response(chat_repo.as_ref(), notebook_id, &full_response, model_name, "[truncated]", None, Some(session_id)).await;
                                 // `error` is terminal: no `done` follows it (US-009, D-007).
                                 out.emit(ChatEvent::error("Response size limit exceeded")).await;
                                 return Ok(());
@@ -317,14 +290,18 @@ pub(super) async fn stream_llm_response(
         }
     }
 
+    // This phase transition is enforced by ChatEventStream: individual
+    // citations cannot be emitted before it, and no text can follow it.
+    out.finish_generation();
+
     // Extract citations: native (Anthropic Citations API) or regex-based [N] fallback.
     let resolved = resolve_citations(
         out,
         &CitationResolution {
             uses_native_citations,
-            native_citations: &native_citations,
-            native_marker_starts: &native_marker_starts,
-            doc_citation_map: &doc_citation_map,
+            native_citations: &native_citations.citations,
+            native_marker_starts: &native_citations.marker_starts,
+            doc_citation_map: &native_citations.document_numbers,
             rag_documents: &rag_documents,
             context_chunks: &context_chunks,
             full_response: &full_response,
@@ -801,17 +778,24 @@ pub enum ChunkResult {
     Truncated,
 }
 
+#[derive(Default)]
+pub struct NativeCitationStream {
+    citations: Vec<crate::llm::NativeCitation>,
+    marker_starts: Vec<usize>,
+    document_numbers: HashMap<usize, usize>,
+}
+
 /// Process a chunk of bytes from the LLM stream.
 ///
-/// Native citations from the Anthropic Citations API are returned via the
-/// `native_citations_out` vec. The caller maps them to `Citation` structs
-/// using the `rag_documents` index.
+/// Native markers are injected while their events are parsed. This preserves
+/// their association with the preceding claim even when one network chunk
+/// contains several alternating text and citation events.
 pub async fn process_chunk(
     bytes: &[u8],
     provider: &dyn LlmProvider,
     full_response: &mut String,
     out: &ChatEventStream,
-    native_citations_out: &mut Vec<crate::llm::NativeCitation>,
+    mut native_citations: Option<&mut NativeCitationStream>,
 ) -> Result<ChunkResult, AppError> {
     let chunk_str = String::from_utf8_lossy(bytes);
 
@@ -837,7 +821,21 @@ pub async fn process_chunk(
                 out.emit(ChatEvent::chunk(text)).await;
             }
             LlmStreamEvent::NativeCitation { citation } => {
-                native_citations_out.push(citation);
+                if let Some(state) = native_citations.as_deref_mut() {
+                    let next_number = state.document_numbers.len() + 1;
+                    let number = *state
+                        .document_numbers
+                        .entry(citation.document_index)
+                        .or_insert(next_number);
+                    let marker = format!(" [{number}]");
+                    if full_response.len() + marker.len() > MAX_RESPONSE_SIZE {
+                        return Ok(ChunkResult::Truncated);
+                    }
+                    state.marker_starts.push(full_response.len());
+                    state.citations.push(citation);
+                    full_response.push_str(&marker);
+                    out.emit(ChatEvent::chunk(marker)).await;
+                }
             }
             LlmStreamEvent::Done => return Ok(ChunkResult::Done),
             LlmStreamEvent::Error { message } => {
@@ -853,26 +851,25 @@ pub async fn process_chunk(
 }
 
 /// Save partial response when stream is interrupted or truncated.
-#[allow(clippy::too_many_arguments)]
 async fn save_partial_response(
     chat_repo: &dyn ChatRepository,
     notebook_id: Uuid,
     response: &str,
-    context_chunks: &[SearchResult],
     model: &str,
     marker: &str,
     agent_id: Option<Uuid>,
     session_id: Option<Uuid>,
 ) {
-    let citable: Vec<CitableChunk> = context_chunks.iter().map(CitableChunk::from).collect();
-    let citations = extract_citations(response, &citable);
     let content = format!("{response} {marker}");
     let _ = create_message(CreateMessageParams {
         repo: chat_repo,
         notebook_id,
         role: "assistant",
         content: &content,
-        citations: &citations,
+        // A partial answer never reaches final active-generation and claim
+        // validation. Persisting no citations is safer than blessing markers
+        // whose association may itself have been interrupted.
+        citations: &[],
         model: Some(model),
         agent_id,
         session_id,
@@ -960,6 +957,12 @@ mod tests {
         fn done_line() -> Vec<u8> {
             b"data: {\"type\":\"done\"}\n".to_vec()
         }
+
+        fn citation_line(document_index: usize, cited_text: &str) -> String {
+            format!(
+                "data: {{\"type\":\"citation\",\"document_index\":{document_index},\"cited_text\":\"{cited_text}\"}}\n"
+            )
+        }
     }
 
     #[async_trait::async_trait]
@@ -978,6 +981,13 @@ mod tests {
             match v.get("type")?.as_str()? {
                 "text" => Some(LlmStreamEvent::TextDelta {
                     text: v.get("text")?.as_str()?.to_owned(),
+                }),
+                "citation" => Some(LlmStreamEvent::NativeCitation {
+                    citation: crate::llm::NativeCitation {
+                        document_index: v.get("document_index")?.as_u64()? as usize,
+                        cited_text: v.get("cited_text")?.as_str()?.to_owned(),
+                        document_title: String::new(),
+                    },
                 }),
                 "done" => Some(LlmStreamEvent::Done),
                 _ => None,
@@ -1007,7 +1017,7 @@ mod tests {
 
         // Send a chunk that would exceed the limit
         let bytes = MockProvider::text_delta_line(&"y".repeat(20));
-        let result = process_chunk(&bytes, &provider, &mut full_response, &out, &mut Vec::new())
+        let result = process_chunk(&bytes, &provider, &mut full_response, &out, None)
             .await
             .unwrap();
 
@@ -1026,7 +1036,7 @@ mod tests {
         let mut full_response = String::new();
 
         let bytes = MockProvider::text_delta_line("hello");
-        let result = process_chunk(&bytes, &provider, &mut full_response, &out, &mut Vec::new())
+        let result = process_chunk(&bytes, &provider, &mut full_response, &out, None)
             .await
             .unwrap();
 
@@ -1044,7 +1054,7 @@ mod tests {
         let mut full_response = String::new();
 
         let bytes = MockProvider::done_line();
-        let result = process_chunk(&bytes, &provider, &mut full_response, &out, &mut Vec::new())
+        let result = process_chunk(&bytes, &provider, &mut full_response, &out, None)
             .await
             .unwrap();
 
@@ -1052,6 +1062,43 @@ mod tests {
             matches!(result, ChunkResult::Done),
             "Expected Done on done event"
         );
+    }
+
+    #[tokio::test]
+    async fn native_markers_follow_provider_event_order_with_no_early_citation_event() {
+        let (out, mut rx) = ChatEventStream::channel();
+        let provider = MockProvider;
+        let mut full_response = String::new();
+        let mut native = NativeCitationStream::default();
+        let bytes = format!(
+            "{}{}{}{}",
+            String::from_utf8(MockProvider::text_delta_line("Claim A")).expect("text A"),
+            MockProvider::citation_line(0, "Claim A"),
+            String::from_utf8(MockProvider::text_delta_line(". Claim B")).expect("text B"),
+            MockProvider::citation_line(1, "Claim B"),
+        );
+
+        let result = process_chunk(
+            bytes.as_bytes(),
+            &provider,
+            &mut full_response,
+            &out,
+            Some(&mut native),
+        )
+        .await
+        .expect("process native events");
+
+        assert!(matches!(result, ChunkResult::Continue));
+        assert_eq!(full_response, "Claim A [1]. Claim B [2]");
+        assert_eq!(native.marker_starts, vec![7, 20]);
+        assert_eq!(native.citations.len(), 2);
+        for expected in ["Claim A", " [1]", ". Claim B", " [2]"] {
+            match rx.recv().await.expect("chunk event") {
+                ChatEvent::Chunk(chunk) => assert_eq!(chunk.text, expected),
+                event => panic!("citation validation must remain after streaming, got {event:?}"),
+            }
+        }
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -1245,11 +1292,9 @@ mod tests {
 
         // Feed 10 chunks of 10KB each = 100KB, all should succeed
         let chunk_10kb = "A".repeat(10_240);
-        let mut citations = Vec::new();
         for i in 0..10 {
             let bytes = MockProvider::text_delta_line(&chunk_10kb);
-            citations.clear();
-            let result = process_chunk(&bytes, &provider, &mut full_response, &out, &mut citations)
+            let result = process_chunk(&bytes, &provider, &mut full_response, &out, None)
                 .await
                 .unwrap();
             assert!(
@@ -1262,7 +1307,7 @@ mod tests {
 
         // The 11th chunk (even 1 byte) should trigger Truncated
         let bytes = MockProvider::text_delta_line("x");
-        let result = process_chunk(&bytes, &provider, &mut full_response, &out, &mut Vec::new())
+        let result = process_chunk(&bytes, &provider, &mut full_response, &out, None)
             .await
             .unwrap();
         assert!(
@@ -1298,11 +1343,9 @@ mod tests {
 
         // Feed in two halves: 50KB + 50KB
         let half = "B".repeat(MAX_RESPONSE_SIZE / 2);
-        let mut citations = Vec::new();
         for _ in 0..2 {
             let bytes = MockProvider::text_delta_line(&half);
-            citations.clear();
-            let result = process_chunk(&bytes, &provider, &mut full_response, &out, &mut citations)
+            let result = process_chunk(&bytes, &provider, &mut full_response, &out, None)
                 .await
                 .unwrap();
             assert!(
@@ -1328,11 +1371,9 @@ mod tests {
 
         // Feed 5 chunks of 1KB each = 5KB total (well under limit)
         let chunk_1kb = "C".repeat(1_024);
-        let mut citations = Vec::new();
         for _ in 0..5 {
             let bytes = MockProvider::text_delta_line(&chunk_1kb);
-            citations.clear();
-            let result = process_chunk(&bytes, &provider, &mut full_response, &out, &mut citations)
+            let result = process_chunk(&bytes, &provider, &mut full_response, &out, None)
                 .await
                 .unwrap();
             assert!(matches!(result, ChunkResult::Continue));
@@ -1342,7 +1383,7 @@ mod tests {
 
         // Send a done event — stream completes normally
         let bytes = MockProvider::done_line();
-        let result = process_chunk(&bytes, &provider, &mut full_response, &out, &mut Vec::new())
+        let result = process_chunk(&bytes, &provider, &mut full_response, &out, None)
             .await
             .unwrap();
         assert!(
@@ -1367,7 +1408,7 @@ mod tests {
         let mut full_response = String::new();
 
         let bytes = MockProvider::text_delta_line(&"Z".repeat(MAX_RESPONSE_SIZE + 1));
-        let result = process_chunk(&bytes, &provider, &mut full_response, &out, &mut Vec::new())
+        let result = process_chunk(&bytes, &provider, &mut full_response, &out, None)
             .await
             .unwrap();
 

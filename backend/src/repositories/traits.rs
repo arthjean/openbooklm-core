@@ -146,6 +146,26 @@ pub trait NotebookRepository: Send + Sync {
 // Source
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Source-row lock held across the enqueue of one validated citation event.
+///
+/// Publication updates the same source row, so it cannot move the active
+/// pointer between validation and event enqueue.
+#[must_use = "retain the lease until citation enqueue, then release it"]
+pub struct ActiveGenerationLease {
+    transaction: sea_orm::DatabaseTransaction,
+}
+
+impl ActiveGenerationLease {
+    pub(super) const fn new(transaction: sea_orm::DatabaseTransaction) -> Self {
+        Self { transaction }
+    }
+
+    pub async fn release(self) -> RepoResult<()> {
+        self.transaction.commit().await?;
+        Ok(())
+    }
+}
+
 #[async_trait]
 pub trait SourceRepository: Send + Sync {
     async fn create(
@@ -159,13 +179,15 @@ pub trait SourceRepository: Send + Sync {
 
     async fn get_by_id(&self, source_id: Uuid) -> RepoResult<Option<source::Model>>;
 
-    /// Linearization check used immediately before a citation is emitted.
-    async fn generation_is_active(&self, source_id: Uuid, generation_id: Uuid) -> RepoResult<bool> {
-        Ok(self
-            .get_by_id(source_id)
-            .await?
-            .is_some_and(|source| source.active_generation_id == Some(generation_id)))
-    }
+    /// Lock the source pointer when `generation_id` is active.
+    ///
+    /// The caller must retain the returned lease until its citation event has
+    /// been enqueued, then release it promptly.
+    async fn lock_active_generation(
+        &self,
+        source_id: Uuid,
+        generation_id: Uuid,
+    ) -> RepoResult<Option<ActiveGenerationLease>>;
 
     /// Returns error if source doesn't exist or user doesn't own it.
     async fn get_for_user(&self, source_id: Uuid, user_id: Uuid) -> RepoResult<source::Model>;

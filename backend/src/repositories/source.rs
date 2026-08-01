@@ -14,7 +14,14 @@ use crate::entities::{Notebook, Source, notebook};
 use crate::error::SourceError;
 use crate::types::SourceType;
 
-use super::traits::{RepoResult, SourceRepository};
+use super::traits::{ActiveGenerationLease, RepoResult, SourceRepository};
+
+const LOCK_ACTIVE_GENERATION_SQL: &str = r"
+    SELECT id
+    FROM sources
+    WHERE id = $1 AND active_generation_id = $2
+    FOR SHARE
+";
 
 #[derive(Clone)]
 pub struct SeaOrmSourceRepository {
@@ -74,12 +81,25 @@ impl SourceRepository for SeaOrmSourceRepository {
     }
 
     #[tracing::instrument(skip(self), fields(%source_id, %generation_id))]
-    async fn generation_is_active(&self, source_id: Uuid, generation_id: Uuid) -> RepoResult<bool> {
-        Ok(Source::find_by_id(source_id)
-            .filter(source::Column::ActiveGenerationId.eq(generation_id))
-            .one(&self.db)
+    async fn lock_active_generation(
+        &self,
+        source_id: Uuid,
+        generation_id: Uuid,
+    ) -> RepoResult<Option<ActiveGenerationLease>> {
+        let transaction = self.db.begin().await?;
+        let active = transaction
+            .query_one(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                LOCK_ACTIVE_GENERATION_SQL,
+                [source_id.into(), generation_id.into()],
+            ))
             .await?
-            .is_some())
+            .is_some();
+        if !active {
+            transaction.rollback().await?;
+            return Ok(None);
+        }
+        Ok(Some(ActiveGenerationLease::new(transaction)))
     }
 
     #[tracing::instrument(skip(self), fields(%source_id, %user_id))]

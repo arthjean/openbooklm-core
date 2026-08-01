@@ -112,10 +112,6 @@ fn extract_citations_with_active_generations(
         // Convert 1-indexed to 0-indexed
         let chunk_idx = index - 1;
 
-        if seen.contains(&chunk_idx) {
-            continue;
-        }
-
         // Skip out-of-bounds citations
         let Some(chunk) = context_chunks.get(chunk_idx) else {
             tracing::warn!(
@@ -177,7 +173,12 @@ fn extract_citations_with_active_generations(
             continue;
         }
 
-        seen.insert(chunk_idx);
+        // Validate every occurrence before deduplicating the public citation.
+        // A repeated marker attached to an unsupported claim is a rejection,
+        // even when an earlier occurrence of the same marker was valid.
+        if !seen.insert(chunk_idx) {
+            continue;
+        }
 
         citations.push(Citation::new(
             chunk.source_id,
@@ -252,7 +253,7 @@ pub fn claim_is_supported_by(marker_start: usize, response: &str, evidence: &str
         .iter()
         .filter(|token| evidence_tokens.contains(token.as_str()))
         .count();
-    let required = claim_tokens.len().div_ceil(2).clamp(1, 4);
+    let required = claim_tokens.len().saturating_mul(2).div_ceil(3).max(1);
     matched >= required
 }
 
@@ -278,6 +279,28 @@ fn is_number_token(token: &str) -> bool {
                 | "eight"
                 | "nine"
                 | "ten"
+                | "eleven"
+                | "twelve"
+                | "thirteen"
+                | "fourteen"
+                | "fifteen"
+                | "sixteen"
+                | "seventeen"
+                | "eighteen"
+                | "nineteen"
+                | "twenty"
+                | "thirty"
+                | "forty"
+                | "fifty"
+                | "sixty"
+                | "seventy"
+                | "eighty"
+                | "ninety"
+                | "hundred"
+                | "thousand"
+                | "million"
+                | "billion"
+                | "trillion"
                 | "zéro"
                 | "un"
                 | "deux"
@@ -288,6 +311,20 @@ fn is_number_token(token: &str) -> bool {
                 | "huit"
                 | "neuf"
                 | "dix"
+                | "onze"
+                | "douze"
+                | "treize"
+                | "quatorze"
+                | "quinze"
+                | "seize"
+                | "vingt"
+                | "trente"
+                | "quarante"
+                | "cinquante"
+                | "soixante"
+                | "cent"
+                | "mille"
+                | "milliard"
         )
 }
 
@@ -295,7 +332,9 @@ fn meaningful_tokens(text: &str) -> Vec<String> {
     text.split(|c: char| !c.is_alphanumeric())
         .filter_map(|raw| {
             let token = raw.to_lowercase();
-            (token.len() >= 2 && !is_stop_word(&token)).then_some(token)
+            ((token.len() >= 2 || token.chars().any(|c| c.is_ascii_digit()))
+                && !is_stop_word(&token))
+            .then_some(token)
         })
         .collect()
 }
@@ -343,7 +382,6 @@ fn is_stop_word(token: &str) -> bool {
             | "que"
             | "qui"
             | "sur"
-            | "un"
             | "une"
     )
 }
@@ -661,6 +699,41 @@ mod tests {
         );
         assert!(unsupported.citations.is_empty());
         assert_eq!(unsupported.rejected, 1);
+
+        let unsupported_digit = extract_citations_verified_against_active(
+            "The retry budget is 5 attempts [1].",
+            &[chunk.clone()],
+            &active,
+        );
+        assert!(unsupported_digit.citations.is_empty());
+        assert_eq!(unsupported_digit.rejected, 1);
+
+        chunk.content = "The retry budget is eleven attempts before failure.".to_owned();
+        let unsupported_large_number = extract_citations_verified_against_active(
+            "The retry budget is twelve attempts [1].",
+            &[chunk.clone()],
+            &active,
+        );
+        assert!(unsupported_large_number.citations.is_empty());
+        assert_eq!(unsupported_large_number.rejected, 1);
+
+        chunk.content = "The service stores retry budget policy in a queue.".to_owned();
+        let unsupported_long_claim = extract_citations_verified_against_active(
+            "The service stores retry budget while database replication permanently changes unrelated ownership semantics [1].",
+            &[chunk.clone()],
+            &active,
+        );
+        assert!(unsupported_long_claim.citations.is_empty());
+        assert_eq!(unsupported_long_claim.rejected, 1);
+
+        chunk.content = "The retry budget is four attempts before the job fails.".to_owned();
+        let repeated_unsupported = extract_citations_verified_against_active(
+            "The retry budget is four attempts [1]. It is five attempts [1].",
+            &[chunk.clone()],
+            &active,
+        );
+        assert_eq!(repeated_unsupported.citations.len(), 1);
+        assert_eq!(repeated_unsupported.rejected, 1);
 
         let wrong_polarity = extract_citations_verified_against_active(
             "The job does not fail after four attempts [1].",

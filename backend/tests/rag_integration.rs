@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, Statement};
+use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, Statement, TransactionTrait};
 use uuid::Uuid;
 
 use openbooklm::core::config::DatabasePoolConfig;
@@ -29,7 +29,8 @@ use openbooklm::core::providers::{EMBEDDING_DIM, EmbeddingProvider};
 use openbooklm::error::AppError;
 use openbooklm::repositories::{
     APPROVED_STRATEGY, ChunkRepository, GenerationRepository, NotebookScope, SeaOrmChunkRepository,
-    SeaOrmGenerationRepository, SeaOrmSearchRepository, SearchRepository, VectorCapabilities,
+    SeaOrmGenerationRepository, SeaOrmSearchRepository, SeaOrmSourceRepository, SearchRepository,
+    SourceRepository, VectorCapabilities,
 };
 use openbooklm::services::rag::provenance::{
     ChunkingProvenance, EmbeddingProvenance, GenerationProvenance, Normalization,
@@ -374,6 +375,66 @@ async fn a_reader_sees_the_old_generation_until_publication_commits() {
     f.cleanup().await;
 }
 
+/// A citation lease pins the source pointer until its event has been enqueued.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "Requires PostgreSQL with pgvector (TEST_DATABASE_URL)"]
+async fn an_active_generation_lease_blocks_pointer_publication() {
+    let f = fixture_or_skip!();
+    let source_id = f.create_source("citation lease").await;
+    let provenance = provenance("model-a");
+    let old_generation = f.publish_generation(source_id, "old", 2, &provenance).await;
+    let replacement = f
+        .generations
+        .claim(source_id, &provenance)
+        .await
+        .expect("claim")
+        .expect("claim wins");
+    let (chunks, embeddings) = synthetic_chunks("new", 2);
+    f.chunks
+        .store_chunks(replacement, source_id, &chunks, &embeddings)
+        .await
+        .expect("store replacement");
+    f.generations
+        .record_build_plan(replacement, 2, &provenance.chunking)
+        .await
+        .expect("record build plan");
+
+    let sources = SeaOrmSourceRepository::new(&f.db);
+    let lease = sources
+        .lock_active_generation(source_id, old_generation)
+        .await
+        .expect("lock active generation")
+        .expect("old generation is active");
+    let generations = f.generations.clone();
+    let mut publisher = tokio::spawn(async move {
+        generations
+            .publish(replacement, source_id, EMBEDDING_DIM)
+            .await
+    });
+    tokio::task::yield_now().await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut publisher)
+            .await
+            .is_err(),
+        "source pointer moved while a citation lease was live"
+    );
+
+    lease.release().await.expect("release citation lease");
+    let _published = publisher
+        .await
+        .expect("publisher join")
+        .expect("publish after citation enqueue");
+    assert!(
+        sources
+            .lock_active_generation(source_id, old_generation)
+            .await
+            .expect("check old generation")
+            .is_none(),
+        "superseded generation must no longer be leasable"
+    );
+    f.cleanup().await;
+}
+
 /// Publication is an immutability boundary, not merely a pointer update.
 #[tokio::test]
 #[ignore = "Requires PostgreSQL with pgvector (TEST_DATABASE_URL)"]
@@ -397,6 +458,68 @@ async fn a_published_generation_rejects_every_late_chunk_write() {
         "the rejection must name the immutable state: {error}"
     );
     assert_eq!(f.active_contents("generation").await, before);
+    f.cleanup().await;
+}
+
+/// Publication waits for a batch that was admitted while the generation was
+/// building, then closes the gate before moving the active pointer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "Requires PostgreSQL with pgvector (TEST_DATABASE_URL)"]
+async fn publication_waits_for_an_admitted_chunk_batch() {
+    let f = fixture_or_skip!();
+    let source_id = f.create_source("writer publication overlap").await;
+    let provenance = provenance("model-a");
+    let generation_id = f
+        .generations
+        .claim(source_id, &provenance)
+        .await
+        .expect("claim")
+        .expect("claim wins");
+    let (first_chunks, first_embeddings) = synthetic_chunks("overlap", 2);
+    f.chunks
+        .store_chunks(generation_id, source_id, &first_chunks, &first_embeddings)
+        .await
+        .expect("store initial chunks");
+    f.generations
+        .record_build_plan(generation_id, 3, &provenance.chunking)
+        .await
+        .expect("record build plan");
+
+    let writer = f.db.begin().await.expect("writer transaction");
+    let (last_chunk, last_embedding) = synthetic_chunks("overlap", 1);
+    f.chunks
+        .store_chunk_batch(
+            generation_id,
+            source_id,
+            &last_chunk,
+            &last_embedding,
+            2,
+            &writer,
+        )
+        .await
+        .expect("admit final batch");
+
+    let generations = f.generations.clone();
+    let mut publisher = tokio::spawn(async move {
+        generations
+            .publish(generation_id, source_id, EMBEDDING_DIM)
+            .await
+    });
+    tokio::task::yield_now().await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut publisher)
+            .await
+            .is_err(),
+        "publisher crossed validation while an admitted writer held the generation lock"
+    );
+
+    writer.commit().await.expect("commit final batch");
+    let published = publisher
+        .await
+        .expect("publisher join")
+        .expect("publish after writer");
+    assert_eq!(published.chunk_count, 3);
+    assert_eq!(f.active_contents("generation").await.len(), 3);
     f.cleanup().await;
 }
 
@@ -1245,12 +1368,11 @@ async fn a_failed_first_build_reports_the_source_as_failed() {
 
 /// The Definition of Done: 1,000 schedules, zero mixed reads.
 ///
-/// Each schedule publishes a replacement against two readers: one racing the
-/// publication at a schedule-dependent offset, and one strictly after it
-/// commits. The racing reader may legitimately observe either generation — both
-/// answers are correct — so the assertion is never "the new one won". It is that
-/// no result set ever spans both, and that the post-commit reader always sees
-/// the whole replacement.
+/// Each schedule publishes a replacement against two readers: one hybrid read
+/// racing publication at a schedule-dependent offset, and one lexical read
+/// strictly after it commits. The racing reader may legitimately observe
+/// either generation. Dense and lexical branches must still share one snapshot,
+/// and the post-commit reader must see the whole replacement.
 ///
 /// The offset is derived from the schedule index and from one calibration
 /// measurement of how long a publication takes on this machine. A fixed offset
@@ -1297,6 +1419,8 @@ async fn a_thousand_publication_schedules_produce_no_mixed_read() {
     let mut mixed = 0usize;
     let mut observed_old = 0usize;
     let mut observed_new = 0usize;
+    let mut hybrid_query = vec![0.0; EMBEDDING_DIM];
+    hybrid_query[0] = 1.0;
 
     for schedule in 0..PUBLICATION_SCHEDULES {
         // Schedule 0 follows the calibration publication, so the marker it
@@ -1336,30 +1460,35 @@ async fn a_thousand_publication_schedules_produce_no_mixed_read() {
         let offset = Duration::from_micros((schedule % 16) as u64 * offset_step);
         let search = f.search.clone();
         let scope = f.scope();
+        let query_embedding = hybrid_query.clone();
         let reader = tokio::spawn(async move {
             if !offset.is_zero() {
                 tokio::time::sleep(offset).await;
             }
-            search.search_lexical_chunks(scope, "generation", 100).await
+            search
+                .search_hybrid_chunks(scope, &query_embedding, "generation", 100)
+                .await
         });
 
         let _published = publisher.await.expect("publisher join").expect("publish");
         let racing = reader.await.expect("reader join").expect("read");
 
-        assert_eq!(
-            racing.len(),
-            4,
-            "schedule {schedule}: a read must return exactly one generation's chunks"
-        );
-        let has_old = racing.iter().any(|r| r.content.contains(&previous_marker));
-        let has_new = racing.iter().any(|r| r.content.contains(&next_marker));
+        assert_eq!(racing.dense.len(), 4, "schedule {schedule}: dense fill");
+        assert_eq!(racing.lexical.len(), 4, "schedule {schedule}: lexical fill");
+        let rows: Vec<_> = racing.dense.iter().chain(&racing.lexical).collect();
+        let generations: HashSet<_> = rows.iter().map(|row| row.generation_id).collect();
+        if generations.len() > 1 {
+            mixed += 1;
+        }
+        let has_old = rows.iter().any(|r| r.content.contains(&previous_marker));
+        let has_new = rows.iter().any(|r| r.content.contains(&next_marker));
         match (has_old, has_new) {
-            (true, true) => mixed += 1,
+            (true, true) => {}
             (true, false) => observed_old += 1,
             (false, true) => observed_new += 1,
             (false, false) => panic!(
                 "schedule {schedule}: read {} rows carrying neither generation's marker",
-                racing.len()
+                rows.len()
             ),
         }
 

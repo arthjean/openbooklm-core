@@ -176,8 +176,8 @@ A citation is emitted only when seven things hold:
 
 1. the marker resolves to a chunk retrieved this turn;
 2. that chunk carries an index generation (a nil generation was never published);
-3. that generation is still the source's active generation immediately before
-   emission;
+3. that generation remains active while a source-row lease is held through
+   event enqueue;
 4. its recorded span and pages describe a passage that can exist - `span_start <
    span_end`, `page_number <= page_end`, no last page without a first;
 5. the immediately preceding claim has a conservative lexical support signal in
@@ -200,6 +200,10 @@ provenance through `llm::types::ChunkProvenance`, which parses the stored
 metadata once, typed, instead of probing the JSON key by key in each of them.
 The count reaches the retrieval trace as `citation_rejected`, so a regression
 shows up as refusals rather than as silently lower citation coverage.
+
+Interrupted, truncated and shutdown responses never reach final validation, so
+their persisted partial messages carry no citations even when marker text was
+already streamed.
 
 ## Three ways to have no answer
 

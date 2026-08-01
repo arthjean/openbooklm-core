@@ -100,10 +100,13 @@ disconnected client starts a new exchange.
 - `done.rag_log_id` is `null` for the same reason: with no retrieved context
   there is no RAG log row for feedback to reference. The key is always present.
 - `citation` events are delayed until generation completes. The server rereads
-  each source's active generation and validates span ownership plus linkage to
-  the immediately preceding claim before exposing the marker as a citation.
+  each source's active generation, holds its row stable through event enqueue,
+  and validates span ownership plus linkage to the immediately preceding claim
+  before exposing the marker as a citation.
   A marker can therefore appear in streamed text without receiving a
   corresponding `citation` event when it is stale or unsupported.
+- Interrupted, truncated and shutdown responses persist no citations because
+  they do not reach final evidence validation.
 - `citation.index` is 1-based and refers to the `[N]` marker in the answer text.
   For providers with native citations the marker is injected by the server, so
   clients see the same markers either way.

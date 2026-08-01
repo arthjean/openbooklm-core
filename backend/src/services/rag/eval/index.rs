@@ -44,6 +44,12 @@ use super::corpus::EvalCorpus;
 #[derive(Debug, Clone)]
 pub struct IndexedChunk {
     pub chunk_id: Uuid,
+    /// The corpus generation this chunk belongs to.
+    ///
+    /// The offline index has exactly one, so every result carries it. That is
+    /// what lets the evaluator exercise the same trace field production fills
+    /// from `sources.active_generation_id` (EP-002).
+    pub generation_id: Uuid,
     pub source_id: Uuid,
     pub notebook_id: Uuid,
     pub source_title: String,
@@ -60,6 +66,7 @@ impl IndexedChunk {
     fn as_result(&self, relevance_score: f32) -> ChunkSearchResult {
         ChunkSearchResult {
             id: self.chunk_id,
+            generation_id: self.generation_id,
             source_id: self.source_id,
             chunk_index: self.chunk_index,
             content: self.content.clone(),
@@ -159,6 +166,7 @@ impl CorpusIndex {
 
                     chunks.push(IndexedChunk {
                         chunk_id: chunk.uuid(),
+                        generation_id: corpus.generation_id(),
                         source_id,
                         notebook_id,
                         source_title: source.title.clone(),

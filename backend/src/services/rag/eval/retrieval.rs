@@ -671,14 +671,16 @@ async fn retrieve_with(
             let request = SearchRequest::new(query)
                 .with_limit(pool)
                 .with_mode(search_mode);
+            // The evaluator drives corpus queries verbatim, with no HyDE and no
+            // cache: an offline run must measure retrieval, not what a previous
+            // run happened to leave behind.
+            let query_embedder = crate::services::rag::search::QueryEmbedder::direct(embedder);
             let (results, _, _) = search(
                 index,
                 &config.fusion,
                 notebook_id,
                 &request,
-                embedder,
-                None,
-                None,
+                &query_embedder,
             )
             .await?;
             Ok(results)
@@ -1078,6 +1080,7 @@ mod tests {
         let source_b = Uuid::from_u128(2);
         let make = |source_id: Uuid, parent: Option<&str>, n: u128| SearchResult {
             chunk_id: Uuid::from_u128(n),
+            generation_id: Uuid::nil(),
             source_id,
             source_title: "t".to_owned(),
             chunk_index: 0,

@@ -217,8 +217,12 @@ const SEED_SENTENCES: &[&str] = &[
 async fn database_latency_baseline() {
     use openbooklm::core::config::DatabasePoolConfig;
     use openbooklm::repositories::{
-        ChunkRepository, NotebookRepository, SeaOrmChunkRepository, SeaOrmNotebookRepository,
-        SeaOrmSearchRepository, SeaOrmSourceRepository, SearchRepository, SourceRepository,
+        ChunkRepository, GenerationRepository, NotebookRepository, SeaOrmChunkRepository,
+        SeaOrmGenerationRepository, SeaOrmNotebookRepository, SeaOrmSearchRepository,
+        SeaOrmSourceRepository, SearchRepository, SourceRepository,
+    };
+    use openbooklm::services::rag::provenance::{
+        ChunkingProvenance, EmbeddingProvenance, GenerationProvenance, Normalization,
     };
     use openbooklm::types::{ChunkMetadata, ChunkWithContext, SourceType};
 
@@ -231,7 +235,21 @@ async fn database_latency_baseline() {
     let notebooks = SeaOrmNotebookRepository::new(&db);
     let sources = SeaOrmSourceRepository::new(&db);
     let chunks_repo = SeaOrmChunkRepository::new(&db);
+    let generations = SeaOrmGenerationRepository::new(&db);
     let search = SeaOrmSearchRepository::new(&db);
+
+    // Seeded chunks reach search only through a published generation (EP-002).
+    // The seed therefore goes through the real lifecycle rather than writing
+    // rows the active pointer would never reach.
+    let seed_provenance = GenerationProvenance {
+        embedding: EmbeddingProvenance {
+            provider: "latency-baseline".into(),
+            model: "zero-vector".into(),
+            dimension: openbooklm::core::providers::EMBEDDING_DIM,
+            normalization: Normalization::Unknown,
+        },
+        chunking: ChunkingProvenance::current(1024),
+    };
 
     // Synthetic fixture: one user, a small notebook set, and one notebook
     // populated with indexed content. This is the shape a self-hosted install
@@ -299,10 +317,31 @@ async fn database_latency_baseline() {
         // not affect the tsvector path. Dimension must still match the schema.
         let embeddings: Vec<Vec<f32>> = vec![vec![0.0; 1024]; chunks.len()];
 
+        let generation_id = generations
+            .claim(source.id, &seed_provenance)
+            .await
+            .expect("claim generation")
+            .expect("a fresh source has no competing build");
         chunks_repo
-            .store_chunks(source.id, &chunks, &embeddings)
+            .store_chunks(generation_id, source.id, &chunks, &embeddings)
             .await
             .expect("store chunks");
+        generations
+            .record_build_plan(
+                generation_id,
+                i32::try_from(chunks.len()).expect("seed size fits in i32"),
+                &seed_provenance.chunking,
+            )
+            .await
+            .expect("record build plan");
+        let _published = generations
+            .publish(
+                generation_id,
+                source.id,
+                openbooklm::core::providers::EMBEDDING_DIM,
+            )
+            .await
+            .expect("publish generation");
         seeded_chunks += chunks.len();
     }
 

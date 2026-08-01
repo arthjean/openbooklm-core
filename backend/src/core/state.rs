@@ -28,9 +28,9 @@ use crate::core::providers::{
 use crate::middleware::TaskTracker;
 use crate::repositories::{
     SeaOrmAccountRepository, SeaOrmAccountSettingsRepository, SeaOrmChatRepository,
-    SeaOrmChunkRepository, SeaOrmMemoryRepository, SeaOrmNoteRepository, SeaOrmNotebookRepository,
-    SeaOrmOcrCacheRepository, SeaOrmRagLogRepository, SeaOrmSearchRepository,
-    SeaOrmSourceRepository,
+    SeaOrmChunkRepository, SeaOrmGenerationRepository, SeaOrmMemoryRepository,
+    SeaOrmNoteRepository, SeaOrmNotebookRepository, SeaOrmOcrCacheRepository,
+    SeaOrmRagLogRepository, SeaOrmSearchRepository, SeaOrmSourceRepository,
 };
 use crate::services::rag::embedding_cache::EmbeddingCache;
 use crate::services::rag::hyde::HydeService;
@@ -64,6 +64,8 @@ pub struct Repositories {
     pub notebooks: Arc<SeaOrmNotebookRepository>,
     pub sources: Arc<SeaOrmSourceRepository>,
     pub chunks: Arc<SeaOrmChunkRepository>,
+    /// Index generation lifecycle: claim, publish, roll back, reclaim (EP-002).
+    pub generations: Arc<SeaOrmGenerationRepository>,
     pub search: Arc<SeaOrmSearchRepository>,
     pub chat: Arc<SeaOrmChatRepository>,
     pub notes: Arc<SeaOrmNoteRepository>,
@@ -80,6 +82,7 @@ impl Repositories {
             notebooks: Arc::new(SeaOrmNotebookRepository::new(db)),
             sources: Arc::new(SeaOrmSourceRepository::new(db)),
             chunks: Arc::new(SeaOrmChunkRepository::new(db)),
+            generations: Arc::new(SeaOrmGenerationRepository::new(db)),
             search: Arc::new(SeaOrmSearchRepository::new(db)),
             chat: Arc::new(SeaOrmChatRepository::new(db)),
             notes: Arc::new(SeaOrmNoteRepository::new(db)),

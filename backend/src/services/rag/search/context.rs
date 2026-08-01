@@ -15,6 +15,7 @@ use crate::repositories::SearchRepository;
 use crate::services::rag::embedding_cache::EmbeddingCache;
 use crate::services::rag::eval::trace::query_hash;
 use crate::services::rag::hyde::HydeService;
+use crate::services::rag::provenance::QueryEmbeddingKind;
 use crate::services::rag::query_reformulation::{ChatTurn, QueryReformulator};
 
 use super::{SearchMode, SearchRequest, search};
@@ -141,6 +142,10 @@ pub struct RetrievalParams<'a> {
     pub reranker: Option<&'a dyn Reranker>,
     pub hyde_service: Option<&'a HydeService>,
     pub embedding_cache: Option<&'a EmbeddingCache>,
+    /// The role `query` plays. Selects the embedding cache namespace, so a
+    /// reformulation and the question it came from cannot share a vector
+    /// (US-011).
+    pub embedding_kind: QueryEmbeddingKind,
     pub provider: &'a str,
     pub model: &'a str,
     pub preference_boost: Option<&'a PreferenceBoost>,
@@ -175,6 +180,7 @@ pub async fn retrieve_context(
         reranker,
         hyde_service,
         embedding_cache,
+        embedding_kind,
         provider,
         model,
         preference_boost,
@@ -248,14 +254,18 @@ pub async fn retrieve_context(
         "Starting context retrieval"
     );
 
+    let query_embedder = super::QueryEmbedder {
+        provider: *embeddings,
+        hyde: *hyde_service,
+        cache: *embedding_cache,
+        kind: *embedding_kind,
+    };
     let (mut results, embed_ms, search_ms) = search(
         *search_repo,
         &config.hybrid_search,
         notebook_id,
         &request,
-        *embeddings,
-        *hyde_service,
-        *embedding_cache,
+        &query_embedder,
     )
     .await?;
 
@@ -363,6 +373,10 @@ pub struct CorrectiveRetrievalParams<'a> {
     pub reformulator: Option<&'a QueryReformulator>,
     pub chat_history: &'a [ChatTurn],
     pub embedding_cache: Option<&'a EmbeddingCache>,
+    /// The role `query` plays before any corrective reformulation. The
+    /// corrected pass overrides it with
+    /// [`QueryEmbeddingKind::Reformulated`](crate::services::rag::provenance::QueryEmbeddingKind::Reformulated).
+    pub embedding_kind: QueryEmbeddingKind,
     pub provider: &'a str,
     pub model: &'a str,
     /// Pre-computed preference boost signals (US-009).
@@ -391,6 +405,7 @@ pub async fn retrieve_context_corrective(
         reranker: params.reranker,
         hyde_service: params.hyde_service,
         embedding_cache: params.embedding_cache,
+        embedding_kind: params.embedding_kind,
         provider: params.provider,
         model: params.model,
         preference_boost: params.preference_boost,
@@ -471,8 +486,12 @@ pub async fn retrieve_context_corrective(
     }
 
     // Retry with reformulated query (use corrected timings if results are better)
+    // The corrective pass embeds a *different* text under a different role.
+    // Both facts belong in the cache key, or the second pass would be served
+    // the first pass's vector and corrective retrieval would be a no-op.
     let corrected_params = RetrievalParams {
         query: &reformulation.query,
+        embedding_kind: QueryEmbeddingKind::Reformulated,
         ..base_params
     };
     let (corrected_results, corrected_timings) = retrieve_context(&corrected_params).await?;
@@ -536,6 +555,7 @@ mod tests {
     fn make_result(title: &str, content: &str) -> SearchResult {
         SearchResult {
             chunk_id: Uuid::new_v4(),
+            generation_id: Uuid::nil(),
             source_id: Uuid::new_v4(),
             source_title: title.to_string(),
             chunk_index: 0,
@@ -720,6 +740,7 @@ mod tests {
     fn make_result_with_source(source_id: Uuid, score: f32, content: &str) -> SearchResult {
         SearchResult {
             chunk_id: Uuid::new_v4(),
+            generation_id: Uuid::nil(),
             source_id,
             source_title: "Test".to_string(),
             chunk_index: 0,
@@ -943,6 +964,7 @@ mod tests {
     ) -> SearchResult {
         SearchResult {
             chunk_id: Uuid::new_v4(),
+            generation_id: Uuid::nil(),
             source_id,
             source_title: "Test".to_string(),
             chunk_index: 0,
@@ -1073,6 +1095,7 @@ mod tests {
         // Both should format correctly in the same context block
         let legacy = SearchResult {
             chunk_id: Uuid::new_v4(),
+            generation_id: Uuid::nil(),
             source_id: Uuid::new_v4(),
             source_title: "Old Doc".to_string(),
             chunk_index: 0,
@@ -1083,6 +1106,7 @@ mod tests {
         };
         let new_chunk = SearchResult {
             chunk_id: Uuid::new_v4(),
+            generation_id: Uuid::nil(),
             source_id: Uuid::new_v4(),
             source_title: "New Doc".to_string(),
             chunk_index: 1,
@@ -1123,6 +1147,7 @@ mod tests {
         let results = vec![
             SearchResult {
                 chunk_id: Uuid::new_v4(),
+                generation_id: Uuid::nil(),
                 source_id: legacy_source_id,
                 source_title: "Same Source".to_string(),
                 chunk_index: 0,
@@ -1133,6 +1158,7 @@ mod tests {
             },
             SearchResult {
                 chunk_id: Uuid::new_v4(),
+                generation_id: Uuid::nil(),
                 source_id: legacy_source_id,
                 source_title: "Same Source".to_string(),
                 chunk_index: 1,
@@ -1143,6 +1169,7 @@ mod tests {
             },
             SearchResult {
                 chunk_id: Uuid::new_v4(),
+                generation_id: Uuid::nil(),
                 source_id: new_source_id,
                 source_title: "New Source".to_string(),
                 chunk_index: 0,
@@ -1153,6 +1180,7 @@ mod tests {
             },
             SearchResult {
                 chunk_id: Uuid::new_v4(),
+                generation_id: Uuid::nil(),
                 source_id: new_source_id,
                 source_title: "New Source".to_string(),
                 chunk_index: 1,
@@ -1185,6 +1213,7 @@ mod tests {
             // Parent A: 2 children matched (scores 0.95, 0.85)
             SearchResult {
                 chunk_id: Uuid::new_v4(),
+                generation_id: Uuid::nil(),
                 source_id,
                 source_title: "Research Paper".to_string(),
                 chunk_index: 0,
@@ -1196,6 +1225,7 @@ mod tests {
             // Parent B: 2 children matched (scores 0.90, 0.80)
             SearchResult {
                 chunk_id: Uuid::new_v4(),
+                generation_id: Uuid::nil(),
                 source_id,
                 source_title: "Research Paper".to_string(),
                 chunk_index: 2,
@@ -1206,6 +1236,7 @@ mod tests {
             },
             SearchResult {
                 chunk_id: Uuid::new_v4(),
+                generation_id: Uuid::nil(),
                 source_id,
                 source_title: "Research Paper".to_string(),
                 chunk_index: 1,
@@ -1216,6 +1247,7 @@ mod tests {
             },
             SearchResult {
                 chunk_id: Uuid::new_v4(),
+                generation_id: Uuid::nil(),
                 source_id,
                 source_title: "Research Paper".to_string(),
                 chunk_index: 3,
@@ -1227,6 +1259,7 @@ mod tests {
             // Parent C: 1 child matched (unique)
             SearchResult {
                 chunk_id: Uuid::new_v4(),
+                generation_id: Uuid::nil(),
                 source_id,
                 source_title: "Research Paper".to_string(),
                 chunk_index: 5,

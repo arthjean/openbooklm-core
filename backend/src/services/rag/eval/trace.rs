@@ -188,9 +188,11 @@ pub struct TokenCounts {
 pub struct RetrievalTrace {
     /// Index generations the result set was read from.
     ///
-    /// EP-002 populates this from each source's active generation pointer. Until
-    /// then the evaluation corpus supplies its own generation id, so the field
-    /// is exercised rather than discovered late.
+    /// Every retrieval query joins `sources.active_generation_id`, so this is a
+    /// set of active generations by construction. Chat fills it from the
+    /// retrieved chunks; the offline evaluator fills it from its corpus
+    /// generation. More than one entry means the answer spanned several
+    /// sources, never several versions of one (EP-002).
     pub generation_ids: Vec<Uuid>,
     pub notebook_id: Uuid,
     /// Truncated SHA-256 of the query as the user asked it.

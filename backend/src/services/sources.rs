@@ -76,7 +76,11 @@ pub async fn update_source_status(
     repo.update_status(source_id, status, error_message).await
 }
 
-/// Update source chunk count after processing.
+/// Set a source's chunk count directly.
+///
+/// Ingestion does not use this: since EP-002 the count is written by generation
+/// publication, inside the transaction that moves the active pointer. See
+/// [`SourceRepository::update_chunk_count`](crate::repositories::SourceRepository::update_chunk_count).
 #[tracing::instrument(skip(repo), fields(%source_id))]
 pub async fn update_source_chunk_count(
     repo: &dyn SourceRepository,

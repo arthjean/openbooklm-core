@@ -11,6 +11,7 @@ pub mod rag;
 pub mod chat;
 pub mod content_cleaning;
 pub mod embeddings;
+pub mod ingestion_tasks;
 pub mod memory;
 pub mod notebooks;
 pub mod processor;

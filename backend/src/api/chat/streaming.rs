@@ -491,6 +491,15 @@ fn build_retrieval_trace(
         trace = trace.with_reformulation(reformulated);
     }
 
+    // The generations that actually answered. Every search path joins the
+    // active pointer, so this is a set of active generations by construction —
+    // and an operator diagnosing a bad answer can tell which index produced it
+    // (US-004, filled by EP-002).
+    let mut generation_ids: Vec<Uuid> = context_chunks.iter().map(|c| c.generation_id).collect();
+    generation_ids.sort_unstable();
+    generation_ids.dedup();
+    trace.generation_ids = generation_ids;
+
     let selected = context_chunks.len();
     let unique_parents = unique_parent_count(context_chunks);
     trace.candidates = StageCounts {
@@ -1517,6 +1526,7 @@ mod tests {
     fn chunk(source_id: Uuid, parent: Option<&str>, content: &str) -> SearchResult {
         SearchResult {
             chunk_id: Uuid::new_v4(),
+            generation_id: Uuid::nil(),
             source_id,
             source_title: "Runbook".to_owned(),
             chunk_index: 0,

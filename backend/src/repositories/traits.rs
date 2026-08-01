@@ -194,6 +194,12 @@ pub trait SourceRepository: Send + Sync {
         error_message: Option<String>,
     ) -> RepoResult<source::Model>;
 
+    /// Set `chunk_count` directly.
+    ///
+    /// Not part of ingestion. Since EP-002 the count is written by generation
+    /// publication, in the same transaction that moves the active pointer, so
+    /// that it can never describe a generation the source is not pointing at.
+    /// Calling this outside that transaction desynchronises the two.
     async fn update_chunk_count(
         &self,
         source_id: Uuid,
@@ -208,6 +214,94 @@ pub trait SourceRepository: Send + Sync {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Index generations (EP-002)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// What a successful publication moved.
+#[must_use]
+#[derive(Debug, Clone, Copy)]
+pub struct PublicationOutcome {
+    pub generation_id: Uuid,
+    pub chunk_count: i32,
+}
+
+/// The lifecycle of an immutable source index.
+///
+/// The trait is deliberately narrow: everything it exposes is a transition
+/// between the states in
+/// [`GenerationState`](crate::entities::source_index_generation::GenerationState),
+/// and nothing exposes a way to write the active pointer outside
+/// [`publish`](Self::publish) and [`rollback_to_previous`](Self::rollback_to_previous).
+#[async_trait]
+pub trait GenerationRepository: Send + Sync {
+    /// Take ownership of a source's index, or report that someone else has it.
+    ///
+    /// Returns the new generation id, or `None` when a building generation
+    /// already exists — the compare-and-set that makes reprocessing
+    /// single-owner (US-009).
+    async fn claim(
+        &self,
+        source_id: Uuid,
+        provenance: &crate::services::rag::provenance::GenerationProvenance,
+    ) -> RepoResult<Option<Uuid>>;
+
+    /// The id of the source's current building generation, if any.
+    async fn find_building(&self, source_id: Uuid) -> RepoResult<Option<Uuid>>;
+
+    /// Declare how many chunks this generation will store, and under which
+    /// chunking contract.
+    ///
+    /// Publication compares the declaration against the rows actually present;
+    /// a generation that never declares one cannot be published. The chunking
+    /// provenance is recorded here rather than at claim time because the
+    /// effective contract is only known after extraction: the PDF+OCR path
+    /// rewrites the source type, which changes the chunk geometry.
+    async fn record_build_plan(
+        &self,
+        generation_id: Uuid,
+        expected: i32,
+        chunking: &crate::services::rag::provenance::ChunkingProvenance,
+    ) -> RepoResult<()>;
+
+    /// Validate and publish in one transaction, moving the active pointer.
+    async fn publish(
+        &self,
+        generation_id: Uuid,
+        source_id: Uuid,
+        expected_dimension: usize,
+    ) -> RepoResult<PublicationOutcome>;
+
+    /// Abandon a building generation, leaving the active one untouched.
+    async fn mark_failed(
+        &self,
+        generation_id: Uuid,
+        source_id: Uuid,
+        reason: &str,
+    ) -> RepoResult<()>;
+
+    /// Repoint a source at its previous complete generation.
+    ///
+    /// Returns `None` when there is no earlier published generation to return
+    /// to. Copies nothing.
+    async fn rollback_to_previous(&self, source_id: Uuid) -> RepoResult<Option<Uuid>>;
+
+    /// The ids of every generation of a source, newest first.
+    ///
+    /// The inspection a reclaim or rollback is checked against: which
+    /// generations still exist, in the order they were created.
+    async fn list_for_source(&self, source_id: Uuid) -> RepoResult<Vec<Uuid>>;
+
+    /// Delete unreferenced generations older than the retention window.
+    ///
+    /// Never touches the active generation or the newest rollback target, and
+    /// reports how many rows it actually removed.
+    async fn reclaim(&self, source_id: Uuid, retention_hours: i32) -> RepoResult<u64>;
+
+    /// Fail building generations abandoned by a process that is gone.
+    async fn fail_stale_builds(&self, older_than_secs: i64, reason: &str) -> RepoResult<u64>;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Chunk (Vector Store)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -216,6 +310,13 @@ pub trait SourceRepository: Send + Sync {
 #[derive(Debug, Clone)]
 pub struct ChunkSearchResult {
     pub id: Uuid,
+    /// The generation this chunk belongs to.
+    ///
+    /// Always the source's active generation: every query that produces a
+    /// `ChunkSearchResult` joins on the active pointer. Carried through to the
+    /// retrieval trace so an operator can tell which index answered a question
+    /// (US-004, EP-002).
+    pub generation_id: Uuid,
     pub source_id: Uuid,
     pub chunk_index: i32,
     pub content: String,
@@ -229,34 +330,38 @@ pub struct ChunkSearchResult {
 /// Re-export from types for convenience.
 pub use crate::types::ChunkWithContext;
 
+/// Chunk access, scoped to index generations (EP-002).
+///
+/// There is no operation here that deletes a source's chunks. That is the
+/// point: FR-03 forbids removing the active index before its replacement is
+/// published, so the only way chunks disappear is a generation being reclaimed
+/// once nothing references it. Reads resolve through
+/// `sources.active_generation_id` and never see a building generation.
 #[async_trait]
 pub trait ChunkRepository: Send + Sync {
+    /// Write a whole generation's chunks in one transaction.
+    ///
+    /// Convenience over [`store_chunk_batch`](Self::store_chunk_batch) for
+    /// callers that already hold every chunk. Same upsert semantics: a position
+    /// already present in this generation is overwritten, never duplicated. The
+    /// generation must exist and still be building.
     async fn store_chunks(
         &self,
+        generation_id: Uuid,
         source_id: Uuid,
         chunks: &[ChunkWithContext],
         embeddings: &[Vec<f32>],
     ) -> RepoResult<()>;
 
-    /// Returns (chunk_id, chunk_index, content) tuples.
-    async fn get_for_source(&self, source_id: Uuid) -> RepoResult<Vec<(Uuid, i32, String)>>;
-
-    /// Returns number of deleted chunks.
-    async fn delete_for_source(&self, source_id: Uuid) -> RepoResult<u64>;
-
-    /// Returns a random sample of chunk contents for a notebook.
-    async fn sample_chunks_for_notebook(
-        &self,
-        notebook_id: Uuid,
-        limit: i32,
-    ) -> RepoResult<Vec<String>>;
-
-    /// Insert a batch of chunks within an existing transaction (no DELETE, no commit).
+    /// Insert a batch within an existing transaction (no commit).
     ///
-    /// Used by the pipeline consumer to incrementally store chunks as embeddings arrive.
-    /// `base_chunk_index` is the absolute index of `chunks[0]` in the full source.
+    /// `base_chunk_index` is the absolute index of `chunks[0]` in the full
+    /// source. Writes are idempotent under
+    /// `chunks_generation_chunk_index_unique`: a retried batch overwrites its
+    /// own positions rather than creating duplicates.
     async fn store_chunk_batch(
         &self,
+        generation_id: Uuid,
         source_id: Uuid,
         chunks: &[ChunkWithContext],
         embeddings: &[Vec<f32>],
@@ -264,14 +369,28 @@ pub trait ChunkRepository: Send + Sync {
         txn: &sea_orm::DatabaseTransaction,
     ) -> RepoResult<()>;
 
-    /// Returns `(chunk_index, content_hash, embedding)` tuples for deduplication.
+    /// Returns `(chunk_id, chunk_index, content)` for the source's *active*
+    /// generation, ordered by position.
+    async fn get_for_source(&self, source_id: Uuid) -> RepoResult<Vec<(Uuid, i32, String)>>;
+
+    /// A random sample of active-generation chunk contents for a notebook.
+    async fn sample_chunks_for_notebook(
+        &self,
+        notebook_id: Uuid,
+        limit: i32,
+    ) -> RepoResult<Vec<String>>;
+
+    /// Embeddings a new build may reuse, keyed by content hash.
     ///
-    /// Used during source reprocessing to identify unchanged chunks whose
-    /// embeddings can be reused instead of re-calling Voyage AI.
-    async fn get_chunks_with_hashes(
+    /// Only chunks from the source's active generation, and only when that
+    /// generation's `embedding_fingerprint` equals the one the new build will
+    /// use (US-011): identical text embedded by a different model is a
+    /// different vector, and reusing it would mix two vector spaces.
+    async fn get_reusable_embeddings(
         &self,
         source_id: Uuid,
-    ) -> RepoResult<Vec<(i32, String, Vec<f32>)>>;
+        embedding_fingerprint: &str,
+    ) -> RepoResult<Vec<(String, Vec<f32>)>>;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

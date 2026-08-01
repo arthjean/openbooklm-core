@@ -2,6 +2,20 @@
 //!
 //! Encapsulates all search-related raw SQL queries (pgvector similarity,
 //! PostgreSQL full-text search) that cannot be expressed via SeaORM's query builder.
+//!
+//! ## Active-generation scope (US-008, EP-002)
+//!
+//! Every query below joins `sources` on **both** `id` and
+//! `active_generation_id = chunks.generation_id`. That single extra equality is
+//! the whole isolation guarantee: a replacement generation accumulating rows in
+//! the same table is unreachable until its publication transaction moves the
+//! pointer, and the move is atomic, so no query can observe a mixture. The join
+//! also excludes sources with no active generation, which is what an unindexed
+//! or failed-first-build source is.
+//!
+//! It is written as a join predicate rather than a `WHERE` clause on purpose:
+//! there is no way to add a filter to one of these queries and forget the
+//! generation, because the generation is part of how `sources` is reached.
 
 use async_trait::async_trait;
 use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, Statement, TransactionTrait};
@@ -16,12 +30,12 @@ use super::traits::{ChunkSearchResult, RepoResult, SearchRepository};
 // ============================================================================
 
 const SEARCH_SIMILAR_SQL: &str = r"
-    SELECT c.id, c.source_id, c.chunk_index, c.content, c.parent_content,
+    SELECT c.id, c.generation_id, c.source_id, c.chunk_index, c.content, c.parent_content,
            c.metadata,
            s.title as source_title,
            (c.embedding <=> $1::vector) as distance
     FROM chunks c
-    JOIN sources s ON c.source_id = s.id
+    JOIN sources s ON c.source_id = s.id AND s.active_generation_id = c.generation_id
     WHERE s.notebook_id = $2
     ORDER BY c.embedding <=> $1::vector
     LIMIT $3
@@ -32,12 +46,12 @@ const SEARCH_SIMILAR_SQL: &str = r"
 const SET_HNSW_EF_SEARCH: &str = "SET LOCAL hnsw.ef_search = 100";
 
 const SEARCH_LEXICAL_SQL: &str = r"
-    SELECT c.id, c.source_id, c.chunk_index, c.content, c.parent_content,
+    SELECT c.id, c.generation_id, c.source_id, c.chunk_index, c.content, c.parent_content,
            c.metadata,
            s.title as source_title,
            ts_rank_cd(c.content_tsv, plainto_tsquery('simple', $1)) as rank
     FROM chunks c
-    JOIN sources s ON c.source_id = s.id
+    JOIN sources s ON c.source_id = s.id AND s.active_generation_id = c.generation_id
     WHERE s.notebook_id = $2
       AND c.content_tsv @@ plainto_tsquery('simple', $1)
     ORDER BY rank DESC
@@ -47,15 +61,15 @@ const SEARCH_LEXICAL_SQL: &str = r"
 const COUNT_CHUNKS_FOR_NOTEBOOK_SQL: &str = r"
     SELECT COUNT(*) as total
     FROM chunks c
-    JOIN sources s ON c.source_id = s.id
+    JOIN sources s ON c.source_id = s.id AND s.active_generation_id = c.generation_id
     WHERE s.notebook_id = $1
 ";
 
 const GET_ALL_CHUNKS_FOR_NOTEBOOK_SQL: &str = r"
-    SELECT c.id, c.source_id, c.chunk_index, c.content, c.parent_content,
+    SELECT c.id, c.generation_id, c.source_id, c.chunk_index, c.content, c.parent_content,
            s.title as source_title
     FROM chunks c
-    JOIN sources s ON c.source_id = s.id
+    JOIN sources s ON c.source_id = s.id AND s.active_generation_id = c.generation_id
     WHERE s.notebook_id = $1
     ORDER BY s.id, c.chunk_index
 ";
@@ -117,6 +131,7 @@ impl SearchRepository for SeaOrmSearchRepository {
                 #[allow(clippy::cast_possible_truncation)]
                 Ok(ChunkSearchResult {
                     id: row.try_get("", "id")?,
+                    generation_id: row.try_get("", "generation_id")?,
                     source_id: row.try_get("", "source_id")?,
                     chunk_index: row.try_get("", "chunk_index")?,
                     content: row.try_get("", "content")?,
@@ -154,6 +169,7 @@ impl SearchRepository for SeaOrmSearchRepository {
                 let rank: f32 = row.try_get("", "rank")?;
                 Ok(ChunkSearchResult {
                     id: row.try_get("", "id")?,
+                    generation_id: row.try_get("", "generation_id")?,
                     source_id: row.try_get("", "source_id")?,
                     chunk_index: row.try_get("", "chunk_index")?,
                     content: row.try_get("", "content")?,
@@ -195,6 +211,7 @@ impl SearchRepository for SeaOrmSearchRepository {
             .map(|row| {
                 Ok(ChunkSearchResult {
                     id: row.try_get("", "id")?,
+                    generation_id: row.try_get("", "generation_id")?,
                     source_id: row.try_get("", "source_id")?,
                     chunk_index: row.try_get("", "chunk_index")?,
                     content: row.try_get("", "content")?,

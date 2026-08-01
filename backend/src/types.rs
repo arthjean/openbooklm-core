@@ -130,6 +130,8 @@ impl From<SourceType> for String {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResult {
     pub chunk_id: Uuid,
+    /// The active generation this chunk was read from (EP-002).
+    pub generation_id: Uuid,
     pub source_id: Uuid,
     pub source_title: String,
     pub chunk_index: i32,
@@ -144,6 +146,7 @@ impl From<ChunkSearchResult> for SearchResult {
     fn from(c: ChunkSearchResult) -> Self {
         Self {
             chunk_id: c.id,
+            generation_id: c.generation_id,
             source_id: c.source_id,
             source_title: c.source_title,
             chunk_index: c.chunk_index,

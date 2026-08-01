@@ -23,6 +23,9 @@ use crate::core::principal::Principal;
 use crate::entities::source::SourceStatus;
 use crate::error::AppError;
 use crate::services::source_events::SourceEvent;
+use crate::services::source_processing::{
+    IndexOwnership, PROCESSING_TIMEOUT, ProcessingDeps, claim_index_ownership,
+};
 use crate::services::sources::{create_source, delete_source, list_sources, update_source_status};
 use crate::types::SourceType;
 
@@ -204,9 +207,74 @@ pub async fn create_source_handler(
     )
     .await?;
 
-    spawn_source_processing(&state, source.id, notebook_id, source_type, &principal);
+    // A brand-new source has no index yet, so this claim cannot lose to
+    // anything; going through the same path as reprocessing is what keeps
+    // "every build is owned" true for both entry points.
+    if let Some(ownership) = claim_or_report(&state, source.id, notebook_id, source_type).await {
+        spawn_source_processing(
+            &state,
+            ownership,
+            source.id,
+            notebook_id,
+            source_type,
+            &principal,
+        );
+    }
 
     Ok(Json(source.into()))
+}
+
+/// Claim the right to build a source's index, reporting a refusal on the source
+/// rather than to the caller.
+///
+/// The creation and reprocess responses describe the *source*, and a claim that
+/// cannot proceed — no embedding provider, provenance the schema will not
+/// accept — is a property of the deployment, not of the request. Reporting it as
+/// a failed source keeps the existing response shape and puts the message where
+/// the user will see it, which is what the pipeline did before ownership moved
+/// to the API boundary.
+async fn claim_or_report(
+    state: &CoreState,
+    source_id: Uuid,
+    notebook_id: Uuid,
+    source_type: SourceType,
+) -> Option<IndexOwnership> {
+    match claim_index_ownership(
+        state.repos.generations.as_ref(),
+        state.clients.embeddings.as_ref(),
+        source_id,
+        source_type,
+        PROCESSING_TIMEOUT,
+    )
+    .await
+    {
+        Ok(Some(ownership)) => Some(ownership),
+        Ok(None) => {
+            info!(
+                %source_id,
+                "Index build request coalesced — another worker owns this source's index"
+            );
+            None
+        }
+        Err(e) => {
+            let message = e.to_string();
+            error!(%source_id, error = %e, "Cannot claim an index build for this source");
+            if let Err(status_err) = update_source_status(
+                state.repos.sources.as_ref(),
+                source_id,
+                SourceStatus::Error,
+                Some(message.clone()),
+            )
+            .await
+            {
+                error!(%source_id, error = %status_err, "Failed to record the claim failure");
+            }
+            state
+                .source_broadcaster
+                .broadcast_error(notebook_id, source_id, &message);
+            None
+        }
+    }
 }
 
 // =============================================================================
@@ -410,6 +478,23 @@ pub async fn reprocess_source_handler(
     Path(source_id): Path<Uuid>,
 ) -> Result<Json<SourceResponse>, AppError> {
     let source = verify_source_access(state.repos.sources.as_ref(), &principal, source_id).await?;
+    let source_type = SourceType::try_from(source.source_type.as_str())?;
+
+    // Ownership is decided here, before anything is spawned or any status is
+    // written. A duplicate request loses the compare-and-set, and the losing
+    // path below returns the source exactly as it is — same response shape, no
+    // second worker, no status rewritten under the worker that owns the build
+    // (US-009).
+    let Some(ownership) = claim_or_report(&state, source_id, source.notebook_id, source_type).await
+    else {
+        // Either another worker owns the build, or the deployment cannot build
+        // one at all. Both are already reported on the source itself; re-reading
+        // it is what makes the response describe the state that actually holds.
+        let current = crate::services::sources::get_source(state.repos.sources.as_ref(), source_id)
+            .await?
+            .unwrap_or(source);
+        return Ok(Json(current.into()));
+    };
 
     let updated = update_source_status(
         state.repos.sources.as_ref(),
@@ -422,9 +507,9 @@ pub async fn reprocess_source_handler(
         .source_broadcaster
         .broadcast_status(source.notebook_id, source_id, "pending", None);
 
-    let source_type = SourceType::try_from(source.source_type.as_str())?;
     spawn_source_processing(
         &state,
+        ownership,
         source_id,
         source.notebook_id,
         source_type,
@@ -438,31 +523,30 @@ pub async fn reprocess_source_handler(
 // SOURCE PROCESSING
 // =============================================================================
 
-/// Maximum wall-clock time for a single source processing pipeline (10 minutes).
-///
-/// This prevents truly stuck processing from hanging forever. A 60-page PDF
-/// typically completes in under 2 minutes; this limit allows ample headroom
-/// for very large documents and rate-limited embedding batches.
-const PROCESSING_TIMEOUT: Duration = Duration::from_secs(600);
-
 /// Spawn async source processing task tracked for graceful shutdown.
 ///
 /// Uses `task_tracker.spawn()` so the server waits for in-progress processing
-/// before shutting down. If the task is cancelled by shutdown, the source is
-/// marked as error so the user can reprocess it.
+/// before shutting down.
+///
+/// The deadline is *not* applied here. `tokio::time::timeout` cancels by
+/// dropping the future it wraps, which detaches whatever that future owns —
+/// exactly the defect EP-002 removes. `process_source` therefore owns both its
+/// deadline and its tasks, cancels cooperatively, drains within a bounded
+/// window, and marks its building generation failed. The previously active
+/// generation stays searchable in every one of those cases, so nothing out here
+/// needs to write the source's status.
 fn spawn_source_processing(
     state: &CoreState,
+    ownership: IndexOwnership,
     source_id: Uuid,
     notebook_id: Uuid,
     source_type: SourceType,
     principal: &Principal,
 ) {
-    use crate::services::source_processing::{ProcessingDeps, process_source};
+    use crate::services::source_processing::process_source;
     use crate::types::RequestContext;
 
     let deps = ProcessingDeps::from_state(state, principal.clone());
-    let source_repo = state.repos.sources.clone();
-    let broadcaster = state.source_broadcaster.clone();
 
     // Dependencies for post-processing suggestion generation
     let mistral = state.clients.mistral.clone();
@@ -474,13 +558,18 @@ fn spawn_source_processing(
     let ctx = RequestContext::current();
 
     state.task_tracker.spawn("source-processing", async move {
-        let result = tokio::time::timeout(
-            PROCESSING_TIMEOUT,
-            ctx.scope(process_source(deps, source_id, notebook_id, source_type)),
-        )
-        .await;
+        let result = ctx
+            .scope(process_source(
+                deps,
+                ownership,
+                source_id,
+                notebook_id,
+                source_type,
+                PROCESSING_TIMEOUT,
+            ))
+            .await;
         match result {
-            Ok(Ok(())) => {
+            Ok(()) => {
                 // Generate and cache suggested questions post-indexation.
                 // Fire-and-forget: errors are logged but don't affect the source status.
                 if let Err(e) = crate::services::suggestions::generate_and_store(
@@ -498,29 +587,8 @@ fn spawn_source_processing(
                     );
                 }
             }
-            Ok(Err(e)) => {
+            Err(e) => {
                 error!(source_id = %source_id, error = %e, "Source processing failed");
-            }
-            Err(_elapsed) => {
-                error!(
-                    source_id = %source_id,
-                    timeout_secs = PROCESSING_TIMEOUT.as_secs(),
-                    "Source processing timed out"
-                );
-                let _ = update_source_status(
-                    source_repo.as_ref(),
-                    source_id,
-                    SourceStatus::Error,
-                    Some(
-                        "Processing timed out — please try again or use a smaller document".into(),
-                    ),
-                )
-                .await;
-                broadcaster.broadcast_error(
-                    notebook_id,
-                    source_id,
-                    "Processing timed out — please try again or use a smaller document",
-                );
             }
         }
     });

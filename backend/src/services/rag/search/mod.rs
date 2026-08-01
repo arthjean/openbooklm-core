@@ -32,6 +32,7 @@ use crate::services::embeddings;
 use crate::services::rag::embedding_cache::EmbeddingCache;
 use crate::services::rag::eval::trace::query_hash;
 use crate::services::rag::hyde::HydeService;
+use crate::services::rag::provenance::{EmbeddingProvenance, QueryEmbeddingKind};
 
 // ============================================================================
 // Constants (used in orchestration and tests)
@@ -63,6 +64,60 @@ use fusion::filter_and_convert;
 // Public API — search orchestration
 // ============================================================================
 
+/// How a query becomes a vector.
+///
+/// Provider, optional HyDE expansion, cache and cache namespace are one
+/// concern, not four parameters: every dense path needs all of them, and a call
+/// site that had to pass them individually could pass a namespace that does not
+/// match the provider it also passed.
+pub struct QueryEmbedder<'a> {
+    pub provider: &'a dyn EmbeddingProvider,
+    pub hyde: Option<&'a HydeService>,
+    pub cache: Option<&'a EmbeddingCache>,
+    /// The role the query text plays; selects the cache namespace (US-011).
+    pub kind: QueryEmbeddingKind,
+}
+
+impl<'a> QueryEmbedder<'a> {
+    /// A direct user query, with no HyDE and no cache.
+    ///
+    /// The shape the offline evaluator drives: corpus queries verbatim, nothing
+    /// remembered between runs.
+    #[must_use]
+    pub fn direct(provider: &'a dyn EmbeddingProvider) -> Self {
+        Self {
+            provider,
+            hyde: None,
+            cache: None,
+            kind: QueryEmbeddingKind::Direct,
+        }
+    }
+}
+
+/// Cache namespaces a dense lookup may legitimately answer from, in order.
+///
+/// With HyDE configured the vector this path stores under the query text is the
+/// *generated document's*, so that namespace is asked first and a `Direct`
+/// lookup does accept it. That is deliberate and it is the one place the
+/// namespace separation is crossed: under HyDE the dense retrieval vector for a
+/// given query text is the HyDE vector, by design, and re-embedding the query
+/// would search with a vector this path never uses. The caller's own namespace
+/// is still consulted second, because HyDE declines long queries and stores the
+/// plain embedding instead.
+///
+/// Everything outside dense retrieval — working-memory lookups in particular —
+/// asks the cache directly and therefore never sees a HyDE vector.
+fn lookup_kinds(
+    kind: QueryEmbeddingKind,
+    hyde_configured: bool,
+) -> [Option<QueryEmbeddingKind>; 2] {
+    if hyde_configured && kind != QueryEmbeddingKind::HydeDocument {
+        [Some(QueryEmbeddingKind::HydeDocument), Some(kind)]
+    } else {
+        [Some(kind), None]
+    }
+}
+
 /// Main search function that routes to the appropriate search method.
 ///
 /// Returns `(results, embed_ms, search_ms)` — timings are populated for Dense/Hybrid
@@ -72,41 +127,26 @@ use fusion::filter_and_convert;
 /// fusion weights are the only configuration this layer reads, and narrowing the
 /// parameter is what lets the offline evaluator (EP-001) drive the real
 /// orchestration without fabricating a server configuration.
-#[tracing::instrument(skip(search_repo, config, request, embeddings, hyde, embedding_cache), fields(%notebook_id))]
+/// `kind` names the role `request.query` plays: an original user question, the
+/// reformulation of one, or a working-memory lookup. It is not a search
+/// parameter — it selects the embedding cache namespace, so a reformulation
+/// cannot be served the original question's vector (US-011).
+#[tracing::instrument(skip(search_repo, config, request, embedder), fields(%notebook_id, kind = embedder.kind.as_str()))]
 pub async fn search(
     search_repo: &dyn SearchRepository,
     config: &HybridSearchConfig,
     notebook_id: Uuid,
     request: &SearchRequest,
-    embeddings: &dyn EmbeddingProvider,
-    hyde: Option<&HydeService>,
-    embedding_cache: Option<&EmbeddingCache>,
+    embedder: &QueryEmbedder<'_>,
 ) -> Result<(Vec<SearchResult>, u128, u128), AppError> {
     let mode = effective_mode(config, request.mode);
 
     match mode {
         SearchMode::Hybrid => {
-            hybrid_search(
-                search_repo,
-                config,
-                notebook_id,
-                request,
-                embeddings,
-                hyde,
-                embedding_cache,
-            )
-            .await
+            hybrid_search(search_repo, config, notebook_id, request, embedder).await
         }
         SearchMode::Dense => {
-            semantic_search_with_hyde(
-                search_repo,
-                notebook_id,
-                request,
-                embeddings,
-                hyde,
-                embedding_cache,
-            )
-            .await
+            semantic_search_with_hyde(search_repo, notebook_id, request, embedder).await
         }
         SearchMode::Lexical => {
             let results = lexical_search(search_repo, notebook_id, request).await?;
@@ -120,24 +160,15 @@ pub async fn search(
 /// When a [`HydeService`] is provided and the query is short (< 20 words),
 /// HyDE generates a hypothetical document and uses its embedding for search,
 /// which bridges the query-document embedding gap.
-#[tracing::instrument(skip(search_repo, request, embeddings, hyde, embedding_cache), fields(%notebook_id))]
+#[tracing::instrument(skip(search_repo, request, embedder), fields(%notebook_id))]
 pub async fn semantic_search(
     search_repo: &dyn SearchRepository,
     notebook_id: Uuid,
     request: &SearchRequest,
-    embeddings: &dyn EmbeddingProvider,
-    hyde: Option<&HydeService>,
-    embedding_cache: Option<&EmbeddingCache>,
+    embedder: &QueryEmbedder<'_>,
 ) -> Result<Vec<SearchResult>, AppError> {
-    let (results, _, _) = semantic_search_with_hyde(
-        search_repo,
-        notebook_id,
-        request,
-        embeddings,
-        hyde,
-        embedding_cache,
-    )
-    .await?;
+    let (results, _, _) =
+        semantic_search_with_hyde(search_repo, notebook_id, request, embedder).await?;
     Ok(results)
 }
 
@@ -145,33 +176,54 @@ pub async fn semantic_search(
 ///
 /// Returns `(results, embed_ms, search_ms)` where `embed_ms` is the time spent
 /// generating the query embedding and `search_ms` is the time spent in the DB search.
-#[tracing::instrument(skip(search_repo, request, embeddings, hyde, embedding_cache), fields(%notebook_id))]
+#[tracing::instrument(skip(search_repo, request, embedder), fields(%notebook_id))]
 pub async fn semantic_search_with_hyde(
     search_repo: &dyn SearchRepository,
     notebook_id: Uuid,
     request: &SearchRequest,
-    embeddings: &dyn EmbeddingProvider,
-    hyde: Option<&HydeService>,
-    embedding_cache: Option<&EmbeddingCache>,
+    embedder: &QueryEmbedder<'_>,
 ) -> Result<(Vec<SearchResult>, u128, u128), AppError> {
+    let QueryEmbedder {
+        provider: embeddings,
+        hyde,
+        cache: embedding_cache,
+        kind,
+    } = *embedder;
     let query = request.validated_query()?;
 
     // --- Embed stage (with cache check) ---
     let embed_start = std::time::Instant::now();
 
-    // Check embedding cache first
-    let cached = if let Some(cache) = embedding_cache {
-        cache.get(query).await
-    } else {
-        None
-    };
+    // The vector space this lookup belongs to. Without it a provider change
+    // would keep serving the previous model's vectors until the TTL expired
+    // (US-011).
+    let fingerprint = EmbeddingProvenance::from_provider(embeddings).fingerprint();
+
+    // A HyDE-enabled search embeds a generated document, not the query. Both
+    // are keyed by the query text but live in different namespaces, so the
+    // lookup asks for each in turn rather than accepting whichever is there.
+    let mut cached = None;
+    let mut cached_kind = kind;
+    if let Some(cache) = embedding_cache {
+        for candidate in lookup_kinds(kind, hyde.is_some()).into_iter().flatten() {
+            if let Some(embedding) = cache.get(candidate, &fingerprint, query).await {
+                cached = Some(embedding);
+                cached_kind = candidate;
+                break;
+            }
+        }
+    }
     let cache_hit = cached.is_some();
-    tracing::debug!(cache_hit, "Embedding cache lookup");
+    tracing::debug!(
+        cache_hit,
+        kind = cached_kind.as_str(),
+        "Embedding cache lookup"
+    );
 
     let query_embedding = if let Some(embedding) = cached {
         embedding
     } else {
-        let embedding = if let Some(hyde_svc) = hyde {
+        let (embedding, stored_kind) = if let Some(hyde_svc) = hyde {
             if let Some(hyde_result) = hyde_svc.generate(query).await {
                 tracing::debug!(
                     %notebook_id,
@@ -179,17 +231,23 @@ pub async fn semantic_search_with_hyde(
                     hyde_doc_len = hyde_result.document.len(),
                     "Using HyDE-generated document for embedding"
                 );
-                embeddings::embed_query(embeddings, &hyde_result.document).await?
+                (
+                    embeddings::embed_query(embeddings, &hyde_result.document).await?,
+                    QueryEmbeddingKind::HydeDocument,
+                )
             } else {
-                embeddings::embed_query(embeddings, query).await?
+                (embeddings::embed_query(embeddings, query).await?, kind)
             }
         } else {
-            embeddings::embed_query(embeddings, query).await?
+            (embeddings::embed_query(embeddings, query).await?, kind)
         };
 
-        // Insert into cache on miss
+        // Insert into cache on miss, under the namespace of what was actually
+        // embedded — not of what the caller asked for.
         if let Some(cache) = embedding_cache {
-            cache.insert(query, embedding.clone()).await;
+            cache
+                .insert(stored_kind, &fingerprint, query, embedding.clone())
+                .await;
         }
 
         embedding
@@ -254,15 +312,13 @@ pub async fn lexical_search(
 ///
 /// Executes both searches in parallel, then fuses results using RRF.
 /// Returns `(results, embed_ms, search_ms)` where timings come from the dense path.
-#[tracing::instrument(skip(search_repo, config, request, embeddings, hyde, embedding_cache), fields(%notebook_id))]
+#[tracing::instrument(skip(search_repo, config, request, embedder), fields(%notebook_id))]
 pub async fn hybrid_search(
     search_repo: &dyn SearchRepository,
     config: &HybridSearchConfig,
     notebook_id: Uuid,
     request: &SearchRequest,
-    embeddings: &dyn EmbeddingProvider,
-    hyde: Option<&HydeService>,
-    embedding_cache: Option<&EmbeddingCache>,
+    embedder: &QueryEmbedder<'_>,
 ) -> Result<(Vec<SearchResult>, u128, u128), AppError> {
     let query = request.validated_query()?;
 
@@ -276,14 +332,7 @@ pub async fn hybrid_search(
 
     // Execute both searches in parallel (dense returns timing info)
     let (dense_res, lexical_res) = tokio::join!(
-        semantic_search_with_hyde(
-            search_repo,
-            notebook_id,
-            &dense_req,
-            embeddings,
-            hyde,
-            embedding_cache
-        ),
+        semantic_search_with_hyde(search_repo, notebook_id, &dense_req, embedder),
         lexical_search(search_repo, notebook_id, &lexical_req)
     );
 
@@ -354,6 +403,7 @@ mod tests {
     fn make_result(chunk_id: Uuid, source_title: &str, score: f32) -> SearchResult {
         SearchResult {
             chunk_id,
+            generation_id: Uuid::nil(),
             source_id: Uuid::new_v4(),
             source_title: source_title.to_string(),
             chunk_index: 0,

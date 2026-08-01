@@ -20,6 +20,7 @@ use crate::llm::{LlmMessage, LlmProvider, TeachingMode, build_system_prompt};
 use crate::repositories::{MemoryRepository, RagLogRepository, SearchRepository};
 use crate::services::memory::{format_memory_for_prompt, select_core_memories};
 use crate::services::rag::eval::trace::query_hash;
+use crate::services::rag::provenance::QueryEmbeddingKind;
 use crate::services::rag::query_reformulation::ChatTurn;
 use crate::services::rag::search::{
     CorrectiveRetrievalParams, PipelineTimings, PreferenceBoost, RetrievalParams,
@@ -467,7 +468,11 @@ pub(crate) async fn retrieve_rag_context(params: &RagContextParams<'_>) -> Retri
         // Reformulate before retrieval when the query appears non-standalone.
         // This is separate from corrective RAG (which reformulates *after*
         // low-quality retrieval) — it prevents the retrieval failure entirely.
-        let effective_query: std::borrow::Cow<'_, str> =
+        // The query and the role it plays are produced together: whether
+        // retrieval is embedding the user's own question or its replacement is
+        // decided here, not re-derived downstream by comparing two strings
+        // (US-011).
+        let (effective_query, embedding_kind): (std::borrow::Cow<'_, str>, QueryEmbeddingKind) =
             if !chat_turns.is_empty() && needs_proactive_reformulation(query) {
                 let result = reformulator.reformulate(query, &chat_turns).await;
                 if result.was_reformulated {
@@ -482,12 +487,12 @@ pub(crate) async fn retrieve_rag_context(params: &RagContextParams<'_>) -> Retri
                     events
                         .emit(ChatEvent::thinking(ThinkingStage::ReformulatingQuery))
                         .await;
-                    result.query.into()
+                    (result.query.into(), QueryEmbeddingKind::Reformulated)
                 } else {
-                    (*query).into()
+                    ((*query).into(), QueryEmbeddingKind::Direct)
                 }
             } else {
-                (*query).into()
+                ((*query).into(), QueryEmbeddingKind::Direct)
             };
 
         match retrieve_context_corrective(&CorrectiveRetrievalParams {
@@ -502,6 +507,7 @@ pub(crate) async fn retrieve_rag_context(params: &RagContextParams<'_>) -> Retri
             reformulator: Some(reformulator),
             chat_history: &chat_turns,
             embedding_cache: *embedding_cache,
+            embedding_kind,
             provider,
             model,
             preference_boost: preference_boost.as_ref(),
@@ -557,6 +563,7 @@ pub(crate) async fn retrieve_rag_context(params: &RagContextParams<'_>) -> Retri
             reranker: reranker.as_deref(),
             hyde_service: *hyde_service,
             embedding_cache: *embedding_cache,
+            embedding_kind: QueryEmbeddingKind::Direct,
             provider,
             model,
             preference_boost: preference_boost.as_ref(),
@@ -652,21 +659,43 @@ pub(crate) async fn load_memory_for_prompt(
     (result, all_memories)
 }
 
-/// Get the query embedding, trying the cache first to avoid redundant API calls.
+/// Get the query embedding for the working-memory search, cached.
+///
+/// The lookup is namespaced to [`QueryEmbeddingKind::WorkingMemory`] rather than
+/// reusing whatever the RAG pipeline left behind. It used to reuse it, on the
+/// reasoning that "the RAG pipeline likely already embedded this query" — which
+/// is false under HyDE, where the pipeline embedded a *generated document*
+/// instead, and memory would then be searched with a vector for text the user
+/// never wrote (US-011).
 pub(crate) async fn get_query_embedding(
     query: &str,
     embeddings: Option<&dyn crate::core::providers::EmbeddingProvider>,
     cache: &crate::services::rag::embedding_cache::EmbeddingCache,
 ) -> Option<Vec<f32>> {
-    // Try cache first — the RAG pipeline likely already embedded this query
-    if let Some(cached) = cache.get(query).await {
+    let embeddings = embeddings?;
+    let fingerprint =
+        crate::services::rag::provenance::EmbeddingProvenance::from_provider(embeddings)
+            .fingerprint();
+
+    if let Some(cached) = cache
+        .get(QueryEmbeddingKind::WorkingMemory, &fingerprint, query)
+        .await
+    {
         return Some(cached);
     }
 
-    // Fall back to the configured provider
-    let embeddings = embeddings?;
     match embeddings.embed_query(query).await {
-        Ok(embedding) => Some(embedding),
+        Ok(embedding) => {
+            cache
+                .insert(
+                    QueryEmbeddingKind::WorkingMemory,
+                    &fingerprint,
+                    query,
+                    embedding.clone(),
+                )
+                .await;
+            Some(embedding)
+        }
         Err(e) => {
             tracing::warn!(error = %e, "Failed to embed query for working memory search");
             None
@@ -1144,17 +1173,32 @@ mod tests {
     // get_query_embedding
     // ════════════════════════════════════════════════════════════════════
 
-    #[tokio::test]
-    async fn embedding_cache_hit() {
-        let cache = crate::services::rag::embedding_cache::EmbeddingCache::new();
-        let embedding = vec![0.1_f32, 0.2, 0.3];
-        cache.insert("test query", embedding.clone()).await;
-        let result = get_query_embedding("test query", None, &cache).await;
-        assert_eq!(result, Some(embedding));
+    fn memory_fingerprint(embedder: &dyn crate::core::providers::EmbeddingProvider) -> String {
+        crate::services::rag::provenance::EmbeddingProvenance::from_provider(embedder).fingerprint()
     }
 
     #[tokio::test]
-    async fn embedding_cache_miss_no_voyage() {
+    async fn embedding_cache_hit() {
+        let cache = crate::services::rag::embedding_cache::EmbeddingCache::new();
+        let embedder = crate::core::providers::DeterministicEmbedder::new();
+        let embedding = vec![0.1_f32, 0.2, 0.3];
+        cache
+            .insert(
+                QueryEmbeddingKind::WorkingMemory,
+                &memory_fingerprint(&embedder),
+                "test query",
+                embedding.clone(),
+            )
+            .await;
+        let result = get_query_embedding("test query", Some(&embedder), &cache).await;
+        assert_eq!(result, Some(embedding));
+    }
+
+    /// Without a provider there is no fingerprint, so there is no way to know
+    /// which vector space a cached entry belongs to. Returning `None` is the
+    /// honest answer; serving whatever is cached is the defect US-011 removes.
+    #[tokio::test]
+    async fn embedding_cache_miss_no_provider() {
         let cache = crate::services::rag::embedding_cache::EmbeddingCache::new();
         let result = get_query_embedding("test query", None, &cache).await;
         assert!(result.is_none());
@@ -1163,9 +1207,42 @@ mod tests {
     #[tokio::test]
     async fn embedding_cache_miss_different_query() {
         let cache = crate::services::rag::embedding_cache::EmbeddingCache::new();
-        // Cache a different query — lookup for "other query" should miss
-        cache.insert("cached query", vec![1.0, 2.0]).await;
-        let result = get_query_embedding("other query", None, &cache).await;
-        assert!(result.is_none());
+        let embedder = crate::core::providers::DeterministicEmbedder::new();
+        cache
+            .insert(
+                QueryEmbeddingKind::WorkingMemory,
+                &memory_fingerprint(&embedder),
+                "cached query",
+                vec![1.0, 2.0],
+            )
+            .await;
+        let result = get_query_embedding("other query", Some(&embedder), &cache).await;
+        assert_ne!(
+            result,
+            Some(vec![1.0, 2.0]),
+            "a different query must not be served the cached entry"
+        );
+    }
+
+    /// The RAG pipeline stores a HyDE-derived vector under its own namespace.
+    /// Working memory must embed the query itself instead of reusing it.
+    #[tokio::test]
+    async fn working_memory_never_reuses_a_hyde_entry() {
+        let cache = crate::services::rag::embedding_cache::EmbeddingCache::new();
+        let embedder = crate::core::providers::DeterministicEmbedder::new();
+        let hyde_vector = vec![9.0_f32; 4];
+        cache
+            .insert(
+                QueryEmbeddingKind::HydeDocument,
+                &memory_fingerprint(&embedder),
+                "what is rrf",
+                hyde_vector.clone(),
+            )
+            .await;
+
+        let result = get_query_embedding("what is rrf", Some(&embedder), &cache)
+            .await
+            .expect("the deterministic provider always embeds");
+        assert_ne!(result, hyde_vector);
     }
 }

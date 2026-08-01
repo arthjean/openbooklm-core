@@ -220,11 +220,13 @@ pub fn claim_is_supported_by(marker_start: usize, response: &str, evidence: &str
     let Some(prefix) = response.get(..marker_start) else {
         return false;
     };
-    let claim = prefix
-        .rsplit(['\n', '.', '!', '?'])
-        .next()
-        .unwrap_or("")
-        .trim_matches(|c: char| c.is_whitespace() || matches!(c, '-' | '*' | ':' | ';'));
+    let claim = immediately_preceding_claim(prefix).trim();
+    let claim = claim
+        .strip_prefix("- ")
+        .or_else(|| claim.strip_prefix("* "))
+        .unwrap_or(claim)
+        .trim_start_matches([':', ';'])
+        .trim();
     let claim_numbers = numeric_values(claim);
     let evidence_numbers: HashSet<String> = numeric_values(evidence).into_iter().collect();
     if claim_numbers
@@ -254,6 +256,29 @@ pub fn claim_is_supported_by(marker_start: usize, response: &str, evidence: &str
         .count();
     let required = claim_tokens.len().saturating_mul(2).div_ceil(3).max(1);
     matched >= required
+}
+
+fn immediately_preceding_claim(prefix: &str) -> &str {
+    let bytes = prefix.as_bytes();
+    let start = prefix
+        .char_indices()
+        .rev()
+        .find_map(|(index, character)| {
+            let sentence_boundary = match character {
+                '\n' | '!' | '?' => true,
+                '.' => {
+                    let decimal_point = index > 0
+                        && index + 1 < bytes.len()
+                        && bytes[index - 1].is_ascii_digit()
+                        && bytes[index + 1].is_ascii_digit();
+                    !decimal_point
+                }
+                _ => false,
+            };
+            sentence_boundary.then_some(index + character.len_utf8())
+        })
+        .unwrap_or(0);
+    &prefix[start..]
 }
 
 fn is_polarity_token(token: &str) -> bool {
@@ -930,6 +955,24 @@ mod tests {
         assert_eq!(accepted_normalized_number.citations.len(), 1);
         assert_eq!(accepted_normalized_number.rejected, 0);
 
+        chunk.content = "The temperature is 5 degrees during the test.".to_owned();
+        let unsupported_negative = extract_citations_verified_against_active(
+            "The temperature is -5 degrees [1].",
+            &[chunk.clone()],
+            &active,
+        );
+        assert!(unsupported_negative.citations.is_empty());
+        assert_eq!(unsupported_negative.rejected, 1);
+
+        chunk.content = "The temperature is -5 degrees during the test.".to_owned();
+        let accepted_negative = extract_citations_verified_against_active(
+            "The temperature is -5 degrees [1].",
+            &[chunk.clone()],
+            &active,
+        );
+        assert_eq!(accepted_negative.citations.len(), 1);
+        assert_eq!(accepted_negative.rejected, 0);
+
         chunk.content = "The retry budget is 1,002 attempts before failure.".to_owned();
         let unsupported_grouped_number = extract_citations_verified_against_active(
             "The retry budget is 1,001 attempts [1].",
@@ -938,6 +981,15 @@ mod tests {
         );
         assert!(unsupported_grouped_number.citations.is_empty());
         assert_eq!(unsupported_grouped_number.rejected, 1);
+
+        chunk.content = "The retry budget is 1.002 attempts before failure.".to_owned();
+        let unsupported_three_digit_decimal = extract_citations_verified_against_active(
+            "The retry budget is 1.001 attempts [1].",
+            &[chunk.clone()],
+            &active,
+        );
+        assert!(unsupported_three_digit_decimal.citations.is_empty());
+        assert_eq!(unsupported_three_digit_decimal.rejected, 1);
 
         chunk.content = "The retry budget is 1 001 attempts before failure.".to_owned();
         let accepted_group_normalization = extract_citations_verified_against_active(

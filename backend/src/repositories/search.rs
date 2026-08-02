@@ -92,6 +92,13 @@ const COUNT_CHUNKS_FOR_NOTEBOOK_SQL: &str = r"
     WHERE s.notebook_id = $1
 ";
 
+const COUNT_SOURCES_FOR_NOTEBOOK_SQL: &str = r"
+    SELECT COUNT(*) as total
+    FROM sources s
+    JOIN notebooks n ON n.id = s.notebook_id AND n.user_id = $2
+    WHERE s.notebook_id = $1
+";
+
 const GET_ALL_CHUNKS_FOR_NOTEBOOK_SQL: &str = r"
     SELECT c.id, c.generation_id, c.source_id, c.chunk_index, c.content, c.parent_content,
            s.title as source_title
@@ -318,6 +325,22 @@ impl SearchRepository for SeaOrmSearchRepository {
             .unwrap_or(0);
 
         Ok(total)
+    }
+
+    #[tracing::instrument(skip(self), fields(notebook_id = %scope.notebook_id))]
+    async fn count_sources_for_notebook(&self, scope: NotebookScope) -> RepoResult<i64> {
+        let rows = self
+            .db
+            .query_all(self.stmt(
+                COUNT_SOURCES_FOR_NOTEBOOK_SQL,
+                [scope.notebook_id.into(), scope.account_id.into()],
+            ))
+            .await?;
+
+        Ok(rows
+            .first()
+            .and_then(|row| row.try_get::<i64>("", "total").ok())
+            .unwrap_or(0))
     }
 
     #[tracing::instrument(skip(self), fields(notebook_id = %scope.notebook_id))]

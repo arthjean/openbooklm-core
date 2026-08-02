@@ -222,7 +222,15 @@ pub async fn retrieve_context(
         .count_chunks_for_notebook(params.scope)
         .await?;
     if chunk_count == 0 {
-        outcome.reasons.insert(ReasonCode::EmptyCorpus);
+        let source_count = params
+            .search_repo
+            .count_sources_for_notebook(params.scope)
+            .await?;
+        outcome.reasons.insert(if source_count == 0 {
+            ReasonCode::EmptyCorpus
+        } else {
+            ReasonCode::NoCandidates
+        });
         return Ok((Vec::new(), outcome));
     }
 
@@ -767,6 +775,7 @@ mod tests {
     /// flakiness.
     struct FakeRepo {
         chunks: Vec<ChunkSearchResult>,
+        source_count: i64,
         /// Rows the dense search returns, when the index comes back short.
         dense_ceiling: Option<usize>,
     }
@@ -792,6 +801,15 @@ mod tests {
                 .collect();
             Self {
                 chunks,
+                source_count: 1,
+                dense_ceiling: None,
+            }
+        }
+
+        fn without_sources() -> Self {
+            Self {
+                chunks: Vec::new(),
+                source_count: 0,
                 dense_ceiling: None,
             }
         }
@@ -836,6 +854,10 @@ mod tests {
 
         async fn count_chunks_for_notebook(&self, _scope: NotebookScope) -> RepoResult<i64> {
             Ok(i64::try_from(self.chunks.len()).unwrap_or(i64::MAX))
+        }
+
+        async fn count_sources_for_notebook(&self, _scope: NotebookScope) -> RepoResult<i64> {
+            Ok(self.source_count)
         }
 
         async fn get_all_chunks_for_notebook(
@@ -1324,7 +1346,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_empty_notebook_is_reported_as_an_empty_corpus() {
-        let repo = FakeRepo::with_parents(0, 1);
+        let repo = FakeRepo::without_sources();
         let config = valid_core_config();
         let embedder = DeterministicEmbedder::new();
 
@@ -1350,6 +1372,29 @@ mod tests {
             outcome.score_domain, None,
             "nothing was ranked, so no scale ordered anything"
         );
+    }
+
+    #[tokio::test]
+    async fn a_configured_source_without_active_chunks_is_no_evidence_not_no_sources() {
+        let repo = FakeRepo::with_parents(0, 1);
+        let config = valid_core_config();
+        let embedder = DeterministicEmbedder::new();
+
+        let (results, outcome) = retrieve_context(&params(
+            &repo,
+            &config,
+            &embedder,
+            None,
+            10,
+            "anthropic",
+            "claude-sonnet-4-6-20260220",
+        ))
+        .await
+        .expect("retrieval succeeds");
+
+        assert!(results.is_empty());
+        assert!(!outcome.reasons.contains(ReasonCode::EmptyCorpus));
+        assert!(outcome.reasons.contains(ReasonCode::NoCandidates));
     }
 
     // ====================================================================

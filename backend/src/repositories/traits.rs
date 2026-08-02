@@ -527,6 +527,9 @@ pub trait SearchRepository: Send + Sync {
     /// Used to decide whether reranking should be applied (skip for small notebooks).
     async fn count_chunks_for_notebook(&self, scope: NotebookScope) -> RepoResult<i64>;
 
+    /// Count configured sources independently of active index generations.
+    async fn count_sources_for_notebook(&self, scope: NotebookScope) -> RepoResult<i64>;
+
     /// Load all chunks for a notebook with source titles, ordered by document structure.
     ///
     /// Used by context stuffing to bypass the search pipeline for small notebooks.

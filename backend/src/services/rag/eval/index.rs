@@ -422,6 +422,21 @@ impl SearchRepository for CorpusIndex {
         .unwrap_or(i64::MAX))
     }
 
+    async fn count_sources_for_notebook(&self, scope: NotebookScope) -> RepoResult<i64> {
+        let Some(notebook_id) = self.owned(scope) else {
+            return Ok(0);
+        };
+        Ok(i64::try_from(
+            self.chunks
+                .iter()
+                .filter(|chunk| chunk.notebook_id == notebook_id)
+                .map(|chunk| chunk.source_id)
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+        )
+        .unwrap_or(i64::MAX))
+    }
+
     async fn get_all_chunks_for_notebook(
         &self,
         scope: NotebookScope,

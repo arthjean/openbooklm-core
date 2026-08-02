@@ -524,6 +524,10 @@ mod tests {
             Ok(2)
         }
 
+        async fn count_sources_for_notebook(&self, _scope: NotebookScope) -> RepoResult<i64> {
+            Ok(1)
+        }
+
         async fn get_all_chunks_for_notebook(
             &self,
             _scope: NotebookScope,

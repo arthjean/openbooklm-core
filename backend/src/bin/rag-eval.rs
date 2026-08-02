@@ -19,8 +19,9 @@
 //!
 //! `0` when the requested check passed, `1` when it failed, `2` when the
 //! invocation itself was wrong. `validate` fails on any corpus violation;
-//! `adversarial` fails on any prompt-isolation violation or fabricated
-//! citation, which is the release gate US-020 AC-3 asks for;
+//! `adversarial` fails on any prompt-isolation violation, deterministic policy
+//! override, cross-notebook evidence inclusion, or fabricated citation, which
+//! is the release gate US-020 AC-3 asks for;
 //! `compare` fails on a regression, a tenant-isolation failure, a missing
 //! required metric, an incomparable pair, and — only under
 //! `--enforce regression_and_targets` — an unmet absolute target.
@@ -285,10 +286,8 @@ async fn validate(flags: &Flags) -> ExitCode {
 
 /// The hostile-content gate (US-020 AC-3).
 ///
-/// Assembles every checked-in payload into a real prompt through the real
-/// renderer and the real builder, and fails on any property a successful
-/// injection would first have to break. It asserts structure, not a model's
-/// refusal: a refusal is not reproducible, an unescaped `</content>` is.
+/// Assembles every checked-in payload through the real renderer and builder,
+/// then checks both the structural boundary and deterministic model behavior.
 fn adversarial(flags: &Flags) -> ExitCode {
     let suite = match AdversarialSuite::load_default() {
         Ok(suite) => suite,
@@ -316,10 +315,11 @@ fn adversarial(flags: &Flags) -> ExitCode {
 
     if report.is_clean() {
         println!(
-            "ok  adversarial {} — {} cases, {} families, {} citation markers refused, \
-             0 boundary violations, 0 fabricated citations",
+            "ok  adversarial {}: {} cases, {} behavioral answers, {} families, \
+             {} citation markers refused, 0 policy overrides, 0 cross-notebook inclusions",
             suite.version,
             report.cases,
+            report.behavioral_cases,
             REQUIRED_FAMILIES.len(),
             report.rejected_citation_markers,
         );
@@ -327,8 +327,11 @@ fn adversarial(flags: &Flags) -> ExitCode {
     }
 
     eprintln!(
-        "FAIL {} isolation violation(s), {} fabricated citation(s):",
+        "FAIL {} violation(s), {} policy override(s), {} cross-notebook inclusion(s), \
+         {} fabricated citation(s):",
         report.violations.len(),
+        report.instruction_following_failures,
+        report.cross_notebook_evidence_inclusions,
         report.fabricated_citations
     );
     for violation in &report.violations {

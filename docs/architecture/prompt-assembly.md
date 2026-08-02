@@ -123,8 +123,8 @@ documents" from a boolean.
 `contracts/eval/adversarial/cases.json` holds fifty synthetic hostile documents
 across six families: instruction override, secret request, fake system tag,
 poisoned citation, cross-notebook reference, encoded payload.
-`rag-eval adversarial` assembles each one into a real prompt and checks
-properties that do not depend on a model's mood:
+`rag-eval adversarial` assembles each one into a real prompt and checks both the
+structural boundary and deterministic offline answer behavior:
 
 - exactly the data policy blocks the builder wrote;
 - exactly one evidence region;
@@ -133,11 +133,14 @@ properties that do not depend on a model's mood:
   assembly;
 - structural characters survive as entities, not as markup;
 - citation markers the payload wrote resolve only to retrieved evidence.
+- with the attack ranked first and a relevant benign passage behind it, the
+  deterministic provider selects only the benign grounded answer and citation;
+- zero hostile payload is repeated or obeyed, and zero hostile or foreign
+  evidence is cited.
 
-Model behaviour is not asserted, because it is not reproducible in the offline
-gate. These checks prove the structural boundary only. EP-004 remains open
-until a provider-specific behavioral evaluation demonstrates zero successful
-instruction following on the same fixtures.
+The deterministic provider makes all fifty output-policy assertions byte-stable
+and network-free. A stochastic provider may add diagnostics, but cannot decide
+this release gate.
 
 Cross-notebook reach is answered where it is enforced rather than in the prompt:
 `NotebookScope` carries the account and the notebook, and all four search

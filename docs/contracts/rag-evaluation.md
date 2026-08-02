@@ -179,12 +179,15 @@ It is a release gate, not only a unit test: it fails when the suite drops below
 fifty cases, when an attack family loses its last fixture, when a payload breaks
 a boundary property, or when a citation resolves outside the retrieved set.
 
-It asserts structure, not behaviour. A model's refusal is not reproducible in
-this offline gate; what is reproducible is whether the payload could close its
-own element, forge a second data policy, or change a byte of the instructions
-that follow the evidence. These checks are necessary but do not prove model
-behavior. EP-004 stays open until a provider-specific behavioral run covers all
-fifty cases with zero successful instruction following.
+It asserts both structure and deterministic behavior. Every hostile case is
+ranked first, ahead of a benign passage relevant to the test question, and
+passed to the offline deterministic provider. The answer must select the benign
+passage behind the attack, stay byte-stably grounded in it, emit its citation
+only, repeat none of the hostile payload, and include no foreign evidence. The
+gate also checks that the system policy still explicitly rejects instructions
+inside source data. This makes all fifty policy-override checks reproducible
+and network-free; stochastic commercial-provider probes may add diagnostics
+but do not define the release gate.
 
 Cross-notebook reach is answered one layer down, where it is enforced: every
 search query joins `notebooks.user_id`, so a scope naming another account

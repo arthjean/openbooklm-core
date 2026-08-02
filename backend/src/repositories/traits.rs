@@ -866,22 +866,29 @@ pub trait RagLogRepository: Send + Sync {
 
 #[async_trait]
 pub trait OcrCacheRepository: Send + Sync {
-    /// Look up cached OCR text by content hash and model.
+    /// Look up OCR text owned by this source, content hash and model.
     ///
     /// Returns `(ocr_text, pages_processed)` on cache hit, `None` on miss.
     async fn find_by_hash(
         &self,
+        source_id: Uuid,
         content_hash: &str,
         model: &str,
     ) -> RepoResult<Option<(String, i32)>>;
 
-    /// Store OCR result in the cache. Uses `ON CONFLICT DO NOTHING` for
-    /// race-condition safety (concurrent OCR calls for the same PDF).
+    /// Store the source's current OCR result, evicting its previous cache row.
+    /// Concurrent writes for identical content preserve the first result while
+    /// transferring ownership to a live source.
     async fn store(
         &self,
+        source_id: Uuid,
         content_hash: &str,
         model: &str,
         ocr_text: &str,
         pages_processed: i32,
     ) -> RepoResult<()>;
+
+    /// Delete cache rows written without a source owner by a pre-migration
+    /// binary during a rolling deployment.
+    async fn purge_unowned(&self) -> RepoResult<u64>;
 }

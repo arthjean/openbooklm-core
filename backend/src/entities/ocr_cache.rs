@@ -1,5 +1,4 @@
-//! OCR cache entity — stores OCR results keyed by (content_hash, model)
-//! to avoid redundant Mistral OCR API calls for identical PDF uploads.
+//! OCR cache entity — stores one source-owned OCR result per PDF source.
 
 use sea_orm::entity::prelude::*;
 
@@ -9,6 +8,10 @@ use sea_orm::entity::prelude::*;
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub id: Uuid,
+
+    /// Source that owns this derived text. Nullable only for rolling
+    /// compatibility with the legacy writer; current code never writes NULL.
+    pub source_id: Option<Uuid>,
 
     /// SHA-256 hex digest of the raw PDF bytes (always 64 chars).
     pub content_hash: String,
@@ -27,6 +30,15 @@ pub struct Model {
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
-pub enum Relation {}
+pub enum Relation {
+    #[sea_orm(
+        belongs_to = "super::source::Entity",
+        from = "Column::SourceId",
+        to = "super::source::Column::Id"
+    )]
+    Source,
+}
+
+super::impl_related!(super::source::Entity, Relation::Source);
 
 impl ActiveModelBehavior for ActiveModel {}

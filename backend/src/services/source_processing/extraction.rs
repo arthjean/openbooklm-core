@@ -518,7 +518,7 @@ async fn extract_pdf(
 
                 let cache_result = deps
                     .ocr_cache
-                    .find_by_hash(&pdf_content_hash, &ocr_model)
+                    .find_by_hash(source_id, &pdf_content_hash, &ocr_model)
                     .await;
 
                 if let Err(ref e) = cache_result {
@@ -609,6 +609,7 @@ async fn extract_pdf(
                         if let Err(e) = deps
                             .ocr_cache
                             .store(
+                                source_id,
                                 &pdf_content_hash,
                                 &ocr_model,
                                 &encode_ocr_pages(&merged_pages),

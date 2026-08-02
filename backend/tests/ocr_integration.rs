@@ -275,36 +275,59 @@ fn multi_page_pdf(page_count: usize, text_pages: &[usize]) -> Vec<u8> {
 // Mock: In-memory OcrCacheRepository
 // ============================================================================
 
+type OcrCacheKey = (String, String);
+
+struct OcrCacheValue {
+    source_id: Uuid,
+    ocr_text: String,
+    pages_processed: i32,
+}
+
 #[derive(Default)]
 struct InMemoryOcrCache {
-    inner: Mutex<HashMap<(String, String), (String, i32)>>,
+    inner: Mutex<HashMap<OcrCacheKey, OcrCacheValue>>,
 }
 
 #[async_trait]
 impl OcrCacheRepository for InMemoryOcrCache {
     async fn find_by_hash(
         &self,
+        source_id: Uuid,
         content_hash: &str,
         model: &str,
     ) -> RepoResult<Option<(String, i32)>> {
         let guard = self.inner.lock().unwrap();
         Ok(guard
             .get(&(content_hash.to_string(), model.to_string()))
-            .cloned())
+            .filter(|value| value.source_id == source_id)
+            .map(|value| (value.ocr_text.clone(), value.pages_processed)))
     }
 
     async fn store(
         &self,
+        source_id: Uuid,
         content_hash: &str,
         model: &str,
         ocr_text: &str,
         pages_processed: i32,
     ) -> RepoResult<()> {
         let mut guard = self.inner.lock().unwrap();
+        guard.retain(|(hash, cache_model), value| {
+            value.source_id != source_id || (hash == content_hash && cache_model == model)
+        });
         guard
             .entry((content_hash.to_string(), model.to_string()))
-            .or_insert_with(|| (ocr_text.to_string(), pages_processed));
+            .and_modify(|value| value.source_id = source_id)
+            .or_insert_with(|| OcrCacheValue {
+                source_id,
+                ocr_text: ocr_text.to_string(),
+                pages_processed,
+            });
         Ok(())
+    }
+
+    async fn purge_unowned(&self) -> RepoResult<u64> {
+        Ok(0)
     }
 }
 
@@ -650,7 +673,7 @@ fn pdf_page_count_invalid_bytes() {
 async fn ocr_cache_miss_returns_none() {
     let cache = InMemoryOcrCache::default();
     let result = cache
-        .find_by_hash("abc123", "mistral-ocr-latest")
+        .find_by_hash(Uuid::nil(), "abc123", "mistral-ocr-latest")
         .await
         .unwrap();
     assert!(result.is_none(), "Cache miss should return None");
@@ -661,12 +684,18 @@ async fn ocr_cache_miss_returns_none() {
 async fn ocr_cache_hit_returns_stored_text() {
     let cache = InMemoryOcrCache::default();
     cache
-        .store("abc123", "mistral-ocr-latest", "# Extracted text", 3)
+        .store(
+            Uuid::nil(),
+            "abc123",
+            "mistral-ocr-latest",
+            "# Extracted text",
+            3,
+        )
         .await
         .unwrap();
 
     let result = cache
-        .find_by_hash("abc123", "mistral-ocr-latest")
+        .find_by_hash(Uuid::nil(), "abc123", "mistral-ocr-latest")
         .await
         .unwrap();
     assert_eq!(
@@ -681,12 +710,12 @@ async fn ocr_cache_hit_returns_stored_text() {
 async fn ocr_cache_different_model_is_miss() {
     let cache = InMemoryOcrCache::default();
     cache
-        .store("abc123", "mistral-ocr-latest", "# Text", 1)
+        .store(Uuid::nil(), "abc123", "mistral-ocr-latest", "# Text", 1)
         .await
         .unwrap();
 
     let result = cache
-        .find_by_hash("abc123", "mistral-ocr-v2")
+        .find_by_hash(Uuid::nil(), "abc123", "mistral-ocr-v2")
         .await
         .unwrap();
     assert!(result.is_none(), "Different model should be a cache miss");
@@ -697,22 +726,91 @@ async fn ocr_cache_different_model_is_miss() {
 async fn ocr_cache_duplicate_store_preserves_first() {
     let cache = InMemoryOcrCache::default();
     cache
-        .store("abc123", "mistral-ocr-latest", "first", 1)
+        .store(Uuid::nil(), "abc123", "mistral-ocr-latest", "first", 1)
         .await
         .unwrap();
     cache
-        .store("abc123", "mistral-ocr-latest", "second", 2)
+        .store(Uuid::nil(), "abc123", "mistral-ocr-latest", "second", 2)
         .await
         .unwrap();
 
     let result = cache
-        .find_by_hash("abc123", "mistral-ocr-latest")
+        .find_by_hash(Uuid::nil(), "abc123", "mistral-ocr-latest")
         .await
         .unwrap();
     assert_eq!(
         result,
         Some(("first".to_string(), 1)),
         "First store should win on duplicate"
+    );
+}
+
+#[tokio::test]
+async fn ocr_cache_is_scoped_and_bounded_per_source() {
+    let cache = InMemoryOcrCache::default();
+    let source_a = Uuid::new_v4();
+    let source_b = Uuid::new_v4();
+
+    cache
+        .store(source_a, "hash-v1", "model-v1", "first", 1)
+        .await
+        .unwrap();
+    assert!(
+        cache
+            .find_by_hash(source_b, "hash-v1", "model-v1")
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    cache
+        .store(source_a, "hash-v2", "model-v2", "replacement", 2)
+        .await
+        .unwrap();
+    assert!(
+        cache
+            .find_by_hash(source_a, "hash-v1", "model-v1")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        cache
+            .find_by_hash(source_a, "hash-v2", "model-v2")
+            .await
+            .unwrap(),
+        Some(("replacement".to_owned(), 2))
+    );
+}
+
+#[tokio::test]
+async fn duplicate_ocr_content_transfers_ownership_without_replacing_text() {
+    let cache = InMemoryOcrCache::default();
+    let source_a = Uuid::new_v4();
+    let source_b = Uuid::new_v4();
+
+    cache
+        .store(source_a, "shared-hash", "model", "first result", 1)
+        .await
+        .unwrap();
+    cache
+        .store(source_b, "shared-hash", "model", "second result", 2)
+        .await
+        .unwrap();
+
+    assert!(
+        cache
+            .find_by_hash(source_a, "shared-hash", "model")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        cache
+            .find_by_hash(source_b, "shared-hash", "model")
+            .await
+            .unwrap(),
+        Some(("first result".to_owned(), 1))
     );
 }
 
@@ -723,13 +821,16 @@ async fn ocr_cache_duplicate_store_preserves_first() {
 async fn ocr_with_cache_lookup(
     cache: &dyn OcrCacheRepository,
     client: &MistralOcrClient,
+    source_id: Uuid,
     pdf_bytes: &[u8],
     content_hash: &str,
     model: &str,
     pages: Option<Vec<u32>>,
 ) -> Result<(String, i32), openbooklm::error::AppError> {
     // Check cache first (mirrors source_processing.rs logic)
-    if let Some((cached_text, pages_processed)) = cache.find_by_hash(content_hash, model).await? {
+    if let Some((cached_text, pages_processed)) =
+        cache.find_by_hash(source_id, content_hash, model).await?
+    {
         return Ok((cached_text, pages_processed));
     }
 
@@ -743,7 +844,7 @@ async fn ocr_with_cache_lookup(
         .join("\n\n");
     let pages_processed = result.pages_processed as i32;
     cache
-        .store(content_hash, model, &text, pages_processed)
+        .store(source_id, content_hash, model, &text, pages_processed)
         .await?;
     Ok((text, pages_processed))
 }
@@ -781,15 +882,22 @@ async fn ocr_cache_hit_skips_api_call() {
     let model = "mistral-ocr-latest";
     let cached_text = "# Cached OCR result\n\nExtracted text from cache.";
     cache
-        .store(content_hash, model, cached_text, 3)
+        .store(Uuid::nil(), content_hash, model, cached_text, 3)
         .await
         .unwrap();
 
     // Call the cache-aware helper — should return cached text without calling the API.
-    let (text, pages) =
-        ocr_with_cache_lookup(&cache, &client, &pdf_bytes, content_hash, model, None)
-            .await
-            .expect("Cache lookup should succeed");
+    let (text, pages) = ocr_with_cache_lookup(
+        &cache,
+        &client,
+        Uuid::nil(),
+        &pdf_bytes,
+        content_hash,
+        model,
+        None,
+    )
+    .await
+    .expect("Cache lookup should succeed");
 
     assert_eq!(text, cached_text);
     assert_eq!(pages, 3);
@@ -823,16 +931,26 @@ async fn ocr_cache_miss_calls_api_and_caches_result() {
     let model = "mistral-ocr-latest";
 
     // First call: cache miss → API called.
-    let (text, pages) =
-        ocr_with_cache_lookup(&cache, &client, &pdf_bytes, content_hash, model, None)
-            .await
-            .expect("OCR should succeed on cache miss");
+    let (text, pages) = ocr_with_cache_lookup(
+        &cache,
+        &client,
+        Uuid::nil(),
+        &pdf_bytes,
+        content_hash,
+        model,
+        None,
+    )
+    .await
+    .expect("OCR should succeed on cache miss");
 
     assert!(text.contains("# From API"));
     assert_eq!(pages, 1);
 
     // Verify the result was stored in cache.
-    let cached = cache.find_by_hash(content_hash, model).await.unwrap();
+    let cached = cache
+        .find_by_hash(Uuid::nil(), content_hash, model)
+        .await
+        .unwrap();
     assert!(cached.is_some(), "Result should be cached after API call");
     assert_eq!(cached.unwrap().0, text);
 }
@@ -931,6 +1049,61 @@ fn merge_ocr_pages_no_ocr_preserves_native() {
 // 7. DB-backed OCR Cache Tests
 // ============================================================================
 
+async fn create_ocr_cache_source(db: &sea_orm::DatabaseConnection) -> (Uuid, Uuid) {
+    use openbooklm_migration_core::core_track::{CoreMigrator, with_migration_lock};
+    use openbooklm_migration_core::{MigratorTrait, validate_core_state};
+    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+
+    let state = validate_core_state(db)
+        .await
+        .expect("validate core migration state for OCR cache test");
+    if let Some(remediation) = state.remediation() {
+        panic!("unsafe OCR cache test database: {remediation}");
+    }
+    with_migration_lock(db, async || CoreMigrator::up(db, None).await)
+        .await
+        .expect("apply core migrations for OCR cache test");
+
+    let account_id = Uuid::new_v4();
+    let notebook_id = Uuid::new_v4();
+    let source_id = Uuid::new_v4();
+    db.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "INSERT INTO accounts (id) VALUES ($1)",
+        [account_id.into()],
+    ))
+    .await
+    .expect("create OCR test account");
+    db.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "INSERT INTO notebooks (id, user_id, title) VALUES ($1, $2, 'OCR cache test')",
+        [notebook_id.into(), account_id.into()],
+    ))
+    .await
+    .expect("create OCR test notebook");
+    db.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "INSERT INTO sources (id, notebook_id, title, source_type, content) \
+         VALUES ($1, $2, 'OCR cache test', 'pdf', '')",
+        [source_id.into(), notebook_id.into()],
+    ))
+    .await
+    .expect("create OCR test source");
+    (account_id, source_id)
+}
+
+async fn delete_ocr_cache_fixture(db: &sea_orm::DatabaseConnection, account_id: Uuid) {
+    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+
+    db.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "DELETE FROM accounts WHERE id = $1",
+        [account_id.into()],
+    ))
+    .await
+    .expect("delete OCR test fixture");
+}
+
 /// Round-trip: store OCR result → find by hash → returns cached text.
 ///
 /// Uses a real PostgreSQL database. Run with:
@@ -950,24 +1123,31 @@ async fn ocr_cache_db_roundtrip() {
         .expect("Failed to connect to test database");
 
     let repo = SeaOrmOcrCacheRepository::new(&db);
+    let (account_id, source_id) = create_ocr_cache_source(&db).await;
     let hash = format!("test_hash_{}", Uuid::new_v4());
     let model = "mistral-ocr-latest";
 
     // Cache miss before storing.
     let miss = repo
-        .find_by_hash(&hash, model)
+        .find_by_hash(source_id, &hash, model)
         .await
         .expect("find_by_hash should not error");
     assert!(miss.is_none(), "Should be a cache miss before store");
 
     // Store.
-    repo.store(&hash, model, "# Extracted markdown\n\nSome content.", 5)
-        .await
-        .expect("store should succeed");
+    repo.store(
+        source_id,
+        &hash,
+        model,
+        "# Extracted markdown\n\nSome content.",
+        5,
+    )
+    .await
+    .expect("store should succeed");
 
     // Cache hit after storing.
     let hit = repo
-        .find_by_hash(&hash, model)
+        .find_by_hash(source_id, &hash, model)
         .await
         .expect("find_by_hash should not error");
     assert_eq!(
@@ -978,16 +1158,17 @@ async fn ocr_cache_db_roundtrip() {
 
     // Different model → miss.
     let diff_model = repo
-        .find_by_hash(&hash, "mistral-ocr-v2")
+        .find_by_hash(source_id, &hash, "mistral-ocr-v2")
         .await
         .expect("find_by_hash should not error");
     assert!(
         diff_model.is_none(),
         "Different model should be a cache miss"
     );
+    delete_ocr_cache_fixture(&db, account_id).await;
 }
 
-/// Duplicate inserts are idempotent (ON CONFLICT DO NOTHING).
+/// Duplicate stores are idempotent and preserve the first OCR payload.
 #[tokio::test]
 #[ignore = "Requires real PostgreSQL database (TEST_DATABASE_URL env var)"]
 async fn ocr_cache_db_duplicate_insert_idempotent() {
@@ -1001,26 +1182,28 @@ async fn ocr_cache_db_duplicate_insert_idempotent() {
         .expect("Failed to connect to test database");
 
     let repo = SeaOrmOcrCacheRepository::new(&db);
+    let (account_id, source_id) = create_ocr_cache_source(&db).await;
     let hash = format!("dup_test_{}", Uuid::new_v4());
     let model = "mistral-ocr-latest";
 
     // First insert.
-    repo.store(&hash, model, "first text", 1)
+    repo.store(source_id, &hash, model, "first text", 1)
         .await
         .expect("first store should succeed");
 
-    // Second insert with same key — should not error (ON CONFLICT DO NOTHING).
-    repo.store(&hash, model, "second text", 2)
+    // A second store with the same key should not error or replace OCR output.
+    repo.store(source_id, &hash, model, "second text", 2)
         .await
         .expect("duplicate store should not error");
 
     // First value should be preserved.
-    let result = repo.find_by_hash(&hash, model).await.unwrap();
+    let result = repo.find_by_hash(source_id, &hash, model).await.unwrap();
     assert_eq!(
         result,
         Some(("first text".to_string(), 1)),
         "First insert should win on conflict"
     );
+    delete_ocr_cache_fixture(&db, account_id).await;
 }
 
 // ============================================================================

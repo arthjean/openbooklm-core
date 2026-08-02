@@ -691,6 +691,18 @@ async fn deleting_a_source_reclaims_its_generations_and_chunks() {
     let generation = f
         .publish_generation(source_id, "cascade", 3, &provenance("model-a"))
         .await;
+    exec(
+        &f.db,
+        "INSERT INTO ocr_cache (
+             id, source_id, content_hash, model, ocr_text, pages_processed
+         ) VALUES ($1, $2, $3, 'test-model', 'derived text', 1)",
+        [
+            Uuid::new_v4().into(),
+            source_id.into(),
+            format!("{:064x}", 1).into(),
+        ],
+    )
+    .await;
 
     exec(
         &f.db,
@@ -713,6 +725,15 @@ async fn deleting_a_source_reclaims_its_generations_and_chunks() {
             &f.db,
             "SELECT count(*) AS value FROM chunks WHERE generation_id = $1",
             [generation.into()],
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        scalar_i64(
+            &f.db,
+            "SELECT count(*) AS value FROM ocr_cache WHERE source_id = $1",
+            [source_id.into()],
         )
         .await,
         0

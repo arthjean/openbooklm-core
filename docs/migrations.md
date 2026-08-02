@@ -140,11 +140,20 @@ restore.
 | `m20260729_000001_core_baseline` | the complete core schema for a fresh install |
 | `m20260801_000001_index_generations` | immutable index generations, the active-generation pointer, and the backfill of existing chunks (EP-002) |
 | `m20260801_000002_rag_log_redaction` | query hashes plus structural scrubbing of legacy raw RAG log fields (US-004) |
+| `m20260802_000001_data_retention` | source ownership and cascade deletion for derived OCR cache entries |
 
 The RAG-log redaction is intentionally irreversible: existing raw query,
 reformulation and HyDE values are cleared during `up`, and the trigger rejects
 future writes to those legacy fields. A `down` migration cannot reconstruct
 that private text.
+
+The data-retention migration adds source ownership and cascade deletion for new
+OCR cache writes. `source_id` stays nullable for one rolling-compatibility
+window because the previous writer does not populate it; the new reader ignores
+nullable legacy rows, and the migration discards the pre-existing unowned
+cache. The reference server's daily retention pass removes any nullable rows
+written while an older process is still draining. No source document is
+removed: OCR cache rows are recomputable derived data.
 
 `m20260801_000001_index_generations` is additive and idempotent, and refuses to
 run on a corpus it cannot represent: among the chunks it would backfill,

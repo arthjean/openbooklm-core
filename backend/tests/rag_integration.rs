@@ -1,3 +1,10 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unimplemented
+)]
+
 //! Index-generation integration suite (EP-002).
 //!
 //! Every test here needs a real PostgreSQL with pgvector, because every claim

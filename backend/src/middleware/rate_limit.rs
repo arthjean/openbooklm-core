@@ -58,6 +58,9 @@ struct UpstashPipelineResult {
 }
 
 impl UpstashRedis {
+    /// The builder applies only a positive constant timeout, so no invalid
+    /// runtime configuration reaches reqwest here.
+    #[allow(clippy::expect_used)]
     fn new(url: impl Into<Arc<str>>, token: impl Into<Arc<str>>) -> Self {
         let http = reqwest::Client::builder()
             .timeout(REDIS_TIMEOUT)
@@ -78,7 +81,7 @@ impl UpstashRedis {
     async fn check_rate_limit(&self, client_id: &str, window_secs: u64) -> Result<i64, String> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .expect("system time before epoch")
+            .unwrap_or_default()
             .as_secs();
         let window_key = now / window_secs;
         let key = format!("ratelimit:{client_id}:{window_key}");
@@ -235,7 +238,7 @@ impl RateLimiter {
                     // Over limit — compute retry_after from current position in the window
                     let now_secs = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
-                        .expect("system time before epoch")
+                        .unwrap_or_default()
                         .as_secs();
                     let elapsed_in_window = now_secs % 60;
                     let retry_after =

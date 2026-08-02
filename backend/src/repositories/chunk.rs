@@ -112,7 +112,7 @@ async fn insert_chunk_rows(
                 sql.push_str(", ");
             }
             let base = row_idx * PARAMS_PER_ROW;
-            write!(
+            let _ = write!(
                 sql,
                 "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}::jsonb, ${}::vector, ${}, NOW())",
                 base + 1,
@@ -125,8 +125,7 @@ async fn insert_chunk_rows(
                 base + 8,
                 base + 9,
                 base + 10,
-            )
-            .expect("write to String");
+            );
 
             let chunk_index = base_chunk_index + offset;
             let context_prefix_val: sea_orm::Value = match &chunk.context_prefix {

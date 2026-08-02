@@ -1,3 +1,10 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unimplemented
+)]
+
 //! Integration tests for P0 fixes (US-017).
 //!
 //! Verifies the critical core P0 fixes:

@@ -578,8 +578,7 @@ impl IntoResponseParts for ChatError {
                 let now = chrono::Utc::now();
                 let tomorrow_midnight = (now + chrono::Duration::days(1))
                     .date_naive()
-                    .and_hms_opt(0, 0, 0)
-                    .expect("valid midnight timestamp");
+                    .and_time(chrono::NaiveTime::MIN);
                 let seconds_until_midnight =
                     (tomorrow_midnight - now.naive_utc()).num_seconds().max(1) as u32;
                 ProblemDetails::rate_limited(self.to_string(), seconds_until_midnight)

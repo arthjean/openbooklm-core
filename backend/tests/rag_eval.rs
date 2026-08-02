@@ -1,3 +1,10 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unimplemented
+)]
+
 //! The RAG evaluation contract, end to end (EP-001).
 //!
 //! Unit tests inside `services::rag::eval` cover each metric and each failure
@@ -19,8 +26,6 @@
 //! Nothing here opens a socket. The corpus is a checked-in fixture, retrieval
 //! runs in memory, and generation uses the in-process deterministic model
 //! (FR-20).
-
-#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::path::{Path, PathBuf};
 

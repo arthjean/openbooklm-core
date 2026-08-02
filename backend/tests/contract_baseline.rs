@@ -1,3 +1,10 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unimplemented
+)]
+
 //! Golden contract baseline for the open-core split (US-002, EP-001).
 //!
 //! These tests freeze the **current** public REST and SSE behavior so that the
@@ -24,8 +31,6 @@
 //!
 //! Nothing here touches PostgreSQL, a provider API or a commercial key. The one
 //! provider used is `FakeLlmProvider`, defined below.
-
-#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

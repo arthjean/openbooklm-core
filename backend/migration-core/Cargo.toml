@@ -7,6 +7,9 @@ license = "Apache-2.0"
 publish = false
 description = "OpenbookLM public core schema: baseline, migration track and startup validation"
 
+[lints]
+workspace = true
+
 [lib]
 name = "openbooklm_migration_core"
 path = "src/lib.rs"

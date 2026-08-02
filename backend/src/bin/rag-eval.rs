@@ -1,3 +1,13 @@
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unimplemented
+    )
+)]
+
 //! Offline RAG evaluation command (EP-001).
 //!
 //! ```bash

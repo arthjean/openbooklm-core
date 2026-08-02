@@ -116,6 +116,12 @@ pub struct ExternalClients {
 }
 
 impl ExternalClients {
+    /// Build clients from validated configuration.
+    ///
+    /// The shared HTTP builder only applies a positive constant timeout, so it
+    /// carries no fallible user input and its construction cannot fail under
+    /// reqwest's current contract.
+    #[allow(clippy::expect_used)]
     pub fn from_config(config: &CoreConfig) -> Self {
         let metrics = ClientMetrics::new();
 

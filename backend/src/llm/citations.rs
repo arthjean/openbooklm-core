@@ -25,6 +25,7 @@ use regex::Regex;
 use super::types::{ChunkProvenance, CitableChunk, Citation};
 
 /// Pre-compiled citation regex [N].
+#[allow(clippy::expect_used)] // Static regex literal is validated by the test suite.
 static CITATION_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\[(\d+)\]").expect("valid regex"));
 

@@ -142,6 +142,10 @@ struct ContentPatterns {
 }
 
 impl ContentPatterns {
+    // Every pattern is a static literal or a regex-escaped static title. A
+    // failure is a source-code defect discovered by unit tests, not runtime
+    // input that can be recovered from.
+    #[allow(clippy::expect_used)]
     fn new() -> Self {
         Self {
             image: Regex::new(r"!\[[^\]]*\]\([^)]*\)").expect("valid regex"),

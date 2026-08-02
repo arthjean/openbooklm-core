@@ -1,3 +1,10 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unimplemented
+)]
+
 //! Integration tests for OCR support (US-011).
 //!
 //! Covers the Mistral OCR pipeline end-to-end:

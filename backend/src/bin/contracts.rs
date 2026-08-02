@@ -1,3 +1,13 @@
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unimplemented
+    )
+)]
+
 //! Generate the public contract artifacts (US-010).
 //!
 //! ```bash

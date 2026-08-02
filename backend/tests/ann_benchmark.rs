@@ -1,3 +1,10 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unimplemented
+)]
+
 //! Filtered HNSW versus exact search (US-015).
 //!
 //! The measurement US-016 is not allowed to skip. It seeds 100,000 synthetic

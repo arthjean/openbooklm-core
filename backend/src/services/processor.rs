@@ -309,6 +309,7 @@ pub fn extract_docx_text(docx_bytes: &[u8]) -> Result<String, AppError> {
 ///
 /// # Errors
 /// Returns `AppError::Validation` for corrupted, DRM-protected, or invalid EPUB files.
+#[allow(clippy::expect_used)] // `body` is a static selector covered by tests.
 pub fn extract_epub_text(epub_bytes: &[u8]) -> Result<(String, serde_json::Value), AppError> {
     use scraper::{Html, Selector};
     use zip::ZipArchive;

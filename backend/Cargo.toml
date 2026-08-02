@@ -20,6 +20,15 @@ description = "OpenbookLM core — RAG-powered document chat: ingestion, retriev
 [workspace]
 members = [".", "migration-core"]
 
+[workspace.lints.clippy]
+panic = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+todo = "warn"
+unwrap_used = "warn"
+expect_used = "warn"
+unwrap_in_result = "warn"
+
 [workspace.dependencies]
 sea-orm = { version = "1", features = ["sqlx-postgres", "runtime-tokio-rustls"] }
 sea-orm-migration = { version = "1", features = ["sqlx-postgres", "runtime-tokio-rustls"] }
@@ -32,6 +41,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "
 # of this repository.
 [features]
 saas = []
+
+[lints]
+workspace = true
 
 [lib]
 name = "openbooklm"

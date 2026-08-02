@@ -1,3 +1,13 @@
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unimplemented
+    )
+)]
+
 //! The OpenbookLM reference server (US-013, EP-004).
 //!
 //! A complete, supported self-hosted binary: the public core router, the public

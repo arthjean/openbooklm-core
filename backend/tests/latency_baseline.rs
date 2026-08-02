@@ -1,3 +1,10 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unimplemented
+)]
+
 //! Latency baseline harness (US-002, EP-001).
 //!
 //! Records P50 and P95 for the four operations the PRD names as the regression
@@ -25,8 +32,6 @@
 //! `docs/contracts/latency-baseline.md` records the numbers taken on the
 //! reference environment. Comparison against those numbers is a deployment gate
 //! (US-019), not a unit test.
-
-#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};

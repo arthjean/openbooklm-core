@@ -1,3 +1,10 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unimplemented
+)]
+
 //! Reference-server identity contract (US-013, EP-004).
 //!
 //! Proves the two acceptance criteria that do not need a database: a protected

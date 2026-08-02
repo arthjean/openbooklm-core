@@ -1,3 +1,13 @@
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unimplemented
+    )
+)]
+
 //! OpenbookLM backend.
 //!
 //! One crate, two editions. Everything declared unconditionally is the public

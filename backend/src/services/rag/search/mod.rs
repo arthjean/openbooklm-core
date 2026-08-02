@@ -290,16 +290,10 @@ pub async fn hybrid_search(
         .search_hybrid_chunks(scope, &embedded.vector, query, request.clamped_limit())
         .await?;
     let search_ms = search_start.elapsed().as_millis();
-    let (dense_results, dense_dropped) = filter_and_convert(
-        rows.dense,
-        request.min_relevance,
-        ScoreDomain::DenseSimilarity,
-    );
-    let (lexical_results, lexical_dropped) = filter_and_convert(
-        rows.lexical,
-        request.min_relevance,
-        ScoreDomain::LexicalRank,
-    );
+    let (dense_results, dense_dropped) =
+        filter_and_convert(rows.dense, None, ScoreDomain::DenseSimilarity);
+    let (lexical_results, lexical_dropped) =
+        filter_and_convert(rows.lexical, None, ScoreDomain::LexicalRank);
 
     // Fuse results using RRF
     let fused = reciprocal_rank_fusion(
@@ -469,10 +463,11 @@ mod tests {
     struct SnapshotRepo {
         old_generation: Uuid,
         new_generation: Uuid,
+        score: f32,
     }
 
     impl SnapshotRepo {
-        fn row(generation_id: Uuid, marker: &str) -> ChunkSearchResult {
+        fn row(&self, generation_id: Uuid, marker: &str) -> ChunkSearchResult {
             ChunkSearchResult {
                 id: Uuid::new_v4(),
                 generation_id,
@@ -481,7 +476,7 @@ mod tests {
                 content: marker.to_owned(),
                 parent_content: None,
                 source_title: "Source".to_owned(),
-                relevance_score: 0.9,
+                relevance_score: self.score,
                 metadata: None,
             }
         }
@@ -495,7 +490,7 @@ mod tests {
             _query_embedding: &[f32],
             _limit: i32,
         ) -> RepoResult<Vec<ChunkSearchResult>> {
-            Ok(vec![Self::row(self.new_generation, "new dense")])
+            Ok(vec![self.row(self.new_generation, "new dense")])
         }
 
         async fn search_lexical_chunks(
@@ -504,7 +499,7 @@ mod tests {
             _query: &str,
             _limit: i32,
         ) -> RepoResult<Vec<ChunkSearchResult>> {
-            Ok(vec![Self::row(self.old_generation, "old lexical")])
+            Ok(vec![self.row(self.old_generation, "old lexical")])
         }
 
         async fn search_hybrid_chunks(
@@ -515,8 +510,8 @@ mod tests {
             _limit: i32,
         ) -> RepoResult<HybridChunkSearchResult> {
             Ok(HybridChunkSearchResult {
-                dense: vec![Self::row(self.new_generation, "new dense")],
-                lexical: vec![Self::row(self.new_generation, "new lexical")],
+                dense: vec![self.row(self.new_generation, "new dense")],
+                lexical: vec![self.row(self.new_generation, "new lexical")],
             })
         }
 
@@ -543,6 +538,7 @@ mod tests {
         let repo = SnapshotRepo {
             old_generation,
             new_generation,
+            score: 0.9,
         };
         let embedder = DeterministicEmbedder::new();
         let outcome = hybrid_search(
@@ -563,6 +559,31 @@ mod tests {
                 .all(|result| result.generation_id == new_generation),
             "RRF must receive both branches from one generation snapshot"
         );
+    }
+
+    #[tokio::test]
+    async fn hybrid_threshold_applies_only_to_the_fused_score() {
+        let repo = SnapshotRepo {
+            old_generation: Uuid::from_u128(1),
+            new_generation: Uuid::from_u128(2),
+            score: 0.005,
+        };
+        let embedder = DeterministicEmbedder::new();
+        let outcome = hybrid_search(
+            &repo,
+            &HybridSearchConfig::default(),
+            NotebookScope::new(Uuid::new_v4(), Uuid::new_v4()),
+            &SearchRequest::new("generation")
+                .with_limit(10)
+                .with_min_relevance(0.01),
+            &QueryEmbedder::direct(&embedder),
+        )
+        .await
+        .expect("hybrid search");
+
+        assert_eq!(outcome.results.len(), 1);
+        assert_eq!(outcome.results[0].score.domain(), ScoreDomain::RrfRank);
+        assert!(outcome.results[0].relevance() >= 0.01);
     }
 
     #[test]

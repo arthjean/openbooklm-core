@@ -142,7 +142,7 @@ fn dense_rows(rows: Vec<QueryResult>) -> RepoResult<Vec<ChunkSearchResult>> {
                 content: row.try_get("", "content")?,
                 parent_content: row.try_get("", "parent_content")?,
                 source_title: row.try_get("", "source_title")?,
-                relevance_score: (1.0 - distance).max(0.0) as f32,
+                relevance_score: clamp_finite_or_preserve((1.0 - distance) as f32, 0.0, 1.0),
                 metadata: row.try_get("", "metadata").ok(),
             })
         })
@@ -161,11 +161,19 @@ fn lexical_rows(rows: Vec<QueryResult>) -> RepoResult<Vec<ChunkSearchResult>> {
                 content: row.try_get("", "content")?,
                 parent_content: row.try_get("", "parent_content")?,
                 source_title: row.try_get("", "source_title")?,
-                relevance_score: rank.min(1.0),
+                relevance_score: clamp_finite_or_preserve(rank, 0.0, 1.0),
                 metadata: row.try_get("", "metadata").ok(),
             })
         })
         .collect()
+}
+
+fn clamp_finite_or_preserve(value: f32, min: f32, max: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(min, max)
+    } else {
+        value
+    }
 }
 
 #[async_trait]
@@ -371,5 +379,21 @@ impl SearchRepository for SeaOrmSearchRepository {
                 })
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clamp_finite_or_preserve;
+
+    #[test]
+    fn non_finite_scores_survive_mapping_so_the_typed_boundary_can_reject_them() {
+        assert!(clamp_finite_or_preserve(f32::NAN, 0.0, 1.0).is_nan());
+        assert_eq!(
+            clamp_finite_or_preserve(f32::INFINITY, 0.0, 1.0),
+            f32::INFINITY
+        );
+        assert_eq!(clamp_finite_or_preserve(-0.4, 0.0, 1.0), 0.0);
+        assert_eq!(clamp_finite_or_preserve(1.4, 0.0, 1.0), 1.0);
     }
 }

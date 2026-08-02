@@ -3,8 +3,7 @@
 //! Logs redacted RAG interaction details for quality analysis: query hashes,
 //! retrieved chunk identifiers, scores and feedback.
 //!
-//! Logs are created non-blocking (via `tokio::spawn`) so they don't
-//! delay the SSE response to the user.
+//! Logs are awaited before the terminal SSE event so its `rag_log_id` is stable.
 //!
 //! All database operations are delegated to the `RagLogRepository` trait.
 //! This module owns the domain types and thin service-layer orchestration.
@@ -133,8 +132,8 @@ pub const RAG_LOG_RETENTION_DAYS: i32 = 90;
 
 /// Create a RAG log entry synchronously, returning its ID.
 ///
-/// Unlike [`log_rag_interaction`] (fire-and-forget), this awaits the insert
-/// so the caller can include the log ID in the SSE response.
+/// The insert is awaited so the caller can include the log ID in the terminal
+/// SSE response.
 pub async fn create_rag_log(
     repo: &dyn RagLogRepository,
     entry: &RagLogEntry,

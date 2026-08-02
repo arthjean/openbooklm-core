@@ -37,9 +37,9 @@
 //! When a client disconnects, Axum drops the response body, the stream future
 //! is dropped, and the provider request is cancelled with it. Work already
 //! spawned on the [`TaskTracker`](crate::middleware::TaskTracker) (source
-//! persistence, memory extraction) is *not* cancelled: it is tracked and
-//! awaited by graceful shutdown. This is the behaviour US-002 captured and
-//! US-013 preserves.
+//! persistence, memory extraction) is not cancelled by a client disconnect.
+//! Process shutdown signals and joins that work through the root task scope.
+//! This is the behaviour US-002 captured and US-013 preserves.
 
 use std::time::Duration;
 

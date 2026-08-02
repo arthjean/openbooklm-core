@@ -4,9 +4,8 @@
 //! user feedback. Legacy raw-text columns remain only for write compatibility
 //! and are scrubbed by a database trigger.
 //!
-//! Logs are created asynchronously (via `tokio::spawn`) so they don't
-//! delay the SSE response to the user. Complex aggregation queries
-//! remain as raw SQL in `services::rag_log`.
+//! Log creation is awaited so the terminal SSE event can carry its ID. Complex
+//! aggregation queries remain in the repository layer.
 
 use sea_orm::entity::prelude::*;
 

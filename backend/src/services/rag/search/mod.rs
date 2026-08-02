@@ -752,36 +752,19 @@ mod tests {
 
     #[test]
     fn fusion_breaks_ties_on_the_chunk_id_rather_than_hash_order() {
-        // Two candidates at the same rank in the same list fuse to the same
-        // score; without a tie-break the surviving order would come from
-        // `HashMap` iteration and differ between runs (US-013).
-        let ids: Vec<Uuid> = (0..8).map(|_| Uuid::new_v4()).collect();
-        let dense: Vec<SearchResult> = ids
-            .iter()
-            .map(|id| make_result(*id, "same rank", 0.5))
-            .collect();
+        let lower = Uuid::from_u128(1);
+        let higher = Uuid::from_u128(2);
+        let dense = vec![make_result(higher, "dense", 0.5)];
+        let lexical = vec![make_result(lower, "lexical", 0.5)];
 
-        let first = reciprocal_rank_fusion(&dense, &[], 60.0, 1.0, 0.25);
-        let mut reversed = dense.clone();
-        reversed.reverse();
-        let second = reciprocal_rank_fusion(&reversed, &[], 60.0, 1.0, 0.25);
+        // Both candidates are rank one in a branch with the same weight, so
+        // their RRF scores are provably equal and the UUID branch must run.
+        let fused = reciprocal_rank_fusion(&dense, &lexical, 60.0, 1.0, 1.0);
 
-        let order = |v: &[SearchResult]| v.iter().map(|r| r.chunk_id).collect::<Vec<_>>();
-        // The two inputs rank the same chunks differently, so the fused scores
-        // differ; what must hold is that equal scores never depend on hashing.
-        for fused in [&first, &second] {
-            for window in fused.windows(2) {
-                let equal_scores =
-                    (window[0].relevance() - window[1].relevance()).abs() < f32::EPSILON;
-                if equal_scores {
-                    assert!(
-                        window[0].chunk_id < window[1].chunk_id,
-                        "equal scores must come back in chunk-id order"
-                    );
-                }
-            }
-        }
-        assert_eq!(order(&first).len(), ids.len());
+        assert_eq!(fused.len(), 2);
+        assert!((fused[0].relevance() - fused[1].relevance()).abs() < f32::EPSILON);
+        assert_eq!(fused[0].chunk_id, lower);
+        assert_eq!(fused[1].chunk_id, higher);
     }
 
     #[test]

@@ -709,7 +709,7 @@ pub async fn answer_with_deterministic_pipeline(
             "You are a helpful assistant.\n\n{}",
             format_context_for_llm(&results)
         );
-        let text = DeterministicLlm::answer_for(&system_prompt);
+        let text = DeterministicLlm::answer_for_question(&system_prompt, &query.query);
 
         let citable: Vec<CitableChunk> = results.iter().map(CitableChunk::from).collect();
         let extracted = extract_citations_verified(&text, &citable);

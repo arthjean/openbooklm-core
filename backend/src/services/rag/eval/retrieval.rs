@@ -373,9 +373,8 @@ fn notes_for(mode: RetrievalMode) -> Vec<String> {
         notes.push(
             "Fused results carry the production tie-break (score desc, chunk \
              id asc), applied inside reciprocal rank fusion since US-013. The \
-             evaluator re-imposes the same order defensively, so a regression \
-             in the pipeline's tie-break shows up as a report diff rather than \
-             as a flapping report."
+             evaluator preserves that order, so a tie-break regression remains \
+             observable instead of being repaired before scoring."
                 .to_owned(),
         );
     }
@@ -630,10 +629,8 @@ async fn prepare(
     let (mut results, dropped_non_finite) =
         retrieve_with(index, embedder, config, notebook_id, query).await?;
 
-    // One ordering pass for every mode, before the cut: truncating an
-    // unordered set is what would make the report depend on retrieval's
-    // internal iteration order.
-    stabilize(&mut results);
+    // Retrieval owns its total order. Re-sorting here would hide a production
+    // tie-break regression from the evaluator that is supposed to catch it.
     results.truncate(usize::try_from(config.limit.max(0)).unwrap_or(0));
 
     Ok(RetrievedSet {
@@ -689,22 +686,6 @@ async fn retrieve_with(
             Ok((found.results, found.dropped_non_finite))
         }
     }
-}
-
-/// Assert the total order the pipeline now guarantees.
-///
-/// Since US-013 the production path breaks score ties on the chunk identifier,
-/// so a fused result set arrives here already totally ordered. This re-imposes
-/// the same order for the modes that bypass fusion (the exact reference) and
-/// keeps the evaluator honest if the pipeline's tie-break ever regresses: the
-/// sort is idempotent when the invariant holds and repairs the report when it
-/// does not, which a `debug_assert` alone could not do in a release run.
-fn stabilize(results: &mut [SearchResult]) {
-    results.sort_by(|a, b| {
-        a.score
-            .cmp_desc(b.score)
-            .then_with(|| a.chunk_id.cmp(&b.chunk_id))
-    });
 }
 
 /// Distinct parent contexts in a result set.

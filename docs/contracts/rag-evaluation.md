@@ -87,9 +87,9 @@ That used to need an intervention here: reciprocal rank fusion collects into a
 hash map and sorts stably, so equal scores came out in hash-iteration order and
 the evaluator re-sorted by `(score desc, chunk id asc)` before scoring. Since
 US-013 the tie-break lives in fusion itself, where it also makes production
-truncation deterministic. The evaluator still re-imposes the same order, now as
-a check rather than a repair: if the pipeline's tie-break regresses, the report
-diffs instead of flapping.
+truncation deterministic. The evaluator now preserves the returned order: if
+the pipeline's tie-break regresses, the report records the regression instead
+of repairing it before scoring.
 
 ## Grounded-response metrics
 
@@ -105,6 +105,12 @@ Claim assertion is decided by the corpus's literal `answer_markers`, never by a
 model. A `ClaimJudge` may be configured; its output lands in `diagnostics` and in
 no metric. A gate that an LLM judge could move would be exactly as reproducible
 as the judge.
+
+The offline answer producer passes each corpus question to the deterministic
+provider. The provider selects the retrieved passage with the strongest lexical
+overlap, so the grounding report no longer degenerates into an echo of rank one.
+It remains a deterministic harness, not evidence about a commercial model's
+grounding or abstention quality.
 
 ### When a citation counts
 

@@ -318,7 +318,7 @@ async fn the_default_run_needs_no_provider_credential() {
     assert!(
         run.report
             .embedding_fingerprint
-            .starts_with("deterministic/"),
+            .starts_with("emb:v1:deterministic:"),
         "the CI path must use the deterministic provider, got {}",
         run.report.embedding_fingerprint
     );

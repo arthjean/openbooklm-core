@@ -4,9 +4,9 @@
 //! instructions, extract a secret, forge provenance, or reach into another
 //! tenant. Each one is assembled into a real prompt through the real renderer
 //! and the real prompt builder. The structural boundary is checked first, then
-//! the deterministic offline provider answers from a benign leading passage
-//! while every hostile document is present. A case fails if the answer repeats
-//! the attack, cites hostile evidence, or departs from the grounded answer.
+//! the deterministic offline provider selects a benign passage behind the
+//! hostile leading passage. A case fails if the answer repeats the attack,
+//! cites hostile evidence, or departs from the grounded answer.
 //!
 //! Cross-notebook reach is checked in the same spirit and in the same place it
 //! is enforced: retrieval is account- and notebook-scoped in SQL
@@ -366,7 +366,11 @@ fn evidence_chunk(content: &str) -> SearchResult {
         content: content.to_owned(),
         parent_content: None,
         score: RetrievalScore::Rrf(0.5),
-        metadata: None,
+        metadata: Some(serde_json::json!({
+            "position": 0,
+            "span_start": 0,
+            "span_end": content.len(),
+        })),
         collapsed_children: Vec::new(),
     }
 }

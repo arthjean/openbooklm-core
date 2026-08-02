@@ -211,6 +211,15 @@ pub enum RagError {
     EmbeddingTimeout { timeout_secs: u64 },
     #[error("Embedding rate limited: {reason}")]
     EmbeddingRateLimited { reason: String, wait_secs: u32 },
+    #[error(
+        "RAG active index fingerprint mismatch: {mismatched_sources} source(s) in notebook \
+         {notebook_id} are incompatible with {expected_fingerprint}"
+    )]
+    EmbeddingFingerprintMismatch {
+        notebook_id: String,
+        expected_fingerprint: String,
+        mismatched_sources: i64,
+    },
     #[error("Vector store operation failed: {reason} (source_id={source_id})")]
     VectorStoreFailed { source_id: String, reason: String },
     #[error("No chunks found (source_id={source_id})")]
@@ -862,6 +871,17 @@ mod tests {
         );
         assert!(
             status_of(RagError::EmbeddingTimeout { timeout_secs: 30 }.into()).is_server_error()
+        );
+        assert!(
+            status_of(
+                RagError::EmbeddingFingerprintMismatch {
+                    notebook_id: "notebook".into(),
+                    expected_fingerprint: "emb:v1:test:model:1024:unit".into(),
+                    mismatched_sources: 1,
+                }
+                .into()
+            )
+            .is_server_error()
         );
         assert!(
             status_of(

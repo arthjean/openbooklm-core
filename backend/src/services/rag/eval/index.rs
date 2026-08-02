@@ -24,13 +24,13 @@
 //! of this repository and not against PostgreSQL. Both facts are recorded in
 //! every report so nobody reads them as production measurements.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use async_trait::async_trait;
 use uuid::Uuid;
 
 use crate::core::providers::{DeterministicEmbedder, EmbeddingProvider};
-use crate::error::AppError;
+use crate::error::{AppError, RagError};
 use crate::repositories::{ChunkSearchResult, NotebookScope, RepoResult, SearchRepository};
 use crate::services::rag::utils::sanitize_tsquery;
 
@@ -246,12 +246,31 @@ impl CorpusIndex {
     /// header. Two reports built with different fingerprints are not comparable.
     #[must_use]
     pub fn embedding_fingerprint(&self) -> String {
-        format!(
-            "{}/{}/{}",
-            self.embedder.name(),
-            self.embedder.model(),
-            self.embedder.dimension()
-        )
+        crate::services::rag::provenance::EmbeddingProvenance::from_provider(&self.embedder)
+            .fingerprint()
+    }
+
+    fn ensure_embedding_compatibility(
+        &self,
+        notebook_id: Uuid,
+        expected_fingerprint: &str,
+    ) -> RepoResult<()> {
+        if expected_fingerprint == self.embedding_fingerprint() {
+            return Ok(());
+        }
+        let mismatched_sources = self
+            .chunks
+            .iter()
+            .filter(|chunk| chunk.notebook_id == notebook_id)
+            .map(|chunk| chunk.source_id)
+            .collect::<HashSet<_>>()
+            .len();
+        Err(RagError::EmbeddingFingerprintMismatch {
+            notebook_id: notebook_id.to_string(),
+            expected_fingerprint: expected_fingerprint.to_owned(),
+            mismatched_sources: i64::try_from(mismatched_sources).unwrap_or(i64::MAX),
+        }
+        .into())
     }
 
     /// Every indexed chunk, for scoping assertions and report headers.
@@ -389,11 +408,13 @@ impl SearchRepository for CorpusIndex {
         &self,
         scope: NotebookScope,
         query_embedding: &[f32],
+        embedding_fingerprint: &str,
         limit: i32,
     ) -> RepoResult<Vec<ChunkSearchResult>> {
         let Some(notebook_id) = self.owned(scope) else {
             return Ok(Vec::new());
         };
+        self.ensure_embedding_compatibility(notebook_id, embedding_fingerprint)?;
         Ok(self.rank_dense(notebook_id, query_embedding, limit))
     }
 
@@ -407,6 +428,24 @@ impl SearchRepository for CorpusIndex {
             return Ok(Vec::new());
         };
         Ok(self.rank_lexical(notebook_id, query, limit))
+    }
+
+    async fn search_hybrid_chunks(
+        &self,
+        scope: NotebookScope,
+        query_embedding: &[f32],
+        embedding_fingerprint: &str,
+        query: &str,
+        limit: i32,
+    ) -> RepoResult<crate::repositories::HybridChunkSearchResult> {
+        let Some(notebook_id) = self.owned(scope) else {
+            return Ok(crate::repositories::HybridChunkSearchResult::default());
+        };
+        self.ensure_embedding_compatibility(notebook_id, embedding_fingerprint)?;
+        Ok(crate::repositories::HybridChunkSearchResult {
+            dense: self.rank_dense(notebook_id, query_embedding, limit),
+            lexical: self.rank_lexical(notebook_id, query, limit),
+        })
     }
 
     async fn count_chunks_for_notebook(&self, scope: NotebookScope) -> RepoResult<i64> {
@@ -522,6 +561,42 @@ mod tests {
 
         let ids = |v: &[ChunkSearchResult]| v.iter().map(|r| r.id).collect::<Vec<_>>();
         assert_eq!(ids(&a), ids(&b));
+    }
+
+    #[tokio::test]
+    async fn incompatible_query_fingerprints_return_no_vector_backed_results() {
+        let index = index().await;
+        let notebook = index.chunks()[0].notebook_id;
+        let scope = CorpusIndex::scope(notebook);
+        let query = index
+            .embedder()
+            .embed_query("incident response")
+            .await
+            .expect("query embedding");
+
+        let dense = index
+            .search_similar_chunks(scope, &query, "emb:v1:other:model:1024:unit", 10)
+            .await
+            .expect_err("dense mismatch must be infrastructure failure");
+        assert!(matches!(
+            dense,
+            AppError::Rag(RagError::EmbeddingFingerprintMismatch { .. })
+        ));
+
+        let hybrid = index
+            .search_hybrid_chunks(
+                scope,
+                &query,
+                "emb:v1:other:model:1024:unit",
+                "incident response",
+                10,
+            )
+            .await
+            .expect_err("hybrid mismatch must be infrastructure failure");
+        assert!(matches!(
+            hybrid,
+            AppError::Rag(RagError::EmbeddingFingerprintMismatch { .. })
+        ));
     }
 
     #[tokio::test]

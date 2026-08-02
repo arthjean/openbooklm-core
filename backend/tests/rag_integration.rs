@@ -288,6 +288,10 @@ fn provenance(model: &str) -> GenerationProvenance {
     }
 }
 
+fn embedding_fingerprint(model: &str) -> String {
+    provenance(model).embedding.fingerprint()
+}
+
 /// `count` chunks whose text carries `marker`, with distinct finite vectors.
 ///
 /// The marker is what makes a mixed read visible: a result set holding two
@@ -1479,12 +1483,13 @@ async fn a_thousand_publication_schedules_produce_no_mixed_read() {
         let search = f.search.clone();
         let scope = f.scope();
         let query_embedding = hybrid_query.clone();
+        let fingerprint = prov.embedding.fingerprint();
         let reader = tokio::spawn(async move {
             if !offset.is_zero() {
                 tokio::time::sleep(offset).await;
             }
             search
-                .search_hybrid_chunks(scope, &query_embedding, "generation", 100)
+                .search_hybrid_chunks(scope, &query_embedding, &fingerprint, "generation", 100)
                 .await
         });
 
@@ -1923,7 +1928,12 @@ async fn every_read_path_is_scoped_to_the_active_generation() {
 
     let dense = f
         .search
-        .search_similar_chunks(f.scope(), &vec![0.001_f32; EMBEDDING_DIM], 50)
+        .search_similar_chunks(
+            f.scope(),
+            &vec![0.001_f32; EMBEDDING_DIM],
+            &embedding_fingerprint("model-a"),
+            50,
+        )
         .await
         .expect("dense search");
     assert_eq!(
@@ -1980,7 +1990,7 @@ async fn no_read_path_returns_a_notebook_to_another_account() {
     );
     assert!(
         f.search
-            .search_similar_chunks(stranger, &embedding, 50)
+            .search_similar_chunks(stranger, &embedding, &embedding_fingerprint("model-a"), 50,)
             .await
             .expect("dense search")
             .is_empty(),
@@ -1993,6 +2003,149 @@ async fn no_read_path_returns_a_notebook_to_another_account() {
             .expect("lexical search")
             .is_empty(),
         "lexical search must not read another account's notebook"
+    );
+
+    f.cleanup().await;
+}
+
+/// Dense and hybrid retrieval refuse an active generation produced in another
+/// vector space, even when both providers expose the schema's 1024 dimensions.
+#[tokio::test]
+#[ignore = "Requires PostgreSQL with pgvector (TEST_DATABASE_URL)"]
+async fn vector_backed_search_rejects_an_incompatible_active_generation() {
+    let f = fixture_or_skip!();
+    let source_id = f.create_source("fingerprint scope").await;
+    let model_a = provenance("model-a");
+    f.publish_generation(source_id, "fingerprint", 3, &model_a)
+        .await;
+    let query = vec![0.001_f32; EMBEDDING_DIM];
+
+    let compatible = f
+        .search
+        .search_similar_chunks(f.scope(), &query, &model_a.embedding.fingerprint(), 10)
+        .await
+        .expect("compatible dense search");
+    assert_eq!(compatible.len(), 3);
+
+    let incompatible_fingerprint = embedding_fingerprint("model-b");
+    let dense = f
+        .search
+        .search_similar_chunks(f.scope(), &query, &incompatible_fingerprint, 10)
+        .await
+        .expect_err("incompatible dense search must fail");
+    assert!(
+        dense.to_string().contains("fingerprint mismatch"),
+        "{dense}"
+    );
+
+    let hybrid = f
+        .search
+        .search_hybrid_chunks(
+            f.scope(),
+            &query,
+            &incompatible_fingerprint,
+            "fingerprint",
+            10,
+        )
+        .await
+        .expect_err("incompatible hybrid search must fail");
+    assert!(
+        hybrid.to_string().contains("fingerprint mismatch"),
+        "{hybrid}"
+    );
+
+    // Lexical-only mode has no vector-space contract and remains available.
+    assert_eq!(
+        f.search
+            .search_lexical_chunks(f.scope(), "fingerprint", 10)
+            .await
+            .expect("lexical search")
+            .len(),
+        3
+    );
+
+    f.cleanup().await;
+}
+
+/// The fingerprint check and dense query must observe one active-generation
+/// snapshot. A concurrent publication may yield old compatible rows or the
+/// structured mismatch, never successful missing evidence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "Requires PostgreSQL with pgvector (TEST_DATABASE_URL)"]
+async fn dense_search_never_turns_a_fingerprint_race_into_missing_evidence() {
+    let f = fixture_or_skip!();
+    let source_id = f.create_source("dense fingerprint race").await;
+    let model_a = provenance("model-a");
+    let model_b = provenance("model-b");
+    let generation_a = f
+        .publish_generation(source_id, "model-a", 3, &model_a)
+        .await;
+    let generation_b = f
+        .publish_generation(source_id, "model-b", 3, &model_b)
+        .await;
+    exec(
+        &f.db,
+        "UPDATE sources SET active_generation_id = $2, chunk_count = 3 WHERE id = $1",
+        [source_id.into(), generation_a.into()],
+    )
+    .await;
+
+    // The compatibility statement reads sources/generations, then the dense
+    // statement reaches chunks. Blocking only chunks lets the first statement
+    // establish its snapshot before the active pointer changes.
+    let blocker = f.db.begin().await.expect("begin chunks blocker");
+    blocker
+        .execute_unprepared("LOCK TABLE chunks IN ACCESS EXCLUSIVE MODE")
+        .await
+        .expect("lock chunks");
+
+    let query = vec![0.001_f32; EMBEDDING_DIM];
+    let search = f.search.clone();
+    let scope = f.scope();
+    let expected_fingerprint = model_a.embedding.fingerprint();
+    let reader = tokio::spawn(async move {
+        search
+            .search_similar_chunks(scope, &query, &expected_fingerprint, 10)
+            .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let waiting = scalar_i64(
+                &f.db,
+                "SELECT count(*)::bigint AS value
+                 FROM pg_locks
+                 WHERE relation = to_regclass($1)
+                   AND mode = 'AccessShareLock'
+                   AND NOT granted",
+                ["chunks".into()],
+            )
+            .await;
+            if waiting > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("dense query never reached the chunks lock");
+
+    exec(
+        &f.db,
+        "UPDATE sources SET active_generation_id = $2 WHERE id = $1",
+        [source_id.into(), generation_b.into()],
+    )
+    .await;
+    blocker.commit().await.expect("release chunks lock");
+
+    let rows = reader
+        .await
+        .expect("reader task")
+        .expect("repeatable-read search keeps its compatible snapshot");
+    assert_eq!(
+        rows.len(),
+        3,
+        "fingerprint race became successful missing evidence"
     );
 
     f.cleanup().await;
@@ -2770,7 +2923,11 @@ async fn per_query_scan_settings_do_not_leak_into_pooled_connections() {
     // Retrievals that apply every setting the approved strategy needs, run
     // concurrently so several pooled connections carry one.
     let query = vec![0.1_f32; EMBEDDING_DIM];
-    let searches = (0..8).map(|_| f.search.search_similar_chunks(f.scope(), &query, 10));
+    let fingerprint = provenance.embedding.fingerprint();
+    let searches = (0..8).map(|_| {
+        f.search
+            .search_similar_chunks(f.scope(), &query, &fingerprint, 10)
+    });
     for result in futures::future::join_all(searches).await {
         result.expect("dense search");
     }
@@ -2864,7 +3021,7 @@ async fn filtered_dense_search_matches_exact_search_on_a_reduced_corpus() {
     for query in &queries {
         let approximate = f
             .search
-            .search_similar_chunks(f.scope(), query, 10)
+            .search_similar_chunks(f.scope(), query, &embedding_fingerprint("dense-recall"), 10)
             .await
             .expect("dense search");
         let exact = exact_top_ids(&f.db, f.notebook_id, query, 10).await;

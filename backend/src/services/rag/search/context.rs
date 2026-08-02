@@ -831,6 +831,7 @@ mod tests {
             &self,
             _scope: NotebookScope,
             _query_embedding: &[f32],
+            _embedding_fingerprint: &str,
             limit: i32,
         ) -> RepoResult<Vec<ChunkSearchResult>> {
             let requested = usize::try_from(limit.max(0)).unwrap_or(0);

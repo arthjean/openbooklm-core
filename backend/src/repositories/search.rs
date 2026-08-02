@@ -35,6 +35,7 @@ use sea_orm::{
     Statement, TransactionTrait,
 };
 
+use crate::error::RagError;
 use crate::services::rag::utils::{format_embedding, sanitize_tsquery};
 
 use super::ann::APPROVED_STRATEGY;
@@ -60,10 +61,12 @@ const SEARCH_SIMILAR_SQL: &str = r"
            (c.embedding <=> $1::vector) as distance
     FROM chunks c
     JOIN sources s ON c.source_id = s.id AND s.active_generation_id = c.generation_id
+    JOIN source_index_generations g ON g.id = c.generation_id
+                                    AND g.embedding_fingerprint = $4
     JOIN notebooks n ON n.id = s.notebook_id AND n.user_id = $3
     WHERE s.notebook_id = $2
-    ORDER BY c.embedding <=> $1::vector
-    LIMIT $4
+    ORDER BY c.embedding <=> $1::vector, c.id ASC
+    LIMIT $5
 ";
 
 // The scan strategy and its parameters live in [`super::ann`], where the
@@ -80,8 +83,27 @@ const SEARCH_LEXICAL_SQL: &str = r"
     JOIN notebooks n ON n.id = s.notebook_id AND n.user_id = $3
     WHERE s.notebook_id = $2
       AND c.content_tsv @@ plainto_tsquery('simple', $1)
-    ORDER BY rank DESC
+    ORDER BY rank DESC, c.id ASC
     LIMIT $4
+";
+
+/// Hybrid lexical candidates must come from the same embedding space as the
+/// dense branch. Standalone lexical search has no query vector and therefore
+/// legitimately uses [`SEARCH_LEXICAL_SQL`] without this filter.
+const SEARCH_HYBRID_LEXICAL_SQL: &str = r"
+    SELECT c.id, c.generation_id, c.source_id, c.chunk_index, c.content, c.parent_content,
+           c.metadata,
+           s.title as source_title,
+           ts_rank_cd(c.content_tsv, plainto_tsquery('simple', $1)) as rank
+    FROM chunks c
+    JOIN sources s ON c.source_id = s.id AND s.active_generation_id = c.generation_id
+    JOIN source_index_generations g ON g.id = c.generation_id
+                                    AND g.embedding_fingerprint = $4
+    JOIN notebooks n ON n.id = s.notebook_id AND n.user_id = $3
+    WHERE s.notebook_id = $2
+      AND c.content_tsv @@ plainto_tsquery('simple', $1)
+    ORDER BY rank DESC, c.id ASC
+    LIMIT $5
 ";
 
 const COUNT_CHUNKS_FOR_NOTEBOOK_SQL: &str = r"
@@ -107,6 +129,16 @@ const GET_ALL_CHUNKS_FOR_NOTEBOOK_SQL: &str = r"
     JOIN notebooks n ON n.id = s.notebook_id AND n.user_id = $2
     WHERE s.notebook_id = $1
     ORDER BY s.id, c.chunk_index
+";
+
+const COUNT_INCOMPATIBLE_GENERATIONS_SQL: &str = r"
+    SELECT count(*) AS mismatched
+    FROM sources s
+    JOIN notebooks n ON n.id = s.notebook_id AND n.user_id = $2
+    LEFT JOIN source_index_generations g ON g.id = s.active_generation_id
+    WHERE s.notebook_id = $1
+      AND s.active_generation_id IS NOT NULL
+      AND (g.id IS NULL OR g.embedding_fingerprint <> $3)
 ";
 
 // ============================================================================
@@ -176,13 +208,44 @@ fn clamp_finite_or_preserve(value: f32, min: f32, max: f32) -> f32 {
     }
 }
 
+async fn ensure_embedding_compatibility(
+    connection: &impl ConnectionTrait,
+    scope: NotebookScope,
+    expected_fingerprint: &str,
+) -> RepoResult<()> {
+    let row = connection
+        .query_one(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            COUNT_INCOMPATIBLE_GENERATIONS_SQL,
+            [
+                scope.notebook_id.into(),
+                scope.account_id.into(),
+                expected_fingerprint.into(),
+            ],
+        ))
+        .await?;
+    let mismatched_sources = row
+        .and_then(|result| result.try_get::<i64>("", "mismatched").ok())
+        .unwrap_or(0);
+    if mismatched_sources > 0 {
+        return Err(RagError::EmbeddingFingerprintMismatch {
+            notebook_id: scope.notebook_id.to_string(),
+            expected_fingerprint: expected_fingerprint.to_owned(),
+            mismatched_sources,
+        }
+        .into());
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl SearchRepository for SeaOrmSearchRepository {
-    #[tracing::instrument(skip(self, query_embedding), fields(notebook_id = %scope.notebook_id, %limit))]
+    #[tracing::instrument(skip(self, query_embedding, embedding_fingerprint), fields(notebook_id = %scope.notebook_id, %limit))]
     async fn search_similar_chunks(
         &self,
         scope: NotebookScope,
         query_embedding: &[f32],
+        embedding_fingerprint: &str,
         limit: i32,
     ) -> RepoResult<Vec<ChunkSearchResult>> {
         let embedding_str = format_embedding(query_embedding);
@@ -191,8 +254,16 @@ impl SearchRepository for SeaOrmSearchRepository {
         // or rollback, so a scan mode chosen for this query cannot leak into
         // the next borrower of this pooled connection (US-016). All of them go
         // out in one statement, so the scoping costs one round trip and not
-        // one per setting.
-        let txn = self.db.begin().await?;
+        // one per setting. Repeatable read also keeps the fingerprint check and
+        // vector query on one active-generation snapshot.
+        let txn = self
+            .db
+            .begin_with_config(
+                Some(IsolationLevel::RepeatableRead),
+                Some(AccessMode::ReadOnly),
+            )
+            .await?;
+        ensure_embedding_compatibility(&txn, scope, embedding_fingerprint).await?;
 
         if !SCAN_PREAMBLE.is_empty() {
             txn.execute_unprepared(&SCAN_PREAMBLE).await?;
@@ -206,6 +277,7 @@ impl SearchRepository for SeaOrmSearchRepository {
                     embedding_str.into(),
                     scope.notebook_id.into(),
                     scope.account_id.into(),
+                    embedding_fingerprint.into(),
                     limit.into(),
                 ],
             ))
@@ -216,7 +288,7 @@ impl SearchRepository for SeaOrmSearchRepository {
         dense_rows(rows)
     }
 
-    #[tracing::instrument(skip(self), fields(notebook_id = %scope.notebook_id, %limit))]
+    #[tracing::instrument(skip(self, query), fields(notebook_id = %scope.notebook_id, %limit))]
     async fn search_lexical_chunks(
         &self,
         scope: NotebookScope,
@@ -244,11 +316,12 @@ impl SearchRepository for SeaOrmSearchRepository {
         lexical_rows(rows)
     }
 
-    #[tracing::instrument(skip(self, query_embedding, query), fields(notebook_id = %scope.notebook_id, %limit))]
+    #[tracing::instrument(skip(self, query_embedding, embedding_fingerprint, query), fields(notebook_id = %scope.notebook_id, %limit))]
     async fn search_hybrid_chunks(
         &self,
         scope: NotebookScope,
         query_embedding: &[f32],
+        embedding_fingerprint: &str,
         query: &str,
         limit: i32,
     ) -> RepoResult<HybridChunkSearchResult> {
@@ -261,6 +334,7 @@ impl SearchRepository for SeaOrmSearchRepository {
                 Some(AccessMode::ReadOnly),
             )
             .await?;
+        ensure_embedding_compatibility(&txn, scope, embedding_fingerprint).await?;
 
         if !SCAN_PREAMBLE.is_empty() {
             txn.execute_unprepared(&SCAN_PREAMBLE).await?;
@@ -274,6 +348,7 @@ impl SearchRepository for SeaOrmSearchRepository {
                     embedding.into(),
                     scope.notebook_id.into(),
                     scope.account_id.into(),
+                    embedding_fingerprint.into(),
                     limit.into(),
                 ],
             ))
@@ -284,11 +359,12 @@ impl SearchRepository for SeaOrmSearchRepository {
             match txn
                 .query_all(Statement::from_sql_and_values(
                     DbBackend::Postgres,
-                    SEARCH_LEXICAL_SQL,
+                    SEARCH_HYBRID_LEXICAL_SQL,
                     [
                         sanitized.into(),
                         scope.notebook_id.into(),
                         scope.account_id.into(),
+                        embedding_fingerprint.into(),
                         limit.into(),
                     ],
                 ))

@@ -487,10 +487,13 @@ impl NotebookScope {
 #[async_trait]
 pub trait SearchRepository: Send + Sync {
     /// Owner-scoped vector similarity search using pgvector `<=>` operator.
+    /// Active generations whose vectors do not match `embedding_fingerprint`
+    /// are excluded before distance evaluation.
     async fn search_similar_chunks(
         &self,
         scope: NotebookScope,
         query_embedding: &[f32],
+        embedding_fingerprint: &str,
         limit: i32,
     ) -> RepoResult<Vec<ChunkSearchResult>>;
 
@@ -502,7 +505,8 @@ pub trait SearchRepository: Send + Sync {
         limit: i32,
     ) -> RepoResult<Vec<ChunkSearchResult>>;
 
-    /// Owner-scoped dense and lexical search over one logical snapshot.
+    /// Owner-scoped dense and lexical search over one logical snapshot and one
+    /// embedding fingerprint.
     ///
     /// In-memory repositories have no concurrent publication boundary, so the
     /// default implementation composes their two deterministic reads. Database
@@ -512,11 +516,12 @@ pub trait SearchRepository: Send + Sync {
         &self,
         scope: NotebookScope,
         query_embedding: &[f32],
+        embedding_fingerprint: &str,
         query: &str,
         limit: i32,
     ) -> RepoResult<HybridChunkSearchResult> {
         let dense = self
-            .search_similar_chunks(scope, query_embedding, limit)
+            .search_similar_chunks(scope, query_embedding, embedding_fingerprint, limit)
             .await?;
         let lexical = self.search_lexical_chunks(scope, query, limit).await?;
         Ok(HybridChunkSearchResult { dense, lexical })

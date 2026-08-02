@@ -193,7 +193,12 @@ pub async fn semantic_search_with_hyde(
     // --- Search stage ---
     let search_start = std::time::Instant::now();
     let chunks = search_repo
-        .search_similar_chunks(scope, &embedded.vector, request.clamped_limit())
+        .search_similar_chunks(
+            scope,
+            &embedded.vector,
+            &embedded.fingerprint,
+            request.clamped_limit(),
+        )
         .await?;
     let search_ms = search_start.elapsed().as_millis();
     tracing::info!(search_ms, notebook_id = %scope.notebook_id, "Dense search completed");
@@ -287,7 +292,13 @@ pub async fn hybrid_search(
     let embedded = embed_query(scope, query, embedder).await?;
     let search_start = std::time::Instant::now();
     let rows = search_repo
-        .search_hybrid_chunks(scope, &embedded.vector, query, request.clamped_limit())
+        .search_hybrid_chunks(
+            scope,
+            &embedded.vector,
+            &embedded.fingerprint,
+            query,
+            request.clamped_limit(),
+        )
         .await?;
     let search_ms = search_start.elapsed().as_millis();
     let (dense_results, dense_dropped) =
@@ -342,6 +353,7 @@ pub async fn hybrid_search(
 
 struct EmbeddedQuery {
     vector: Vec<f32>,
+    fingerprint: String,
     elapsed_ms: u128,
     cache_hit: bool,
 }
@@ -414,6 +426,7 @@ async fn embed_query(
     tracing::info!(elapsed_ms, cache_hit, notebook_id = %scope.notebook_id, "Embedding completed");
     Ok(EmbeddedQuery {
         vector,
+        fingerprint,
         elapsed_ms,
         cache_hit,
     })
@@ -488,6 +501,7 @@ mod tests {
             &self,
             _scope: NotebookScope,
             _query_embedding: &[f32],
+            _embedding_fingerprint: &str,
             _limit: i32,
         ) -> RepoResult<Vec<ChunkSearchResult>> {
             Ok(vec![self.row(self.new_generation, "new dense")])
@@ -506,6 +520,7 @@ mod tests {
             &self,
             _scope: NotebookScope,
             _query_embedding: &[f32],
+            _embedding_fingerprint: &str,
             _query: &str,
             _limit: i32,
         ) -> RepoResult<HybridChunkSearchResult> {

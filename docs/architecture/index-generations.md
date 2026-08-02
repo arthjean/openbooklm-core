@@ -132,7 +132,15 @@ It is a join predicate rather than a `WHERE` clause so that there is no way to
 add a filter to one of these queries and forget the generation — the generation
 is part of how `sources` is reached.
 
-Verified: `every_read_path_is_scoped_to_the_active_generation`.
+Dense and hybrid reads compare every active generation with the query
+provider's embedding fingerprint. The check and vector query share one
+repeatable-read snapshot, so a concurrent publication returns either compatible
+evidence or the structured fingerprint mismatch, never successful missing
+evidence.
+
+Verified: `every_read_path_is_scoped_to_the_active_generation`,
+`vector_backed_search_rejects_an_incompatible_active_generation`, and
+`dense_search_never_turns_a_fingerprint_race_into_missing_evidence`.
 
 ### Ownership
 

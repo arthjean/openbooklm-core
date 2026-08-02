@@ -256,18 +256,6 @@ pub trait SourceRepository: Send + Sync {
         error_message: Option<String>,
     ) -> RepoResult<source::Model>;
 
-    /// Set `chunk_count` directly.
-    ///
-    /// Not part of ingestion. Since EP-002 the count is written by generation
-    /// publication, in the same transaction that moves the active pointer, so
-    /// that it can never describe a generation the source is not pointing at.
-    /// Calling this outside that transaction desynchronises the two.
-    async fn update_chunk_count(
-        &self,
-        source_id: Uuid,
-        chunk_count: i32,
-    ) -> RepoResult<source::Model>;
-
     async fn count_for_notebook(&self, notebook_id: Uuid) -> RepoResult<u64>;
 
     async fn count_web_sources_for_notebook(&self, notebook_id: Uuid) -> RepoResult<u64>;

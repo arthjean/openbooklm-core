@@ -76,20 +76,6 @@ pub async fn update_source_status(
     repo.update_status(source_id, status, error_message).await
 }
 
-/// Set a source's chunk count directly.
-///
-/// Ingestion does not use this: since EP-002 the count is written by generation
-/// publication, inside the transaction that moves the active pointer. See
-/// [`SourceRepository::update_chunk_count`](crate::repositories::SourceRepository::update_chunk_count).
-#[tracing::instrument(skip(repo), fields(%source_id))]
-pub async fn update_source_chunk_count(
-    repo: &dyn SourceRepository,
-    source_id: Uuid,
-    chunk_count: i32,
-) -> Result<source::Model, AppError> {
-    repo.update_chunk_count(source_id, chunk_count).await
-}
-
 /// Count sources in a notebook.
 #[tracing::instrument(skip(repo), fields(%notebook_id))]
 pub async fn count_sources(

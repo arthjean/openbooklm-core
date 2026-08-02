@@ -200,20 +200,6 @@ impl SourceRepository for SeaOrmSourceRepository {
         Ok(active.update(&self.db).await?)
     }
 
-    #[tracing::instrument(skip(self), fields(%source_id))]
-    async fn update_chunk_count(
-        &self,
-        source_id: Uuid,
-        chunk_count: i32,
-    ) -> RepoResult<source::Model> {
-        let source = self.fetch_or_not_found(source_id).await?;
-        let mut active: source::ActiveModel = source.into();
-
-        active.chunk_count = Set(chunk_count);
-
-        Ok(active.update(&self.db).await?)
-    }
-
     #[tracing::instrument(skip(self), fields(%notebook_id))]
     async fn count_for_notebook(&self, notebook_id: Uuid) -> RepoResult<u64> {
         Ok(Source::find()

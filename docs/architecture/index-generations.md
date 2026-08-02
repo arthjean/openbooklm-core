@@ -160,6 +160,10 @@ Verified: `a_hundred_concurrent_requests_produce_one_owner`,
 Rollback repoints a source at its newest `published` generation that is not the
 active one, using the same `UPDATE sources` statement publication uses. It
 copies nothing and deletes nothing, and public response shapes do not change.
+Before selecting that predecessor it locks the `sources` row `FOR UPDATE`.
+Publication's pointer update takes the same row lock, so a concurrent rollback
+observes either the pointer before publication or the committed pointer after
+publication and cannot overwrite a newer generation from a stale snapshot.
 
 Reclaim deletes unreferenced generations older than the retention window, with
 three exclusions: the active generation, the newest other published generation
@@ -180,6 +184,8 @@ already live, and disk left behind is an operational cost, not a reason to
 report a successful rebuild as a failure.
 
 Verified: `rollback_returns_to_the_previous_complete_generation`,
+`rollback_serializes_on_the_source_pointer`,
+`a_thousand_publication_rollback_schedules_are_linearizable`,
 `rollback_without_a_predecessor_changes_nothing`,
 `reclaim_never_removes_a_referenced_or_rollback_eligible_generation`,
 `reclaim_respects_the_retention_window`.

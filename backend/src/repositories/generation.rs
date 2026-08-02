@@ -111,6 +111,16 @@ const POINT_SOURCE_SQL: &str = r"
      WHERE id = $2
 ";
 
+/// Serialize every active-pointer move for one source. Publication's final
+/// `UPDATE sources` takes the same row lock, so a rollback either observes the
+/// pointer before that publication or after it, never a stale value in between.
+const LOCK_SOURCE_SQL: &str = r"
+    SELECT id
+    FROM sources
+    WHERE id = $1
+    FOR UPDATE
+";
+
 /// Every embedding under a generation must have the configured width and only
 /// finite components.
 ///
@@ -132,7 +142,7 @@ const PREVIOUS_PUBLISHED_SQL: &str = r"
     WHERE g.source_id = $1
       AND g.state = 'published'
       AND (s.active_generation_id IS NULL OR g.id <> s.active_generation_id)
-    ORDER BY g.published_at DESC
+    ORDER BY g.published_at DESC, g.id DESC
     LIMIT 1
 ";
 
@@ -352,6 +362,14 @@ impl GenerationRepository for SeaOrmGenerationRepository {
     #[tracing::instrument(skip(self), fields(%source_id))]
     async fn rollback_to_previous(&self, source_id: Uuid) -> RepoResult<Option<Uuid>> {
         let txn = self.db.begin().await?;
+
+        let source = txn
+            .query_one(Self::stmt(LOCK_SOURCE_SQL, [source_id.into()]))
+            .await?;
+        if source.is_none() {
+            txn.rollback().await?;
+            return Ok(None);
+        }
 
         let rows = txn
             .query_all(Self::stmt(PREVIOUS_PUBLISHED_SQL, [source_id.into()]))

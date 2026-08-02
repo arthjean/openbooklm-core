@@ -258,6 +258,24 @@ async fn scalar_i64(
     .expect("bigint column named `value`")
 }
 
+async fn optional_uuid(
+    db: &DatabaseConnection,
+    sql: &str,
+    values: impl IntoIterator<Item = sea_orm::Value>,
+) -> Option<Uuid> {
+    db.query_one(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        sql,
+        values,
+    ))
+    .await
+    .expect("query")
+    .map(|row| {
+        row.try_get::<Uuid>("", "value")
+            .expect("UUID column named `value`")
+    })
+}
+
 fn provenance(model: &str) -> GenerationProvenance {
     GenerationProvenance {
         embedding: EmbeddingProvenance {
@@ -1574,6 +1592,168 @@ async fn rollback_returns_to_the_previous_complete_generation() {
         "the public chunk count must follow the pointer"
     );
 
+    f.cleanup().await;
+}
+
+/// Rollback must wait behind any other active-pointer move for the same source.
+/// Publication takes this row lock through its final `UPDATE sources`, so this
+/// is the serialization point that prevents a stale rollback from overwriting
+/// a concurrently published generation.
+#[tokio::test]
+#[ignore = "Requires PostgreSQL with pgvector (TEST_DATABASE_URL)"]
+async fn rollback_serializes_on_the_source_pointer() {
+    let f = fixture_or_skip!();
+    let prov = provenance("model-a");
+    let source_id = f.create_source("rollback-lock").await;
+    let first = f.publish_generation(source_id, "first", 2, &prov).await;
+    f.publish_generation(source_id, "second", 2, &prov).await;
+
+    let blocker = f.db.begin().await.expect("begin blocker");
+    blocker
+        .query_one(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT id FROM sources WHERE id = $1 FOR UPDATE",
+            [source_id.into()],
+        ))
+        .await
+        .expect("lock source");
+
+    let generations = f.generations.clone();
+    let mut rollback =
+        tokio::spawn(async move { generations.rollback_to_previous(source_id).await });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut rollback)
+            .await
+            .is_err(),
+        "rollback moved the pointer while another pointer transaction held the source row"
+    );
+
+    blocker.commit().await.expect("release source lock");
+    let target = rollback
+        .await
+        .expect("rollback task")
+        .expect("rollback")
+        .expect("previous generation");
+    assert_eq!(target, first);
+
+    f.cleanup().await;
+}
+
+/// Publication and rollback are both real pointer moves here. Across a
+/// thousand injected schedules the final pointer and rollback target must
+/// correspond to one of the only two legal serial orders.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "Requires PostgreSQL with pgvector (TEST_DATABASE_URL)"]
+async fn a_thousand_publication_rollback_schedules_are_linearizable() {
+    let f = fixture_or_skip!();
+    let prov = provenance("model-a");
+    let source_id = f.create_source("rollback-publication-stress").await;
+    f.publish_generation(source_id, "oldest", 1, &prov).await;
+    f.publish_generation(source_id, "active", 1, &prov).await;
+
+    let mut rollback_first = 0usize;
+    let mut publication_first = 0usize;
+    for schedule in 0..PUBLICATION_SCHEDULES {
+        let active_before = optional_uuid(
+            &f.db,
+            "SELECT active_generation_id AS value FROM sources WHERE id = $1",
+            [source_id.into()],
+        )
+        .await
+        .expect("source has an active generation");
+        let newest_before = optional_uuid(
+            &f.db,
+            "SELECT id AS value FROM source_index_generations
+             WHERE source_id = $1 AND state = 'published'
+             ORDER BY published_at DESC, id DESC LIMIT 1",
+            [source_id.into()],
+        )
+        .await
+        .expect("source has a published generation");
+        let previous_before = optional_uuid(
+            &f.db,
+            "SELECT id AS value FROM source_index_generations
+             WHERE source_id = $1 AND state = 'published' AND id <> $2
+             ORDER BY published_at DESC, id DESC LIMIT 1",
+            [source_id.into(), active_before.into()],
+        )
+        .await
+        .expect("source has a rollback target");
+
+        let replacement = f
+            .generations
+            .claim(source_id, &prov)
+            .await
+            .expect("claim")
+            .expect("claim wins");
+        let marker = format!("rollback-race-{schedule}");
+        let (chunks, embeddings) = synthetic_chunks(&marker, 1);
+        f.chunks
+            .store_chunks(replacement, source_id, &chunks, &embeddings)
+            .await
+            .expect("store replacement");
+        f.generations
+            .record_build_plan(replacement, 1, &prov.chunking)
+            .await
+            .expect("record build plan");
+
+        let rollback_delay = Duration::from_millis(usize::from(schedule % 2 == 1) as u64);
+        let publish_delay = Duration::from_millis(usize::from(schedule % 2 == 0) as u64);
+        let rollback_repo = f.generations.clone();
+        let rollback = tokio::spawn(async move {
+            if !rollback_delay.is_zero() {
+                tokio::time::sleep(rollback_delay).await;
+            }
+            rollback_repo.rollback_to_previous(source_id).await
+        });
+        let publish_repo = f.generations.clone();
+        let publisher = tokio::spawn(async move {
+            if !publish_delay.is_zero() {
+                tokio::time::sleep(publish_delay).await;
+            }
+            publish_repo
+                .publish(replacement, source_id, EMBEDDING_DIM)
+                .await
+        });
+
+        let rollback_target = rollback
+            .await
+            .expect("rollback join")
+            .expect("rollback")
+            .expect("rollback target");
+        let _published = publisher.await.expect("publisher join").expect("publish");
+        let final_active = optional_uuid(
+            &f.db,
+            "SELECT active_generation_id AS value FROM sources WHERE id = $1",
+            [source_id.into()],
+        )
+        .await
+        .expect("source remains active");
+
+        if final_active == replacement {
+            rollback_first += 1;
+            assert_eq!(
+                rollback_target, previous_before,
+                "schedule {schedule}: rollback-before-publication chose a stale target"
+            );
+        } else {
+            publication_first += 1;
+            assert_eq!(
+                rollback_target, newest_before,
+                "schedule {schedule}: rollback-after-publication did not choose the prior latest generation"
+            );
+            assert_eq!(
+                final_active, rollback_target,
+                "schedule {schedule}: final pointer disagrees with the serialized rollback"
+            );
+        }
+    }
+
+    assert!(rollback_first > 0, "no schedule serialized rollback first");
+    assert!(
+        publication_first > 0,
+        "no schedule serialized publication first"
+    );
     f.cleanup().await;
 }
 

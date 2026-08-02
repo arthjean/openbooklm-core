@@ -40,6 +40,26 @@ struct CitationCandidate {
     generation_id: Uuid,
 }
 
+fn native_ownership(
+    document: &crate::llm::RagDocument,
+    chunk: Option<&SearchResult>,
+    cited_text: &str,
+) -> (bool, bool) {
+    let Some(chunk) = chunk else {
+        return (false, false);
+    };
+    let identity_owned = chunk.source_id == document.source_id
+        && chunk.generation_id == document.generation_id
+        && chunk.chunk_index == document.chunk_index;
+    let quote_owned =
+        identity_owned && crate::llm::citations::quote_belongs_to(&chunk.content, cited_text);
+    let provenance = ChunkProvenance::read(document.metadata.as_ref());
+    let span_owned = identity_owned
+        && document.metadata == chunk.metadata
+        && provenance.owns_chunk(chunk.chunk_index, &chunk.content);
+    (quote_owned, span_owned)
+}
+
 pub(super) async fn resolve_citations(
     input: &CitationResolution<'_>,
     source_repo: &dyn SourceRepository,
@@ -90,15 +110,17 @@ async fn resolve_native(
             rejected += 1;
             continue;
         };
-        let quote_owned =
-            crate::llm::citations::quote_belongs_to(&document.content, &native.cited_text);
+        let (quote_owned, span_owned) = native_ownership(
+            document,
+            input.context_chunks.get(native.document_index),
+            &native.cited_text,
+        );
         let claim_linked =
             claim_is_supported_by(marker_start, input.full_response, &native.cited_text);
         let marker_outside_code = !code_ranges
             .iter()
             .any(|&(start, end)| marker_start >= start && marker_start < end);
-        let provenance = ChunkProvenance::read(document.metadata.as_ref());
-        if !quote_owned || !claim_linked || !marker_outside_code || !provenance.is_coherent() {
+        if !quote_owned || !claim_linked || !marker_outside_code || !span_owned {
             rejected += 1;
             tracing::warn!(
                 notebook_id = %input.notebook_id,
@@ -107,12 +129,13 @@ async fn resolve_native(
                 quote_owned,
                 claim_linked,
                 marker_outside_code,
-                coherent_provenance = provenance.is_coherent(),
+                span_owned,
                 reason = ReasonCode::CitationRejected.as_str(),
                 "Native citation failed final validation"
             );
             continue;
         }
+        let provenance = ChunkProvenance::read(document.metadata.as_ref());
         if !seen_doc_indices.insert(native.document_index) {
             continue;
         }
@@ -260,5 +283,83 @@ async fn finalize_candidates(
             event_refs,
             lease: Some(lease),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{RetrievalScore, ScoreDomain};
+
+    fn native_fixture() -> (crate::llm::RagDocument, SearchResult) {
+        let source_id = Uuid::new_v4();
+        let generation_id = Uuid::new_v4();
+        let content = "owned child passage";
+        let metadata = serde_json::json!({
+            "position": 3,
+            "span_start": 100,
+            "span_end": 100 + content.len(),
+        });
+        let chunk = SearchResult {
+            chunk_id: Uuid::new_v4(),
+            generation_id,
+            source_id,
+            source_title: "Synthetic".to_owned(),
+            chunk_index: 3,
+            content: content.to_owned(),
+            parent_content: Some(
+                "forbidden parent-only statement followed by owned child passage".to_owned(),
+            ),
+            score: RetrievalScore::new(ScoreDomain::DenseSimilarity, 0.9).expect("finite score"),
+            metadata: Some(metadata.clone()),
+            collapsed_children: Vec::new(),
+        };
+        let document = crate::llm::RagDocument {
+            source_id,
+            generation_id,
+            title: "Synthetic".to_owned(),
+            content: chunk.parent_content.clone().expect("parent"),
+            chunk_index: chunk.chunk_index,
+            relevance_score: chunk.relevance(),
+            metadata: Some(metadata),
+        };
+        (document, chunk)
+    }
+
+    #[test]
+    fn a_native_quote_outside_the_child_is_not_owned() {
+        let (document, chunk) = native_fixture();
+        let (quote_owned, span_owned) =
+            native_ownership(&document, Some(&chunk), "forbidden parent-only statement");
+        assert!(!quote_owned);
+        assert!(span_owned);
+    }
+
+    #[test]
+    fn a_shifted_same_width_native_span_is_not_owned() {
+        let (mut document, chunk) = native_fixture();
+        document.metadata = Some(serde_json::json!({
+            "position": 3,
+            "span_start": 101,
+            "span_end": 101 + chunk.content.len(),
+        }));
+        let (quote_owned, span_owned) =
+            native_ownership(&document, Some(&chunk), "owned child passage");
+        assert!(quote_owned);
+        assert!(!span_owned);
+    }
+
+    #[test]
+    fn a_native_position_must_equal_the_chunk_index() {
+        let (mut document, mut chunk) = native_fixture();
+        let metadata = serde_json::json!({
+            "position": 4,
+            "span_start": 100,
+            "span_end": 100 + chunk.content.len(),
+        });
+        document.metadata = Some(metadata.clone());
+        chunk.metadata = Some(metadata);
+        let (_, span_owned) = native_ownership(&document, Some(&chunk), "owned child passage");
+        assert!(!span_owned);
     }
 }

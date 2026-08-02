@@ -391,8 +391,8 @@ pub struct ChunkMetadata {
     pub page_end: Option<u32>,
     /// Byte offset where this chunk begins in the source's extracted text.
     ///
-    /// `None` on chunks written before US-019; those still resolve by
-    /// `(source, chunk_index)` and simply carry no span.
+    /// `None` on chunks written before US-019; citation resolution rejects
+    /// those legacy rows because they have no stable navigation anchor.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub span_start: Option<u32>,
     /// Byte offset just past this chunk's last byte.

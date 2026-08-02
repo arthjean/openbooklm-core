@@ -283,9 +283,9 @@ impl Citation {
 /// evidence renderer: adding a provenance field used to mean adding a seventh
 /// probe to each of the three.
 ///
-/// Malformed or absent metadata yields an empty provenance rather than an
-/// error. A chunk whose extra fields cannot be parsed is still citable by
-/// `(source, chunk_index)`; what it loses is enrichment, not identity.
+/// Malformed or absent metadata yields an empty provenance. Citation
+/// resolution rejects it because a source/chunk pair without a stable span is
+/// not a navigable citation anchor (US-019).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ChunkProvenance {
     pub section_header: Option<String>,
@@ -295,6 +295,9 @@ pub struct ChunkProvenance {
     /// Byte range within the source's extracted text. `None` on chunks written
     /// before US-019.
     pub span: Option<(u32, u32)>,
+    /// Position within the source, retained separately from the public
+    /// citation shape so resolution can prove the metadata owns this chunk.
+    pub position: Option<u32>,
     pub timestamp_start: Option<f64>,
     pub timestamp_end: Option<f64>,
     pub video_id: Option<String>,
@@ -305,6 +308,10 @@ impl ChunkProvenance {
     /// Read provenance out of a chunk's stored metadata.
     #[must_use]
     pub fn read(metadata: Option<&serde_json::Value>) -> Self {
+        let position = metadata
+            .and_then(|value| value.get("position"))
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok());
         let Some(parsed) = metadata
             .cloned()
             .and_then(|value| serde_json::from_value::<crate::types::ChunkMetadata>(value).ok())
@@ -317,6 +324,7 @@ impl ChunkProvenance {
             page_number: parsed.page_number,
             page_end: parsed.page_end,
             span: parsed.span_start.zip(parsed.span_end),
+            position,
             timestamp_start: parsed.timestamp_start,
             timestamp_end: parsed.timestamp_end,
             video_id: parsed.video_id,
@@ -334,7 +342,7 @@ impl ChunkProvenance {
     /// that claim the stored provenance can actually answer.
     #[must_use]
     pub fn is_coherent(&self) -> bool {
-        let span_ok = self.span.is_none_or(|(start, end)| start < end);
+        let span_ok = self.span.is_some_and(|(start, end)| start < end);
         let pages_ok = match (self.page_number, self.page_end) {
             (Some(first), Some(last)) => first <= last,
             // A last page with no first page is a page claim with no anchor.
@@ -342,6 +350,28 @@ impl ChunkProvenance {
             _ => true,
         };
         span_ok && pages_ok
+    }
+
+    /// Whether this span can own the exact child passage stored on the chunk.
+    ///
+    /// The resolver cannot reconstruct an extracted PDF from the public
+    /// citation shape, but it can reject metadata whose byte width disagrees
+    /// with the child bytes it claims to locate. Ingestion separately proves
+    /// that the absolute offsets slice back to those same bytes.
+    #[must_use]
+    pub fn owns_content(&self, content: &str) -> bool {
+        self.span.is_some_and(|(start, end)| {
+            start < end
+                && usize::try_from(end - start).is_ok_and(|span_len| span_len == content.len())
+        }) && self.is_coherent()
+    }
+
+    /// Whether the metadata identifies this exact child position and owns its
+    /// byte width.
+    #[must_use]
+    pub fn owns_chunk(&self, chunk_index: i32, content: &str) -> bool {
+        u32::try_from(chunk_index).is_ok_and(|index| self.position == Some(index))
+            && self.owns_content(content)
     }
 }
 

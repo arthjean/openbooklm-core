@@ -968,7 +968,13 @@ fn citation_extraction_baseline() {
             chunk_index: 0,
             content: "The first synthetic passage.".into(),
             relevance_score: 0.91,
-            metadata: Some(json!({ "section_header": "Introduction", "page_number": 2 })),
+            metadata: Some(json!({
+                "section_header": "Introduction",
+                "page_number": 2,
+                "position": 0,
+                "span_start": 0,
+                "span_end": "The first synthetic passage.".len(),
+            })),
         },
         CitableChunk {
             source_id: uuid(SOURCE_ID),
@@ -976,7 +982,11 @@ fn citation_extraction_baseline() {
             chunk_index: 1,
             content: "The second synthetic passage.".into(),
             relevance_score: 0.55,
-            metadata: None,
+            metadata: Some(json!({
+                "position": 1,
+                "span_start": 30,
+                "span_end": 30 + "The second synthetic passage.".len(),
+            })),
         },
     ];
 

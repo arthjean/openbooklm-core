@@ -126,9 +126,11 @@ denominator as `malformed_marker`, and gives the case the explicit
 
 The chat path refuses the same things before a citation is ever emitted (US-019):
 a marker that resolves to nothing retrieved, a missing or stale active
-generation, a claim without lexical support in the cited passage, a
-provider-native quote the document does not contain, and a marker written inside
-a code fence. Refusals are counted and reach the trace as `citation_rejected`,
+generation, a missing or width-mismatched source span, a metadata position that
+does not own the cited child chunk, a claim without lexical
+support in the cited passage, a provider-native quote the document does not
+contain, and a marker written inside a code fence. Refusals are counted and
+reach the trace as `citation_rejected`,
 so a regression appears as refusals rather than as silently lower coverage.
 One transaction locks every active source through complete-message persistence
 and non-blocking enqueue of singular and aggregate citation events. Partial

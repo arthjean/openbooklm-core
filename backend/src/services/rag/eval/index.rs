@@ -150,6 +150,7 @@ impl CorpusIndex {
                         "eval_chunk_slug".to_owned(),
                         serde_json::Value::String(chunk.id.clone()),
                     );
+                    metadata.insert("position".to_owned(), serde_json::Value::from(chunk.index));
                     metadata.insert(
                         "span_start".to_owned(),
                         serde_json::Value::from(chunk.span.start),

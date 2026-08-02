@@ -97,7 +97,10 @@ fn extract_citations_with_active_generations(
     for cap in CITATION_REGEX.captures_iter(response) {
         marker_count += 1;
 
-        let full_match = cap.get(0).expect("capture group 0 always exists");
+        let Some(full_match) = cap.get(0) else {
+            rejected += 1;
+            continue;
+        };
         // A marker inside a code block is code, not a citation. It is still
         // counted: an answer that only "cites" inside a fence has cited nothing.
         if is_in_code_range(full_match.start(), &code_ranges) {
@@ -166,11 +169,11 @@ fn extract_citations_with_active_generations(
         // can exist. One that cannot was not written by this pipeline, and a
         // citation into it would open something the reader cannot verify.
         let provenance = ChunkProvenance::read(chunk.metadata.as_ref());
-        if !provenance.is_coherent() {
+        if !provenance.owns_chunk(chunk.chunk_index, &chunk.content) {
             tracing::warn!(
                 citation_index = index,
                 source_id = %chunk.source_id,
-                "Citation resolves to a chunk with an incoherent span, skipping"
+                "Citation resolves to a chunk without an owned source span, skipping"
             );
             rejected += 1;
             continue;
@@ -754,8 +757,21 @@ mod tests {
             chunk_index: 0,
             content: content.to_string(),
             relevance_score: 0.9,
-            metadata: None,
+            metadata: Some(serde_json::json!({
+                "position": 0,
+                "span_start": 0,
+                "span_end": content.len(),
+            })),
         }
+    }
+
+    fn set_chunk_content(chunk: &mut CitableChunk, content: &str) {
+        chunk.content = content.to_owned();
+        chunk.metadata = Some(serde_json::json!({
+            "position": 0,
+            "span_start": 0,
+            "span_end": content.len(),
+        }));
     }
 
     #[test]
@@ -894,11 +910,11 @@ mod tests {
     fn a_coherent_span_travels_into_the_citation_as_its_page() {
         let mut chunk = make_chunk("00000000-0000-0000-0000-000000000001", "text");
         chunk.metadata = Some(serde_json::json!({
-            "position": 3,
+            "position": 0,
             "page_number": 4,
             "page_end": 5,
             "span_start": 120,
-            "span_end": 480,
+            "span_end": 124,
             "section_header": "Retention",
         }));
         let response = "Supported [1].";
@@ -915,14 +931,26 @@ mod tests {
         );
     }
 
-    /// Legacy rows carry neither span nor page. They stay citable: US-019 adds
-    /// provenance, it does not retire the notebooks indexed before it.
     #[test]
-    fn a_chunk_with_no_span_at_all_is_still_citable() {
-        let chunk = make_chunk("00000000-0000-0000-0000-000000000001", "text");
+    fn a_chunk_with_no_span_at_all_is_rejected() {
+        let mut chunk = make_chunk("00000000-0000-0000-0000-000000000001", "text");
+        chunk.metadata = None;
         let extracted = extract_citations_verified("Supported [1].", &[chunk]);
-        assert_eq!(extracted.citations.len(), 1);
-        assert_eq!(extracted.rejected, 0);
+        assert!(extracted.citations.is_empty());
+        assert_eq!(extracted.rejected, 1);
+    }
+
+    #[test]
+    fn a_span_whose_width_does_not_own_the_chunk_is_rejected() {
+        let mut chunk = make_chunk("00000000-0000-0000-0000-000000000001", "text");
+        chunk.metadata = Some(serde_json::json!({
+            "position": 0,
+            "span_start": 100,
+            "span_end": 105,
+        }));
+        let extracted = extract_citations_verified("Supported [1].", &[chunk]);
+        assert!(extracted.citations.is_empty());
+        assert_eq!(extracted.rejected, 1);
     }
 
     #[test]
@@ -978,7 +1006,7 @@ mod tests {
         assert_eq!(accepted_normalized_number.citations.len(), 1);
         assert_eq!(accepted_normalized_number.rejected, 0);
 
-        chunk.content = "The temperature is 5 degrees during the test.".to_owned();
+        set_chunk_content(&mut chunk, "The temperature is 5 degrees during the test.");
         let unsupported_negative = extract_citations_verified_against_active(
             "The temperature is -5 degrees [1].",
             &[chunk.clone()],
@@ -987,7 +1015,7 @@ mod tests {
         assert!(unsupported_negative.citations.is_empty());
         assert_eq!(unsupported_negative.rejected, 1);
 
-        chunk.content = "The temperature is -5 degrees during the test.".to_owned();
+        set_chunk_content(&mut chunk, "The temperature is -5 degrees during the test.");
         let accepted_negative = extract_citations_verified_against_active(
             "The temperature is -5 degrees [1].",
             &[chunk.clone()],
@@ -996,7 +1024,10 @@ mod tests {
         assert_eq!(accepted_negative.citations.len(), 1);
         assert_eq!(accepted_negative.rejected, 0);
 
-        chunk.content = "The retry budget is 1,002 attempts before failure.".to_owned();
+        set_chunk_content(
+            &mut chunk,
+            "The retry budget is 1,002 attempts before failure.",
+        );
         let unsupported_grouped_number = extract_citations_verified_against_active(
             "The retry budget is 1,001 attempts [1].",
             &[chunk.clone()],
@@ -1005,7 +1036,10 @@ mod tests {
         assert!(unsupported_grouped_number.citations.is_empty());
         assert_eq!(unsupported_grouped_number.rejected, 1);
 
-        chunk.content = "The retry budget is 1.002 attempts before failure.".to_owned();
+        set_chunk_content(
+            &mut chunk,
+            "The retry budget is 1.002 attempts before failure.",
+        );
         let unsupported_three_digit_decimal = extract_citations_verified_against_active(
             "The retry budget is 1.001 attempts [1].",
             &[chunk.clone()],
@@ -1014,7 +1048,10 @@ mod tests {
         assert!(unsupported_three_digit_decimal.citations.is_empty());
         assert_eq!(unsupported_three_digit_decimal.rejected, 1);
 
-        chunk.content = "The retry budget is 1 001 attempts before failure.".to_owned();
+        set_chunk_content(
+            &mut chunk,
+            "The retry budget is 1 001 attempts before failure.",
+        );
         let accepted_group_normalization = extract_citations_verified_against_active(
             "The retry budget is 1001 attempts [1].",
             &[chunk.clone()],
@@ -1023,7 +1060,10 @@ mod tests {
         assert_eq!(accepted_group_normalization.citations.len(), 1);
         assert_eq!(accepted_group_normalization.rejected, 0);
 
-        chunk.content = "The retry budget is 1,001 attempts before failure.".to_owned();
+        set_chunk_content(
+            &mut chunk,
+            "The retry budget is 1,001 attempts before failure.",
+        );
         let ambiguous_punctuation_is_not_assumed_to_be_grouping =
             extract_citations_verified_against_active(
                 "The retry budget is 1001 attempts [1].",
@@ -1043,7 +1083,10 @@ mod tests {
         assert_eq!(numeric_values(".5 -0,25"), numeric_values("0.5 -0.25"));
         assert_eq!(numeric_values("1,001.500"), numeric_values("1001.5"));
 
-        chunk.content = "The retry budget is thirteen attempts before failure.".to_owned();
+        set_chunk_content(
+            &mut chunk,
+            "The retry budget is thirteen attempts before failure.",
+        );
         let unsupported_dozen = extract_citations_verified_against_active(
             "The retry budget is a dozen attempts [1].",
             &[chunk.clone()],
@@ -1052,7 +1095,10 @@ mod tests {
         assert!(unsupported_dozen.citations.is_empty());
         assert_eq!(unsupported_dozen.rejected, 1);
 
-        chunk.content = "The retry budget is eleven attempts before failure.".to_owned();
+        set_chunk_content(
+            &mut chunk,
+            "The retry budget is eleven attempts before failure.",
+        );
         let unsupported_large_number = extract_citations_verified_against_active(
             "The retry budget is twelve attempts [1].",
             &[chunk.clone()],
@@ -1061,7 +1107,10 @@ mod tests {
         assert!(unsupported_large_number.citations.is_empty());
         assert_eq!(unsupported_large_number.rejected, 1);
 
-        chunk.content = "The service stores retry budget policy in a queue.".to_owned();
+        set_chunk_content(
+            &mut chunk,
+            "The service stores retry budget policy in a queue.",
+        );
         let unsupported_long_claim = extract_citations_verified_against_active(
             "The service stores retry budget while database replication permanently changes unrelated ownership semantics [1].",
             &[chunk.clone()],
@@ -1070,7 +1119,10 @@ mod tests {
         assert!(unsupported_long_claim.citations.is_empty());
         assert_eq!(unsupported_long_claim.rejected, 1);
 
-        chunk.content = "The retry budget is four attempts before the job fails.".to_owned();
+        set_chunk_content(
+            &mut chunk,
+            "The retry budget is four attempts before the job fails.",
+        );
         let repeated_unsupported = extract_citations_verified_against_active(
             "The retry budget is four attempts [1]. It is five attempts [1].",
             &[chunk.clone()],

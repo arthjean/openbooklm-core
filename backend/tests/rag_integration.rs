@@ -2648,6 +2648,7 @@ impl openbooklm::core::events::EventSink for RecordingSink {
 struct CountingEmbedder {
     started: Arc<AtomicUsize>,
     block: Arc<AtomicBool>,
+    fail_on_call: Option<usize>,
 }
 
 #[async_trait]
@@ -2665,7 +2666,12 @@ impl EmbeddingProvider for CountingEmbedder {
     }
 
     async fn embed_documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, AppError> {
-        self.started.fetch_add(1, Ordering::SeqCst);
+        let call = self.started.fetch_add(1, Ordering::SeqCst) + 1;
+        if self.fail_on_call == Some(call) {
+            return Err(AppError::ProviderError(format!(
+                "synthetic embedding failure on call {call}"
+            )));
+        }
         while self.block.load(Ordering::SeqCst) {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -2724,6 +2730,7 @@ async fn a_timed_out_run_stops_calling_the_provider_and_preserves_the_index() {
     let embedder = Arc::new(CountingEmbedder {
         started: Arc::clone(&started),
         block: Arc::clone(&block),
+        fail_on_call: None,
     }) as Arc<dyn EmbeddingProvider>;
     let sink = Arc::new(RecordingSink::default());
 
@@ -2850,6 +2857,96 @@ async fn a_timed_out_run_stops_calling_the_provider_and_preserves_the_index() {
     f.cleanup().await;
 }
 
+/// A provider failure stops the lazy batch stream at the first failed call.
+///
+/// With concurrency one, any third call necessarily started after the second
+/// returned its terminal error. This makes the admission guarantee exact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "Requires PostgreSQL with pgvector (TEST_DATABASE_URL)"]
+async fn an_embedding_error_stops_admitting_new_provider_calls() {
+    use openbooklm::core::entitlements::UnrestrictedPolicy;
+    use openbooklm::core::principal::Principal;
+    use openbooklm::services::source_processing::{
+        ProcessingDeps, claim_index_ownership, process_source,
+    };
+    use openbooklm::types::SourceType;
+    use tokio_util::sync::CancellationToken;
+
+    let f = fixture_or_skip!();
+    let prov = provenance("counting-v1");
+    let source_id = f.create_source("provider failure").await;
+    let original = f.publish_generation(source_id, "old", 3, &prov).await;
+    let content = "Retrieval invariants and generation publication. ".repeat(4_000);
+    exec(
+        &f.db,
+        "UPDATE sources SET content = $2 WHERE id = $1",
+        [source_id.into(), content.into()],
+    )
+    .await;
+
+    let started = Arc::new(AtomicUsize::new(0));
+    let embedder = Arc::new(CountingEmbedder {
+        started: Arc::clone(&started),
+        block: Arc::new(AtomicBool::new(false)),
+        fail_on_call: Some(2),
+    }) as Arc<dyn EmbeddingProvider>;
+    let sink = Arc::new(RecordingSink::default());
+    let deps = ProcessingDeps {
+        db: f.db.clone(),
+        config: Arc::new(openbooklm::core::config::CoreConfig::from_env()),
+        broadcaster: openbooklm::services::source_events::SourceEventBroadcaster::new(),
+        source_repo: Arc::new(SeaOrmSourceRepository::new(&f.db)),
+        chunk_repo: Arc::new(SeaOrmChunkRepository::new(&f.db)),
+        generation_repo: Arc::new(SeaOrmGenerationRepository::new(&f.db)),
+        embeddings: Some(embedder),
+        firecrawl: None,
+        youtube: None,
+        ocr: None,
+        ocr_cache: Arc::new(openbooklm::repositories::SeaOrmOcrCacheRepository::new(
+            &f.db,
+        )),
+        entitlements: Arc::new(UnrestrictedPolicy),
+        events: Arc::clone(&sink) as Arc<dyn openbooklm::core::events::EventSink>,
+        principal: Principal::new(f.account_id),
+        shutdown: CancellationToken::new(),
+    };
+    let ownership = claim_index_ownership(
+        deps.generation_repo.as_ref(),
+        deps.embeddings.as_ref(),
+        source_id,
+        SourceType::Text,
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("claim must not error")
+    .expect("claim must succeed");
+
+    let outcome = process_source(
+        deps,
+        ownership,
+        source_id,
+        f.notebook_id,
+        SourceType::Text,
+        Duration::from_secs(10),
+    )
+    .await;
+
+    assert!(outcome.is_err());
+    assert_eq!(started.load(Ordering::SeqCst), 2);
+    assert_eq!(sink.terminal(), vec!["source_processing_failed"]);
+    assert_eq!(
+        optional_uuid(
+            &f.db,
+            "SELECT active_generation_id AS value FROM sources WHERE id = $1",
+            [source_id.into()],
+        )
+        .await,
+        Some(original)
+    );
+
+    f.cleanup().await;
+}
+
 /// Process shutdown reaches ingestion through the token, with the same outcome
 /// as a timeout: the building generation fails, the active one survives, and
 /// exactly one terminal event is emitted (US-010).
@@ -2882,6 +2979,7 @@ async fn a_shutdown_signal_stops_ingestion_and_preserves_the_index() {
     let embedder = Arc::new(CountingEmbedder {
         started: Arc::clone(&started),
         block: Arc::clone(&block),
+        fail_on_call: None,
     }) as Arc<dyn EmbeddingProvider>;
     let sink = Arc::new(RecordingSink::default());
     let shutdown = CancellationToken::new();

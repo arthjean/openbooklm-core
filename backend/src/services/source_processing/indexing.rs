@@ -182,9 +182,10 @@ async fn embed_and_store(
     let progress_total = u32::try_from(total_chunks).unwrap_or(u32::MAX);
     let progress = Arc::new(AtomicU32::new(0));
     let token = tasks.token();
+    let producer_token = token.clone();
 
     let producer_handle = tasks.spawn(async move {
-        use futures::stream::{self, StreamExt};
+        use futures::stream::{self, StreamExt, TryStreamExt};
 
         let batch_work: Vec<(usize, Vec<ChunkWithContext>)> = chunks
             .chunks(batch_size)
@@ -192,14 +193,14 @@ async fn embed_and_store(
             .map(|(batch_idx, slice)| (batch_idx * batch_size, slice.to_vec()))
             .collect();
 
-        let results: Vec<Result<(), AppError>> = stream::iter(batch_work)
+        let result: Result<Vec<()>, AppError> = stream::iter(batch_work)
             .map(|(base_index, batch_chunks)| {
                 let tx = tx.clone();
                 let embedder = &embedder_clone;
                 let reused = &reused;
                 let progress = Arc::clone(&progress);
                 let broadcaster = &broadcaster;
-                let token = token.clone();
+                let token = producer_token.clone();
 
                 async move {
                     // Admission check. `buffer_unordered` creates each batch
@@ -262,20 +263,22 @@ async fn embed_and_store(
                 }
             })
             .buffer_unordered(concurrency)
-            .collect()
+            .try_collect()
             .await;
+
+        if result.is_err() {
+            producer_token.cancel();
+        }
 
         // Drop the sender so the consumer's recv loop terminates.
         drop(tx);
 
-        for result in results {
-            result?;
-        }
+        result?;
         Ok::<(), AppError>(())
     });
 
     let embed_start = std::time::Instant::now();
-    let consumer_error = store_batches(deps, generation_id, source_id, &mut rx).await;
+    let consumer_error = store_batches(deps, generation_id, source_id, &token, &mut rx).await;
 
     // The first terminal storage error closes admission immediately, rather
     // than after the outstanding batches have each paid for a provider call
@@ -335,9 +338,16 @@ async fn store_batches(
     deps: &ProcessingDeps,
     generation_id: Uuid,
     source_id: Uuid,
+    token: &tokio_util::sync::CancellationToken,
     rx: &mut tokio::sync::mpsc::Receiver<EmbeddedBatch>,
 ) -> Option<AppError> {
-    while let Some(batch) = rx.recv().await {
+    loop {
+        let batch = tokio::select! {
+            biased;
+            () = token.cancelled() => return None,
+            batch = rx.recv() => batch,
+        };
+        let batch = batch?;
         let txn = match deps.db.begin().await {
             Ok(txn) => txn,
             Err(e) => {
@@ -367,7 +377,6 @@ async fn store_batches(
             return Some(AppError::Internal(format!("Failed to commit batch: {e}")));
         }
     }
-    None
 }
 
 /// Split a batch into the embeddings already known and the texts still to embed.

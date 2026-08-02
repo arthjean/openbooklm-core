@@ -604,9 +604,9 @@ async fn publish_generation(
 
 /// Reclaim this source's superseded generations, once publication has committed.
 ///
-/// A publication is the only event that makes a generation obsolete, so it is
-/// also the only moment worth looking — which is what keeps retention a real
-/// policy rather than a documented one nothing ever runs.
+/// Publication is the fast path because it is what makes a generation
+/// obsolete. The daily maintenance pass retries every source, so a transient
+/// failure here cannot retain obsolete data indefinitely.
 ///
 /// Deliberately outside the publication transaction and deliberately not
 /// fallible: the new index is already live, and disk left behind is an

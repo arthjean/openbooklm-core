@@ -349,6 +349,11 @@ pub trait GenerationRepository: Send + Sync {
     /// many rows it actually removed.
     async fn reclaim(&self, source_id: Uuid, retention_hours: i32) -> RepoResult<u64>;
 
+    /// Reclaim expired generations for every source that has old non-building
+    /// generations. Each source still uses the same row lock and exclusions as
+    /// [`Self::reclaim`].
+    async fn reclaim_all(&self, retention_hours: i32) -> RepoResult<u64>;
+
     /// Fail building generations abandoned by a process that is gone.
     async fn fail_stale_builds(&self, older_than_secs: i64, reason: &str) -> RepoResult<u64>;
 }

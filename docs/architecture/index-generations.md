@@ -188,13 +188,13 @@ pass back without changing the active pointer or rollback target.
 Retention is at least one prior complete generation and at least 24 hours.
 Cleanup never runs inside the publication transaction.
 
-**When it runs.** Immediately after a publication commits, for the source that
-was just published, in `source_processing::reclaim_obsolete_generations`. A
-publication is the only event that makes a generation obsolete, so it is the
-only moment worth looking, and it needs no scheduler to be a real policy rather
-than a documented one. The call is deliberately not fallible: the new index is
-already live, and disk left behind is an operational cost, not a reason to
-report a successful rebuild as a failure.
+**When it runs.** The fast path runs immediately after a publication commits,
+for the source that was just published, in
+`source_processing::reclaim_obsolete_generations`. The reference server also
+runs a maintenance pass immediately at startup and every 24 hours. That pass
+fails abandoned builds first, then sends every source with expired generations
+through the same locked reclaim path. The publication call remains deliberately
+non-fallible: the new index is already live, and the maintenance pass owns retry.
 
 Verified: `rollback_returns_to_the_previous_complete_generation`,
 `rollback_never_activates_an_incompatible_embedding_generation`,
@@ -203,7 +203,8 @@ Verified: `rollback_returns_to_the_previous_complete_generation`,
 `rollback_without_a_predecessor_changes_nothing`,
 `reclaim_never_removes_a_referenced_or_rollback_eligible_generation`,
 `reclaim_serializes_on_the_source_pointer`,
-`reclaim_respects_the_retention_window`.
+`reclaim_respects_the_retention_window`,
+`global_reclaim_visits_every_source_with_expired_generations`.
 
 ## Migration and rollout
 

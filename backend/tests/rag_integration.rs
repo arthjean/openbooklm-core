@@ -1962,6 +1962,41 @@ async fn reclaim_never_removes_a_referenced_or_rollback_eligible_generation() {
     f.cleanup().await;
 }
 
+#[tokio::test]
+#[ignore = "Requires PostgreSQL with pgvector (TEST_DATABASE_URL)"]
+async fn global_reclaim_visits_every_source_with_expired_generations() {
+    let f = fixture_or_skip!();
+    let prov = provenance("model-a");
+    let first = f.create_source("global reclaim first").await;
+    let second = f.create_source("global reclaim second").await;
+
+    for source_id in [first, second] {
+        f.publish_generation(source_id, "oldest", 2, &prov).await;
+        f.publish_generation(source_id, "previous", 2, &prov).await;
+        f.publish_generation(source_id, "active", 2, &prov).await;
+        exec(
+            &f.db,
+            "UPDATE source_index_generations
+             SET created_at = now() - interval '48 hours'
+             WHERE source_id = $1",
+            [source_id.into()],
+        )
+        .await;
+    }
+
+    assert_eq!(
+        f.generations.reclaim_all(24).await.expect("global reclaim"),
+        2
+    );
+    assert_eq!(f.generations.list_for_source(first).await.unwrap().len(), 2);
+    assert_eq!(
+        f.generations.list_for_source(second).await.unwrap().len(),
+        2
+    );
+
+    f.cleanup().await;
+}
+
 /// Reclaim holds the same source-row lock as publication and rollback from
 /// candidate selection through deletion.
 #[tokio::test]

@@ -185,6 +185,16 @@ const RECLAIMABLE_SQL: &str = r"
 
 const DELETE_GENERATION_SQL: &str = "DELETE FROM source_index_generations WHERE id = $1";
 
+/// Sources worth passing through the authoritative per-source reclaim path.
+/// The broad prefilter is deliberate: [`RECLAIMABLE_SQL`] makes the final
+/// decision while holding the source row lock.
+const SOURCES_WITH_EXPIRED_GENERATIONS_SQL: &str = r"
+    SELECT DISTINCT source_id
+    FROM source_index_generations
+    WHERE state <> 'building'
+      AND created_at < now() - make_interval(hours => $1)
+";
+
 /// Building generations older than the deadline, with the source they block.
 const STALE_BUILDING_SQL: &str = r"
     SELECT g.id, g.source_id
@@ -441,6 +451,24 @@ impl GenerationRepository for SeaOrmGenerationRepository {
         Ok(reclaimed)
     }
 
+    #[tracing::instrument(skip(self), fields(%retention_hours))]
+    async fn reclaim_all(&self, retention_hours: i32) -> RepoResult<u64> {
+        let rows = self
+            .db
+            .query_all(Self::stmt(
+                SOURCES_WITH_EXPIRED_GENERATIONS_SQL,
+                [retention_hours.into()],
+            ))
+            .await?;
+
+        let mut reclaimed = 0_u64;
+        for row in rows {
+            let source_id: Uuid = row.try_get("", "source_id")?;
+            reclaimed = reclaimed.saturating_add(self.reclaim(source_id, retention_hours).await?);
+        }
+        Ok(reclaimed)
+    }
+
     #[tracing::instrument(skip(self), fields(%older_than_secs))]
     async fn fail_stale_builds(&self, older_than_secs: i64, reason: &str) -> RepoResult<u64> {
         let rows = self
@@ -453,18 +481,21 @@ impl GenerationRepository for SeaOrmGenerationRepository {
             let generation_id: Uuid = row.try_get("", "id")?;
             let source_id: Uuid = row.try_get("", "source_id")?;
             let txn = self.db.begin().await?;
-            txn.execute(Self::stmt(
-                FAIL_STALE_SQL,
-                [generation_id.into(), reason.into()],
-            ))
-            .await?;
-            txn.execute(Self::stmt(
-                RESTORE_SOURCE_STATUS_SQL,
-                [source_id.into(), reason.into()],
-            ))
-            .await?;
+            let result = txn
+                .execute(Self::stmt(
+                    FAIL_STALE_SQL,
+                    [generation_id.into(), reason.into()],
+                ))
+                .await?;
+            if result.rows_affected() == 1 {
+                txn.execute(Self::stmt(
+                    RESTORE_SOURCE_STATUS_SQL,
+                    [source_id.into(), reason.into()],
+                ))
+                .await?;
+                failed += 1;
+            }
             txn.commit().await?;
-            failed += 1;
         }
         Ok(failed)
     }

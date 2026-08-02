@@ -34,11 +34,13 @@ use crate::services::chat::orchestration::{
     validate_and_authorize,
 };
 use crate::services::memory::{MIN_DROPPED_FOR_SUMMARY, load_conversation_summaries};
-use crate::services::rag::eval::trace::ReasonCode;
-use crate::services::rag::search::render_evidence;
+use crate::services::rag::eval::trace::{ReasonCode, RetrievalTrace, TokenCounts};
+use crate::services::rag::search::{PipelineOutcome, render_evidence};
 
-use super::fallback::{FailureContext, FallbackContext};
-use super::streaming::StreamContext;
+use super::fallback::{FailureContext, FallbackContext, fallback_trace};
+use super::streaming::{
+    StreamContext, build_retrieval_trace, build_retrieval_trace_from_generation_ids,
+};
 use super::types::{MAX_HISTORY_FETCH, SendMessageRequest};
 
 /// What the client is told when the request cannot be measured.
@@ -169,8 +171,20 @@ pub(super) async fn prepare(
     // No evidence is three different incidents, and only one of them is an
     // error (US-020 AC-4).
     if let Some(failure) = retrieved.failure {
+        let reason = failure.reason_code();
+        rag_outcome.reasons.insert(reason);
+        let trace = build_retrieval_trace(
+            notebook_id,
+            &req.message,
+            reformulated_query.as_deref(),
+            &retrieved.chunks,
+            &rag_outcome,
+            TokenCounts::default(),
+            0,
+            0,
+        );
         return Ok(match failure {
-            RetrievalFailure::Infrastructure => failed(
+            RetrievalFailure::Infrastructure => failed_with_trace(
                 state,
                 principal,
                 &req,
@@ -178,22 +192,23 @@ pub(super) async fn prepare(
                 ReasonCode::ProviderError,
                 "retrieval_unavailable",
                 RETRIEVAL_UNAVAILABLE_MESSAGE,
+                trace,
             ),
-            RetrievalFailure::NoSources => answer(
+            RetrievalFailure::NoSources => answer_with_trace(
                 state,
                 principal,
                 &req,
                 notebook_id,
                 no_sources_text(&locale),
-                failure.reason_code(),
+                trace,
             ),
-            RetrievalFailure::NoEvidence => answer(
+            RetrievalFailure::NoEvidence => answer_with_trace(
                 state,
                 principal,
                 &req,
                 notebook_id,
                 insufficient_evidence_text(&locale),
-                failure.reason_code(),
+                trace,
             ),
         });
     }
@@ -223,25 +238,55 @@ pub(super) async fn prepare(
     };
     let fitted = match fit_prompt(&inputs, retrieved.chunks) {
         Ok(fitted) => fitted,
-        Err(BudgetRefusal { needed, allowance }) => {
-            tracing::error!(
-                %notebook_id,
-                provider = req.provider.name(),
-                model = %req.model_id,
-                window = budget.window(),
-                needed,
-                allowance,
-                "Instructions and question alone exceed the window"
-            );
-            return Ok(failed(
-                state,
-                principal,
-                &req,
+        Err(refusal) => {
+            let trace = build_budget_refusal_trace(
                 notebook_id,
-                ReasonCode::PromptOverBudget,
-                "prompt_over_budget",
-                UNMEASURABLE_REQUEST_MESSAGE,
-            ));
+                &req.message,
+                reformulated_query.as_deref(),
+                &rag_outcome,
+                &refusal,
+            );
+            return Ok(match refusal {
+                BudgetRefusal::MandatoryComponents {
+                    needed, allowance, ..
+                } => {
+                    tracing::error!(
+                        %notebook_id,
+                        provider = req.provider.name(),
+                        model = %req.model_id,
+                        window = budget.window(),
+                        needed,
+                        allowance,
+                        "Instructions and question alone exceed the window"
+                    );
+                    failed_with_trace(
+                        state,
+                        principal,
+                        &req,
+                        notebook_id,
+                        ReasonCode::PromptOverBudget,
+                        "prompt_over_budget",
+                        UNMEASURABLE_REQUEST_MESSAGE,
+                        trace,
+                    )
+                }
+                BudgetRefusal::NoEvidenceFits { .. } => {
+                    tracing::info!(
+                        %notebook_id,
+                        provider = req.provider.name(),
+                        model = %req.model_id,
+                        "No retrieved passage fits the provider context window"
+                    );
+                    answer_with_trace(
+                        state,
+                        principal,
+                        &req,
+                        notebook_id,
+                        insufficient_evidence_text(&locale),
+                        trace,
+                    )
+                }
+            });
         }
     };
     rag_outcome.reasons.extend(&fitted.reasons);
@@ -289,8 +334,19 @@ pub(super) async fn prepare(
 
     let messages = build_messages(&fitted.history.messages, &req.message);
 
+    // Native documents are outside the system prompt, but still inside the
+    // provider request. The fitting pass measured their complete rendered
+    // blocks, so the final assertion must add that amount back explicitly.
+    let native_document_tokens = match format {
+        EvidenceFormat::Inline => 0,
+        EvidenceFormat::NativeDocuments => fitted.tokens.selected,
+    };
     // The assertion US-018 AC-4 asks for, on the request as it will be sent.
-    if !budget.admits(&system_prompt, &messages) {
+    if !budget.admits_with_additional_prompt_tokens(
+        &system_prompt,
+        &messages,
+        native_document_tokens,
+    ) {
         tracing::error!(
             %notebook_id,
             provider = req.provider.name(),
@@ -298,7 +354,18 @@ pub(super) async fn prepare(
             window = budget.window(),
             "Assembled request exceeds the declared context window"
         );
-        return Ok(failed(
+        rag_outcome.reasons.insert(ReasonCode::PromptOverBudget);
+        let trace = build_retrieval_trace(
+            notebook_id,
+            &req.message,
+            reformulated_query.as_deref(),
+            &context_chunks,
+            &rag_outcome,
+            fitted.tokens,
+            0,
+            0,
+        );
+        return Ok(failed_with_trace(
             state,
             principal,
             &req,
@@ -306,6 +373,7 @@ pub(super) async fn prepare(
             ReasonCode::PromptOverBudget,
             "prompt_over_budget",
             UNMEASURABLE_REQUEST_MESSAGE,
+            trace,
         ));
     }
 
@@ -343,14 +411,58 @@ pub(super) async fn prepare(
     })))
 }
 
-/// A turn answered with a documented constant.
-fn answer(
+/// Preserve every retrieval field when budgeting terminates a turn.
+fn build_budget_refusal_trace(
+    notebook_id: Uuid,
+    query: &str,
+    reformulated_query: Option<&str>,
+    outcome: &PipelineOutcome,
+    refusal: &BudgetRefusal,
+) -> RetrievalTrace {
+    let (generation_ids, tokens, record_no_candidates, reason) = match refusal {
+        BudgetRefusal::MandatoryComponents {
+            tokens,
+            generation_ids,
+            ..
+        } => (
+            generation_ids.clone(),
+            *tokens,
+            generation_ids.is_empty(),
+            ReasonCode::PromptOverBudget,
+        ),
+        BudgetRefusal::NoEvidenceFits {
+            tokens,
+            generation_ids,
+        } => (
+            generation_ids.clone(),
+            *tokens,
+            true,
+            ReasonCode::EvidenceDroppedForBudget,
+        ),
+    };
+    let mut outcome = outcome.clone();
+    outcome.reasons.insert(reason);
+    build_retrieval_trace_from_generation_ids(
+        notebook_id,
+        query,
+        reformulated_query,
+        generation_ids,
+        record_no_candidates,
+        &outcome,
+        tokens,
+        0,
+        0,
+    )
+}
+
+/// A constant answer that retains the complete retrieval record.
+fn answer_with_trace(
     state: &CoreState,
     principal: &Principal,
     req: &ValidatedRequest,
     notebook_id: Uuid,
     text: &'static str,
-    reason: ReasonCode,
+    trace: RetrievalTrace,
 ) -> TurnOutcome {
     TurnOutcome::Answer(FallbackContext {
         chat_repo: state.repos.chat.clone(),
@@ -361,8 +473,7 @@ fn answer(
         provider: req.provider.name().to_owned(),
         model: req.model_id.clone(),
         answer: text,
-        query: req.message.clone(),
-        reason,
+        trace,
     })
 }
 
@@ -376,14 +487,119 @@ fn failed(
     error_type: &'static str,
     message: &'static str,
 ) -> TurnOutcome {
+    let trace = fallback_trace(notebook_id, &req.message, reason);
+    failed_with_trace(
+        state,
+        principal,
+        req,
+        notebook_id,
+        reason,
+        error_type,
+        message,
+        trace,
+    )
+}
+
+/// A turn that ends without an answer after retrieval produced a full trace.
+#[allow(clippy::too_many_arguments)] // one terminal turn context
+fn failed_with_trace(
+    state: &CoreState,
+    principal: &Principal,
+    req: &ValidatedRequest,
+    notebook_id: Uuid,
+    reason: ReasonCode,
+    error_type: &'static str,
+    message: &'static str,
+    trace: RetrievalTrace,
+) -> TurnOutcome {
     TurnOutcome::Failed(FailureContext {
         events: state.events.clone(),
         account_id: principal.account_id,
         notebook_id,
         provider: req.provider.name().to_owned(),
-        query: req.message.clone(),
         reason,
+        trace,
         error_type,
         message,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::services::rag::eval::trace::StageCounts;
+    use crate::services::rag::search::RetrievalConfidence;
+    use crate::types::{RetrievalScore, ScoreDomain, SearchResult};
+
+    #[test]
+    fn budget_refusal_mapping_preserves_the_complete_retrieval_trace() {
+        let notebook_id = Uuid::new_v4();
+        let generation_id = Uuid::new_v4();
+        let query = "oversized evidence";
+        let inputs = PromptInputs {
+            budget: PromptBudget::new(16_000, 1_000),
+            format: EvidenceFormat::Inline,
+            instructions: "policy",
+            memory: None,
+            query,
+            history: &[],
+        };
+        let refusal = fit_prompt(
+            &inputs,
+            vec![SearchResult {
+                chunk_id: Uuid::new_v4(),
+                generation_id,
+                source_id: Uuid::new_v4(),
+                source_title: "Synthetic runbook".to_owned(),
+                chunk_index: 0,
+                content: "child ".repeat(40_000),
+                parent_content: Some("parent ".repeat(40_000)),
+                score: RetrievalScore::Rrf(0.5),
+                metadata: None,
+                collapsed_children: Vec::new(),
+            }],
+        )
+        .expect_err("neither the parent nor child should fit");
+        let pipeline = PipelineOutcome {
+            embed_ms: 11,
+            search_ms: 22,
+            rerank_ms: 33,
+            counts: StageCounts {
+                dense: 20,
+                lexical: 18,
+                fused: 30,
+                reranker_input: 15,
+                reranker_output: 10,
+                deduplicated: 8,
+                selected: 1,
+            },
+            unique_parents: 1,
+            reasons: [ReasonCode::DedupShortfall].into_iter().collect(),
+            score_domain: Some(ScoreDomain::RrfRank),
+            confidence: RetrievalConfidence::Sufficient,
+            ..PipelineOutcome::default()
+        };
+
+        let trace = build_budget_refusal_trace(
+            notebook_id,
+            query,
+            Some("oversized source evidence"),
+            &pipeline,
+            &refusal,
+        );
+
+        assert_eq!(trace.generation_ids, vec![generation_id]);
+        assert!(trace.reformulated_query_hash.is_some());
+        assert_eq!(trace.score_domain, pipeline.score_domain);
+        assert_eq!(trace.candidates, pipeline.counts);
+        assert_eq!(trace.unique_parents, pipeline.unique_parents);
+        assert_eq!(trace.durations.embed_ms, 11);
+        assert_eq!(trace.durations.search_ms, 22);
+        assert_eq!(trace.durations.rerank_ms, 33);
+        assert_eq!(trace.tokens.selected, 0);
+        assert!(trace.tokens.dropped > 0);
+        assert!(trace.reasons.contains(ReasonCode::DedupShortfall));
+        assert!(trace.reasons.contains(ReasonCode::NoCandidates));
+        assert!(trace.reasons.contains(ReasonCode::EvidenceDroppedForBudget));
+    }
 }

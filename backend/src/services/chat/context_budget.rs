@@ -36,7 +36,9 @@
 //! smaller, lower-ranked one would silently reorder the evidence by size.
 
 use crate::llm::LlmMessage;
-use crate::llm::budget::{FittedHistory, PromptBudget, estimate_tokens, fit_history};
+use crate::llm::budget::{
+    FittedHistory, PromptBudget, estimate_tokens, fit_history, message_tokens,
+};
 use crate::llm::prompts::EvidenceFormat;
 use crate::services::rag::eval::trace::{ReasonCode, ReasonSet, TokenCounts};
 use crate::services::rag::search::{entry_tokens, evidence_body, region_overhead_tokens};
@@ -74,12 +76,20 @@ pub struct BudgetedPrompt {
 }
 
 /// Why no request could be assembled.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BudgetRefusal {
-    /// Tokens the mandatory components need.
-    pub needed: usize,
-    /// Tokens the window allows the prompt.
-    pub allowance: usize,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BudgetRefusal {
+    /// Instructions and the current query cannot fit even without evidence.
+    MandatoryComponents {
+        needed: usize,
+        allowance: usize,
+        tokens: TokenCounts,
+        generation_ids: Vec<uuid::Uuid>,
+    },
+    /// Retrieval succeeded, but neither a parent nor its matched child fit.
+    NoEvidenceFits {
+        tokens: TokenCounts,
+        generation_ids: Vec<uuid::Uuid>,
+    },
 }
 
 /// How the window is divided, before any evidence is looked at.
@@ -108,12 +118,14 @@ fn allocate(
     memory: Option<&str>,
     query: &str,
 ) -> Result<Allocation, BudgetRefusal> {
-    let mandatory = estimate_tokens(instructions) + estimate_tokens(query);
+    let mandatory = estimate_tokens(instructions) + message_tokens(query);
     let allowance = budget.prompt_allowance();
     if mandatory > allowance {
-        return Err(BudgetRefusal {
+        return Err(BudgetRefusal::MandatoryComponents {
             needed: mandatory,
             allowance,
+            tokens: TokenCounts::default(),
+            generation_ids: Vec::new(),
         });
     }
     let mut remaining = allowance - mandatory;
@@ -162,19 +174,62 @@ pub fn fit_prompt(
     inputs: &PromptInputs<'_>,
     evidence: Vec<SearchResult>,
 ) -> Result<BudgetedPrompt, BudgetRefusal> {
+    let had_evidence = !evidence.is_empty();
+    let mut generation_ids: Vec<uuid::Uuid> = evidence
+        .iter()
+        .map(|context| context.generation_id)
+        .collect();
+    generation_ids.sort_unstable();
+    generation_ids.dedup();
     let mut reasons = ReasonSet::default();
 
+    let allocation = allocate(
+        &inputs.budget,
+        inputs.instructions,
+        inputs.memory,
+        inputs.query,
+    );
     let Allocation {
         memory_kept,
         memory_tokens,
         mut remaining,
         evidence_budget,
-    } = allocate(
-        &inputs.budget,
-        inputs.instructions,
-        inputs.memory,
-        inputs.query,
-    )?;
+    } = match allocation {
+        Ok(allocation) => allocation,
+        Err(BudgetRefusal::MandatoryComponents {
+            needed, allowance, ..
+        }) => {
+            let dropped = if evidence.is_empty() {
+                0
+            } else {
+                region_overhead_tokens(inputs.format)
+                    + evidence
+                        .iter()
+                        .enumerate()
+                        .map(|(position, context)| {
+                            entry_tokens(
+                                inputs.format,
+                                position + 1,
+                                context,
+                                evidence_body(context),
+                            )
+                        })
+                        .sum::<usize>()
+            };
+            return Err(BudgetRefusal::MandatoryComponents {
+                needed,
+                allowance,
+                tokens: TokenCounts {
+                    selected: 0,
+                    dropped,
+                },
+                generation_ids,
+            });
+        }
+        Err(BudgetRefusal::NoEvidenceFits { .. }) => {
+            unreachable!("allocate cannot inspect evidence")
+        }
+    };
     if !memory_kept && memory_tokens > 0 {
         reasons.insert(ReasonCode::MemoryDroppedForBudget);
     }
@@ -230,7 +285,17 @@ pub fn fit_prompt(
         reasons.insert(ReasonCode::EvidenceDroppedForBudget);
     }
     if selected.is_empty() {
+        dropped_tokens += spent;
         spent = 0;
+        if had_evidence {
+            return Err(BudgetRefusal::NoEvidenceFits {
+                tokens: TokenCounts {
+                    selected: 0,
+                    dropped: dropped_tokens,
+                },
+                generation_ids,
+            });
+        }
     }
     remaining = remaining.saturating_sub(spent);
 
@@ -349,10 +414,18 @@ mod tests {
     #[test]
     fn a_context_whose_child_does_not_fit_either_is_dropped_with_the_rest() {
         let evidence = vec![context(0, 200_000, 200_000), context(1, 40, 40)];
-        let fitted = fit_prompt(&inputs(PromptBudget::new(16_000, 1_000)), evidence).expect("fits");
-        assert!(fitted.evidence.is_empty());
-        assert_eq!(fitted.tokens.selected, 0);
-        assert!(fitted.tokens.dropped > 0);
+        let refusal = fit_prompt(&inputs(PromptBudget::new(16_000, 1_000)), evidence)
+            .expect_err("generation without evidence must be refused");
+        let BudgetRefusal::NoEvidenceFits {
+            tokens,
+            generation_ids,
+        } = refusal
+        else {
+            panic!("expected evidence refusal")
+        };
+        assert_eq!(tokens.selected, 0);
+        assert!(tokens.dropped > 0);
+        assert_eq!(generation_ids.len(), 1);
     }
 
     #[test]
@@ -413,7 +486,13 @@ mod tests {
             ..inputs(budget)
         };
         let refusal = fit_prompt(&params, Vec::new()).expect_err("must refuse");
-        assert!(refusal.needed > refusal.allowance);
+        let BudgetRefusal::MandatoryComponents {
+            needed, allowance, ..
+        } = refusal
+        else {
+            panic!("expected mandatory-component refusal")
+        };
+        assert!(needed > allowance);
     }
 
     /// A pool whose parents are all too large is not dropped: each context
@@ -430,14 +509,11 @@ mod tests {
             "every context kept a form that fit"
         );
         assert!(
-            fitted.evidence[0].parent_content.is_some(),
-            "the top-ranked context still fit at full resolution"
-        );
-        assert!(
-            fitted.evidence[1..]
+            fitted
+                .evidence
                 .iter()
-                .all(|c| c.parent_content.is_none()),
-            "the rest were sent as their children"
+                .all(|context| context.parent_content.is_none()),
+            "every oversized parent was sent as its child"
         );
         assert!(fitted.reasons.contains(ReasonCode::ParentDowngradedToChild));
         assert_eq!(fitted.tokens.dropped, 0);

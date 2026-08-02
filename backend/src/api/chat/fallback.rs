@@ -39,9 +39,9 @@ pub(super) struct FallbackContext {
     pub model: String,
     /// The sentence to return. Never model output.
     pub answer: &'static str,
-    /// The user's question, hashed into the trace and never logged.
-    pub query: String,
-    pub reason: ReasonCode,
+    /// The complete retrieval record assembled while all pipeline state is
+    /// still available. It contains hashes and counts, never source content.
+    pub trace: RetrievalTrace,
 }
 
 /// A turn that produced no answer at all.
@@ -50,9 +50,10 @@ pub(super) struct FailureContext {
     pub account_id: Uuid,
     pub notebook_id: Uuid,
     pub provider: String,
-    /// The user's question, hashed into the trace and never logged.
-    pub query: String,
     pub reason: ReasonCode,
+    /// The complete retrieval record assembled while all pipeline state is
+    /// still available. It contains hashes and counts, never source content.
+    pub trace: RetrievalTrace,
     /// Domain-event classification, for operators reading failure counters.
     pub error_type: &'static str,
     /// What the client is told. Never carries source text or configuration.
@@ -66,7 +67,7 @@ pub(super) struct FailureContext {
 /// just because no model was involved (US-020 AC-4). The permit is deliberately
 /// not recorded: nothing was generated, so nothing is charged.
 pub(super) async fn stream_grounded_fallback(ctx: FallbackContext, out: &ChatEventStream) {
-    emit_retrieval_trace(ctx.notebook_id, &ctx.query, ctx.reason);
+    ctx.trace.emit();
 
     out.emit(ChatEvent::chunk(ctx.answer)).await;
     out.finish_generation();
@@ -116,7 +117,7 @@ pub(super) async fn stream_turn_failure(ctx: FailureContext, out: &ChatEventStre
         "Turn terminated without generating an answer"
     );
 
-    emit_retrieval_trace(ctx.notebook_id, &ctx.query, ctx.reason);
+    ctx.trace.emit();
     ctx.events.emit(DomainEvent::ChatFailed {
         account_id: ctx.account_id,
         notebook_id: ctx.notebook_id,
@@ -126,17 +127,12 @@ pub(super) async fn stream_turn_failure(ctx: FailureContext, out: &ChatEventStre
     out.emit(ChatEvent::error(ctx.message)).await;
 }
 
-/// Emit a trace for a turn that produced no evidence.
-///
-/// The reason code is the whole point: "the notebook is empty", "nothing
-/// relevant came back", "retrieval never ran" and "the request could not be
-/// measured" produce the same absence of chunks and are four different
-/// incidents (US-018 AC-5, US-020 AC-4).
-fn emit_retrieval_trace(notebook_id: Uuid, query: &str, reason: ReasonCode) {
+/// Build the necessarily partial trace for a turn that ended before retrieval.
+pub(super) fn fallback_trace(notebook_id: Uuid, query: &str, reason: ReasonCode) -> RetrievalTrace {
     let mut trace = RetrievalTrace::new(notebook_id, query, "chat", None);
     trace.reasons.insert(reason);
     trace.finish();
-    trace.emit();
+    trace
 }
 
 #[cfg(test)]
@@ -275,19 +271,23 @@ mod tests {
         let repo = Arc::new(RecordingChatRepo::default());
         let (out, mut rx) = ChatEventStream::channel();
         let answer = crate::llm::fallbacks::no_sources_text("fr");
+        let notebook_id = Uuid::new_v4();
 
         stream_grounded_fallback(
             FallbackContext {
                 chat_repo: Arc::clone(&repo) as Arc<dyn ChatRepository>,
                 events: Arc::new(NoopEventSink),
                 account_id: Uuid::new_v4(),
-                notebook_id: Uuid::new_v4(),
+                notebook_id,
                 session_id: Uuid::new_v4(),
                 provider: "anthropic".to_owned(),
                 model: "claude-sonnet-4-6-20260220".to_owned(),
                 answer,
-                query: "what is the retention window".to_owned(),
-                reason: ReasonCode::EmptyCorpus,
+                trace: fallback_trace(
+                    notebook_id,
+                    "what is the retention window",
+                    ReasonCode::EmptyCorpus,
+                ),
             },
             &out,
         )
@@ -315,15 +315,20 @@ mod tests {
     #[tokio::test]
     async fn an_unmeasurable_turn_terminates_with_error_and_no_answer() {
         let (out, mut rx) = ChatEventStream::channel();
+        let notebook_id = Uuid::new_v4();
 
         stream_turn_failure(
             FailureContext {
                 events: Arc::new(NoopEventSink),
                 account_id: Uuid::new_v4(),
-                notebook_id: Uuid::new_v4(),
+                notebook_id,
                 provider: "anthropic".to_owned(),
-                query: "what is the retention window".to_owned(),
                 reason: ReasonCode::ContextWindowUnknown,
+                trace: fallback_trace(
+                    notebook_id,
+                    "what is the retention window",
+                    ReasonCode::ContextWindowUnknown,
+                ),
                 error_type: "context_window_unknown",
                 message: super::super::turn::UNMEASURABLE_REQUEST_MESSAGE,
             },

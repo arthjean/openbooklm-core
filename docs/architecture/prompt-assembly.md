@@ -40,13 +40,15 @@ code is `stuffing_over_budget`.
 
 **Evidence is priced by the renderer that sends it.** `write_entry` renders one
 `<source>` element into a `fmt::Write` sink. `format_context_for_llm` gives it a
-`String`; `entry_tokens` gives it a `TokenMeter`, which counts bytes and CJK
-characters without building anything. So the budget measures the exact bytes the
-renderer would emit, rather than estimating the passage and adding a constant
-for the markup, and it does so without allocating the string it is about to
-discard. Provider-native document blocks go through the same `entry_tokens` with
-the other `EvidenceFormat`: they are not prompt text, but they occupy the same
-window.
+`String`; `entry_tokens` gives it a `TokenMeter`, which counts UTF-8 bytes
+without building anything. The meter uses one token per byte:
+a deliberately conservative upper bound shared by every supported provider,
+plus fixed request and per-message framing allowances. So the budget prices the
+exact bytes the renderer would emit instead of estimating the passage and
+adding a markup constant, and it does so without allocating the string it is
+about to discard. Provider-native document blocks go through the same
+`entry_tokens` with the other `EvidenceFormat`: they are not prompt text, but
+they occupy the same window.
 
 ### A parent that does not fit degrades to its child
 
@@ -59,6 +61,9 @@ dropped to save tokens is a citation the reader cannot open. Reason code:
 
 Admission stops at the first context that fits in neither form, so what survives
 is always a prefix of the ranking. Reason code: `evidence_dropped_for_budget`.
+If no parent or child fits, generation is skipped and the insufficient-evidence
+fallback keeps `selected = 0` and the complete dropped-token count in its
+retrieval trace.
 
 ### An undeclared window is a refusal
 
@@ -67,9 +72,11 @@ gets no budget and no request: the previous 128 000-token fallback was a guess,
 and a model with a smaller window rejects the request only after the prompt has
 been assembled and paid for. Reason code: `context_window_unknown`.
 
-The assembled request is checked once more before it is sent
-(`PromptBudget::admits`). That check is not a `debug_assert`: a release build
-must refuse an oversized request, not send it.
+The assembled request is checked once more before it is sent. Inline evidence
+is already inside the system prompt; provider-native document tokens are added
+explicitly to the same final assertion
+(`PromptBudget::admits_with_additional_prompt_tokens`). That check is not a
+`debug_assert`: a release build must refuse an oversized request, not send it.
 
 ## The untrusted data boundary
 
@@ -221,6 +228,7 @@ point where the outcome is still whole.
 |---|---|---|
 | The notebook has no source | `empty_corpus` | Answers `no_sources_text(locale)` |
 | Sources exist, nothing relevant came back | `no_candidates` | Answers `insufficient_evidence_text(locale)` |
+| Retrieved passages exist but none fits the window | `no_candidates` | Answers `insufficient_evidence_text(locale)` |
 | Retrieval did not run | `provider_error` | Terminates through the existing SSE `error` event |
 | The request cannot be measured | `context_window_unknown`, `prompt_over_budget` | Terminates through the existing SSE `error` event |
 

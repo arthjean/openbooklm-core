@@ -471,11 +471,37 @@ pub(super) async fn stream_llm_response(
 /// property that matters — that nothing here can carry source text or the user's
 /// question — is worth an assertion, and an assertion needs a seam.
 #[allow(clippy::too_many_arguments)] // one record, assembled from one turn
-fn build_retrieval_trace(
+pub(super) fn build_retrieval_trace(
     notebook_id: Uuid,
     query: &str,
     reformulated: Option<&str>,
     context_chunks: &[SearchResult],
+    outcome: &PipelineOutcome,
+    evidence_tokens: TokenCounts,
+    rejected_citations: usize,
+    llm_ttft_ms: u128,
+) -> RetrievalTrace {
+    let generation_ids: Vec<Uuid> = context_chunks.iter().map(|c| c.generation_id).collect();
+    build_retrieval_trace_from_generation_ids(
+        notebook_id,
+        query,
+        reformulated,
+        generation_ids,
+        context_chunks.is_empty(),
+        outcome,
+        evidence_tokens,
+        rejected_citations,
+        llm_ttft_ms,
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // one record, assembled from one turn
+pub(super) fn build_retrieval_trace_from_generation_ids(
+    notebook_id: Uuid,
+    query: &str,
+    reformulated: Option<&str>,
+    mut generation_ids: Vec<Uuid>,
+    record_no_candidates: bool,
     outcome: &PipelineOutcome,
     evidence_tokens: TokenCounts,
     rejected_citations: usize,
@@ -494,7 +520,6 @@ fn build_retrieval_trace(
     // active pointer, so this is a set of active generations by construction —
     // and an operator diagnosing a bad answer can tell which index produced it
     // (US-004, filled by EP-002).
-    let mut generation_ids: Vec<Uuid> = context_chunks.iter().map(|c| c.generation_id).collect();
     generation_ids.sort_unstable();
     generation_ids.dedup();
     trace.generation_ids = generation_ids;
@@ -524,7 +549,7 @@ fn build_retrieval_trace(
     };
 
     trace.reasons.extend(&outcome.reasons);
-    if context_chunks.is_empty() {
+    if record_no_candidates {
         trace.reasons.insert(ReasonCode::NoCandidates);
     }
     if rejected_citations > 0 {

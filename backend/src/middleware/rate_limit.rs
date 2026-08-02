@@ -3,7 +3,7 @@
 //! Supports two backends:
 //! - **Distributed (Upstash Redis)**: Atomic INCR + EXPIRE via REST API for multi-instance deployments.
 //!   Key format: `ratelimit:{client_id}:{minute_timestamp}` with 60s TTL for natural expiry.
-//! - **In-memory (fallback)**: Token bucket with optimized read/write locking and background cleanup.
+//! - **In-memory (primary or fallback)**: Token bucket with optimized locking and background cleanup.
 //!
 //! Falls back to in-memory if Redis is unreachable (logs warning, never blocks requests).
 
@@ -154,7 +154,7 @@ impl RateLimiter {
     /// Create a new rate limiter.
     ///
     /// If `redis_url` and `redis_token` are provided, uses Upstash Redis as the primary backend
-    /// with in-memory fallback. Otherwise, uses in-memory only with a background cleanup task.
+    /// with in-memory fallback. The fallback is always cleaned because Redis can fail after startup.
     pub fn new(
         requests_per_minute: u32,
         task_tracker: TaskTracker,
@@ -186,18 +186,15 @@ impl RateLimiter {
             requests_per_minute,
         };
 
-        // Only spawn cleanup task when Redis is not active (Redis TTL handles expiry)
-        if limiter.redis.is_none() {
-            let state = Arc::clone(&limiter.in_memory);
-            let cancel_token = task_tracker.cancellation_token();
-            if task_tracker
-                .try_spawn("rate-limit-cleanup", async move {
-                    Self::cleanup_loop(state, cancel_token).await;
-                })
-                .is_err()
-            {
-                tracing::warn!("Rate limiter cleanup not started because shutdown is active");
-            }
+        let state = Arc::clone(&limiter.in_memory);
+        let cancel_token = task_tracker.cancellation_token();
+        if task_tracker
+            .try_spawn("rate-limit-cleanup", async move {
+                Self::cleanup_loop(state, cancel_token).await;
+            })
+            .is_err()
+        {
+            tracing::warn!("Rate limiter cleanup not started because shutdown is active");
         }
 
         limiter
@@ -456,6 +453,34 @@ mod tests {
         assert!(limiter.check("client-b").await.is_ok());
         assert!(limiter.check("client-b").await.is_ok());
         assert!(limiter.check("client-b").await.is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn redis_configuration_cleans_the_fallback_map() {
+        let task_tracker = TaskTracker::new();
+        let limiter = RateLimiter::new(
+            10,
+            task_tracker.clone(),
+            Some("http://127.0.0.1:1"),
+            Some("fake-token"),
+        );
+
+        limiter.in_memory.write().await.buckets.insert(
+            "fallback-client".into(),
+            TokenBucket {
+                tokens: 0,
+                last_refill: Instant::now()
+                    .checked_sub(BUCKET_EXPIRY)
+                    .expect("bucket expiry fits in Instant"),
+            },
+        );
+        tokio::task::yield_now().await;
+        tokio::time::advance(CLEANUP_INTERVAL).await;
+        tokio::task::yield_now().await;
+
+        assert!(limiter.in_memory.read().await.buckets.is_empty());
+        task_tracker.begin_shutdown();
+        task_tracker.wait().await;
     }
 
     #[tokio::test]

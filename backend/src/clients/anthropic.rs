@@ -779,13 +779,13 @@ mod tests {
     use crate::clients::metrics::ClientMetrics;
     use crate::llm::Role;
 
-    /// Verifies the resilience executor returns an error instead of panicking
-    /// when all retry attempts are exhausted (connection refused to real API).
+    /// Invalid credentials fail before any HTTP request. Retry exhaustion is
+    /// covered by `clients::resilience`; this provider test must stay offline.
     #[tokio::test]
-    async fn retry_returns_error_on_exhaustion() {
+    async fn invalid_credentials_fail_before_network() {
         let metrics = ClientMetrics::new();
         let client = AnthropicClient::new(
-            "test-key",
+            "invalid\nheader",
             Duration::from_secs(1),
             metrics.provider("anthropic"),
         )
@@ -802,11 +802,10 @@ mod tests {
             content: "test".to_string(),
         }];
 
-        // stream_chat should return an Err (connection refused), not panic
         let result = client.stream_chat("test", messages, None, &[], None).await;
         assert!(
             result.is_err(),
-            "Retry loop must return an error, not panic"
+            "an invalid authorization header must be rejected locally"
         );
     }
 

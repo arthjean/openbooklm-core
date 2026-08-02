@@ -30,6 +30,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -746,13 +747,21 @@ const FORBIDDEN_VALUE_PATTERNS: &[(&str, &str)] = &[
     ),
 ];
 
+static FORBIDDEN_VALUE_REGEXES: LazyLock<Vec<(&'static str, Result<regex::Regex, regex::Error>)>> =
+    LazyLock::new(|| {
+        FORBIDDEN_VALUE_PATTERNS
+            .iter()
+            .map(|(label, pattern)| (*label, regex::Regex::new(pattern)))
+            .collect()
+    });
+
 fn forbidden_value_matches(text: &str) -> Option<&'static str> {
-    for (label, pattern) in FORBIDDEN_VALUE_PATTERNS {
+    for (label, compiled) in FORBIDDEN_VALUE_REGEXES.iter() {
         // The pattern set is a compile-time constant; a build that cannot
         // compile it is broken, and reporting "no match" would silently drop a
         // secret check. `ok()?` would do exactly that, so an unbuildable
         // pattern is treated as a violation instead.
-        let Ok(regex) = regex::Regex::new(pattern) else {
+        let Ok(regex) = compiled else {
             return Some("unbuildable secret pattern");
         };
         if regex.is_match(text) {

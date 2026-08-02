@@ -24,6 +24,8 @@
 
 use std::path::{Path, PathBuf};
 
+use tokio::sync::OnceCell;
+
 use openbooklm::services::rag::eval::baseline::{
     Baseline, Enforcement, Targets, compare, missing_metrics, unmet,
 };
@@ -43,6 +45,9 @@ const FIXED_TIME: &str = "unspecified";
 /// Fixed so that a baseline diff reflects a behavior change and not a version
 /// bump. The real revision belongs to whoever runs the gate in CI.
 const FIXED_REVISION: &str = "corpus-v1-deterministic";
+
+static TRAIN_BASELINE: OnceCell<Baseline> = OnceCell::const_new();
+static HOLDOUT_BASELINE: OnceCell<Baseline> = OnceCell::const_new();
 
 fn baseline_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -71,6 +76,14 @@ fn config(split: Split) -> RetrievalRunConfig {
 
 /// Produce the baseline for one split, through the same path the binary uses.
 async fn capture(split: Split) -> Baseline {
+    let cell = match split {
+        Split::Train => &TRAIN_BASELINE,
+        Split::Holdout => &HOLDOUT_BASELINE,
+    };
+    cell.get_or_init(|| capture_uncached(split)).await.clone()
+}
+
+async fn capture_uncached(split: Split) -> Baseline {
     let corpus = corpus();
     let index = CorpusIndex::build(&corpus).await.expect("index builds");
     let retrieval = config(split);
@@ -254,14 +267,14 @@ fn a_malformed_case_fails_loudly_and_names_the_query() {
 #[tokio::test]
 async fn every_retrieval_mode_produces_a_byte_identical_report_twice() {
     let corpus = corpus();
+    // Two independently built indexes: determinism has to survive a rebuild,
+    // not only a second call over the same vectors. They can be reused across
+    // modes because the index is immutable.
+    let first_index = CorpusIndex::build(&corpus).await.expect("index");
+    let second_index = CorpusIndex::build(&corpus).await.expect("index");
     for mode in RetrievalMode::ALL {
         let mut config = config(Split::Train);
         config.mode = *mode;
-
-        // Two independently built indexes: determinism has to survive a
-        // rebuild, not only a second call over the same vectors.
-        let first_index = CorpusIndex::build(&corpus).await.expect("index");
-        let second_index = CorpusIndex::build(&corpus).await.expect("index");
 
         let first = run_retrieval_eval(&corpus, &first_index, &config, FIXED_TIME)
             .await

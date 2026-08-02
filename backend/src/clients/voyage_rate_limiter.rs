@@ -8,9 +8,10 @@
 //! The limiter blocks (`acquire`) until budget is available or times out.
 
 use std::collections::VecDeque;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tokio::sync::{Mutex, Notify};
+use tokio::time::Instant;
 
 use crate::core::config::VoyageRateLimitConfig;
 use crate::error::{AppError, RagError};
@@ -60,7 +61,7 @@ impl VoyageRateLimiter {
         loop {
             let now = Instant::now();
             let elapsed = now.duration_since(start);
-            if elapsed > max_wait {
+            if elapsed >= max_wait {
                 return Err(AppError::from(RagError::EmbeddingRateLimited {
                     reason: format!(
                         "Rate limit wait exceeded {}s (RPM={}, TPM={})",
@@ -294,14 +295,14 @@ mod tests {
         assert_eq!(stats.rpm_remaining, 299);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn acquire_blocks_at_rpm_limit() {
         let config = VoyageRateLimitConfig {
             max_rpm: 2,
             max_tpm: 2_000_000,
             batch_size: 128,
             concurrent_batches: 4,
-            max_wait_secs: 1, // Short timeout for test
+            max_wait_secs: 1,
         };
         let limiter = VoyageRateLimiter::new(config);
 
@@ -309,7 +310,8 @@ mod tests {
         limiter.acquire(10).await.unwrap();
         limiter.acquire(10).await.unwrap();
 
-        // Third should fail (max_wait_secs=1 will timeout before 60s window slides)
+        // Tokio's paused clock advances to the limiter deadline without making
+        // the default offline suite sleep for a wall-clock second.
         let result = limiter.acquire(10).await;
         assert!(result.is_err());
     }

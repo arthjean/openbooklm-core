@@ -87,10 +87,12 @@ curl -fsS localhost:3001/health
 curl -fsS -H "x-health-token: $HEALTH_TOKEN" localhost:3001/health/detailed | jq .
 ```
 
-`/health/detailed` reports per-dependency status, pool metrics and
-circuit-breaker state. Then ingest one source and ask one question: a healthy
-process with an unreachable embedding provider looks fine until you try to use
-it.
+`/health/detailed` reports per-dependency status, pool metrics,
+circuit-breaker state and the immediately started retention passes. Confirm
+that `rag-log-retention`, `ocr-cache-retention` and
+`index-generation-retention` each report at least one run. Then ingest one
+source and ask one question: a healthy process with an unreachable embedding
+provider looks fine until you try to use it.
 
 ## Rollback
 

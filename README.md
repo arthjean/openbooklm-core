@@ -194,6 +194,13 @@ back means restoring the backup described in [docs/upgrading.md](docs/upgrading.
 The server applies migrations itself on start, under a Postgres advisory lock,
 so a rolling deploy serialises rather than races.
 
+The reference server also owns one data-retention loop. It runs immediately,
+then every 24 hours: RAG interaction logs older than 90 days are deleted,
+unowned OCR cache rows left by a pre-migration writer are removed, abandoned
+index builds are failed, and expired obsolete generations are reclaimed.
+`/health/detailed` reports the last result and counters for all three retention
+domains.
+
 ## Development
 
 ```bash

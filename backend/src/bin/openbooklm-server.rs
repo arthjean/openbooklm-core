@@ -122,6 +122,13 @@ async fn run() -> anyhow::Result<()> {
     let server_owner = task_tracker.clone();
     let server = async move {
         require_provider_capabilities(&state)?;
+        openbooklm::services::maintenance::start_maintenance_task(
+            &state.task_tracker,
+            &state.purge_task_state,
+            state.repos.rag_logs.clone(),
+            state.repos.ocr_cache.clone(),
+            state.repos.generations.clone(),
+        );
 
         let identity = ReferenceIdentity::new(mode, account_id);
         let app = build_app(state, &config, identity);
@@ -295,6 +302,8 @@ fn build_core_state(
         SourceEventBroadcaster::with_cleanup_config(SseCleanupConfig::from_env());
     source_broadcaster.start_cleanup_task(&task_tracker);
 
+    let purge_task_state = PurgeTaskState::new();
+
     let events: openbooklm::core::SharedEventSink = if env_flag(EVENT_LOG_ENV) {
         Arc::new(openbooklm::core::TracingEventSink)
     } else {
@@ -308,7 +317,7 @@ fn build_core_state(
         repos,
         clients,
         source_broadcaster,
-        purge_task_state: PurgeTaskState::new(),
+        purge_task_state,
         // Self-hosting has no plans, no quotas and no metering.
         entitlements: Arc::new(UnrestrictedPolicy),
         events,

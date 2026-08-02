@@ -204,6 +204,7 @@ yarn-error.log*
 # Cache
 .cache/
 
-# Claude Code
+# Local agent state
+.codex/
 .claude/
 .mcp.json

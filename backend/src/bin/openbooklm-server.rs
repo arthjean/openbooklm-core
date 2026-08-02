@@ -36,6 +36,7 @@
 //! Multi-tenant hosting is the commercial edition's job, not a missing feature
 //! here.
 
+use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -75,11 +76,23 @@ const DEFAULT_BIND: &str = "127.0.0.1";
 /// discarding them.
 const EVENT_LOG_ENV: &str = "OPENBOOKLM_EVENT_LOG";
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
     init_tracing();
 
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let result = runtime.block_on(run());
+
+    // Application-owned async work has already drained or been aborted. Tokio
+    // cannot stop a spawn_blocking closure that exceeded that budget, so waiting
+    // again here would make the configured shutdown deadline untrue.
+    runtime.shutdown_timeout(Duration::ZERO);
+    result
+}
+
+async fn run() -> anyhow::Result<()> {
     // 1. Configuration. Every missing or malformed core value is reported at
     //    once; commercial variables are neither read nor required.
     let config = CoreConfig::load().map_err(|e| {
@@ -105,25 +118,90 @@ async fn main() -> anyhow::Result<()> {
     ensure_account(&db, account_id).await?;
 
     let (state, task_tracker) = build_core_state(&config, db);
-    require_provider_capabilities(&state)?;
-
-    let identity = ReferenceIdentity::new(mode, account_id);
-    let app = build_app(state, &config, identity);
-
-    let addr = SocketAddr::new(bind, config.server_port);
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!(%addr, "OpenbookLM core is ready.");
-
     let shutdown_timeout = Duration::from_secs(config.async_config.shutdown_timeout_secs);
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            shutdown_signal().await;
-            task_tracker.shutdown(shutdown_timeout).await;
-        })
-        .await?;
+    let server_owner = task_tracker.clone();
+    let server = async move {
+        require_provider_capabilities(&state)?;
 
-    tracing::info!("Server shut down successfully");
-    Ok(())
+        let identity = ReferenceIdentity::new(mode, account_id);
+        let app = build_app(state, &config, identity);
+
+        let addr = SocketAddr::new(bind, config.server_port);
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+        tracing::info!(%addr, "OpenbookLM core is ready.");
+
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                shutdown_signal().await;
+                server_owner.begin_shutdown();
+            })
+            .await?;
+        Ok::<(), anyhow::Error>(())
+    };
+
+    run_server_lifecycle(server, task_tracker, shutdown_timeout).await
+}
+
+async fn run_server_lifecycle<F>(
+    server: F,
+    task_tracker: TaskTracker,
+    shutdown_timeout: Duration,
+) -> anyhow::Result<()>
+where
+    F: Future<Output = anyhow::Result<()>>,
+{
+    let shutdown_observer = task_tracker.cancellation_token();
+    tokio::pin!(server);
+    let mut forced = false;
+    let server_result = tokio::select! {
+        biased;
+        () = shutdown_observer.cancelled() => {
+            let drain = async {
+                let (server_result, ()) = tokio::join!(server.as_mut(), task_tracker.wait());
+                server_result
+            };
+            match tokio::time::timeout(shutdown_timeout, drain).await {
+                Ok(server_result) => server_result,
+                Err(_) => {
+                    forced = true;
+                    let aborted = task_tracker.abort_remaining();
+                    tracing::warn!(
+                        aborted,
+                        remaining_tasks = task_tracker.task_count(),
+                        remaining_chat_streams = task_tracker.active_stream_count(),
+                        timeout_secs = shutdown_timeout.as_secs(),
+                        "Shutdown deadline reached; aborting remaining async work"
+                    );
+                    tokio::task::yield_now().await;
+                    Ok(())
+                }
+            }
+        }
+        server_result = server.as_mut() => {
+            // Startup failures and unexpected server exits use the same root
+            // cancellation, bounded drain and abort path as a process signal.
+            task_tracker.begin_shutdown();
+            if tokio::time::timeout(shutdown_timeout, task_tracker.wait()).await.is_err() {
+                forced = true;
+                let aborted = task_tracker.abort_remaining();
+                tracing::warn!(
+                    aborted,
+                    remaining_tasks = task_tracker.task_count(),
+                    timeout_secs = shutdown_timeout.as_secs(),
+                    "Shutdown deadline reached after server exit; aborting remaining async work"
+                );
+                tokio::task::yield_now().await;
+            }
+            server_result
+        }
+    };
+
+    if forced {
+        tracing::warn!("Server stopped after the graceful shutdown deadline");
+    } else {
+        tracing::info!("Server shut down successfully");
+    }
+    server_result
 }
 
 fn init_tracing() {
@@ -215,7 +293,7 @@ fn build_core_state(
 
     let source_broadcaster =
         SourceEventBroadcaster::with_cleanup_config(SseCleanupConfig::from_env());
-    source_broadcaster.start_cleanup_task();
+    source_broadcaster.start_cleanup_task(&task_tracker);
 
     let events: openbooklm::core::SharedEventSink = if env_flag(EVENT_LOG_ENV) {
         Arc::new(openbooklm::core::TracingEventSink)
@@ -288,7 +366,7 @@ fn require_provider_capabilities(state: &CoreState) -> anyhow::Result<()> {
 fn build_app(state: CoreState, config: &CoreConfig, identity: ReferenceIdentity) -> Router {
     let rate_limiter = RateLimiter::new(
         config.security.rate_limit_rpm,
-        state.task_tracker.cancellation_token(),
+        state.task_tracker.clone(),
         config.upstash_redis_url.as_deref(),
         config.upstash_redis_token.as_deref(),
     );
@@ -318,4 +396,60 @@ fn build_app(state: CoreState, config: &CoreConfig, identity: ReferenceIdentity)
 
 fn env_flag(name: &str) -> bool {
     std::env::var(name).is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn startup_failure_cancels_and_drains_root_tasks() {
+        let task_tracker = TaskTracker::new();
+        let shutdown = task_tracker.cancellation_token();
+        let cleaned = Arc::new(AtomicBool::new(false));
+        let cleaned_by_task = Arc::clone(&cleaned);
+        task_tracker
+            .try_spawn("startup-cleanup", async move {
+                shutdown.cancelled().await;
+                cleaned_by_task.store(true, Ordering::SeqCst);
+            })
+            .expect("task admission");
+
+        let result = run_server_lifecycle(
+            async { anyhow::bail!("startup failed") },
+            task_tracker,
+            Duration::from_secs(1),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(cleaned.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn unexpected_server_exit_aborts_work_past_the_deadline() {
+        let task_tracker = TaskTracker::new();
+        task_tracker
+            .try_spawn("stuck-cleanup", std::future::pending())
+            .expect("task admission");
+
+        run_server_lifecycle(
+            std::future::ready(Ok(())),
+            task_tracker.clone(),
+            Duration::from_millis(10),
+        )
+        .await
+        .expect("server result");
+
+        tokio::time::timeout(Duration::from_millis(50), async {
+            while task_tracker.task_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("aborted work must leave the root scope");
+    }
 }

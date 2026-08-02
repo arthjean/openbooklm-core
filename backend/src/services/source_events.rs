@@ -14,6 +14,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
+use crate::middleware::TaskTracker;
+
 /// Broadcast channel capacity per notebook.
 const CHANNEL_CAPACITY: usize = 100;
 
@@ -390,28 +392,38 @@ impl SourceEventBroadcaster {
     }
 
     /// Spawn a background task that periodically removes stale channels.
-    pub fn start_cleanup_task(&self) {
+    pub fn start_cleanup_task(&self, task_tracker: &TaskTracker) {
         let broadcaster = self.clone();
         let interval = broadcaster.cleanup_config.cleanup_interval;
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(interval).await;
-                let removed = broadcaster.cleanup_stale_channels();
-                tracing::debug!(
-                    removed,
-                    remaining = broadcaster.channel_count(),
-                    total_receivers = broadcaster.total_receivers(),
-                    "SSE cleanup cycle completed"
-                );
-                if removed > 0 {
-                    tracing::info!(
+        let shutdown = task_tracker.cancellation_token();
+        if task_tracker
+            .try_spawn("source-event-cleanup", async move {
+                loop {
+                    tokio::select! {
+                        biased;
+                        () = shutdown.cancelled() => break,
+                        () = tokio::time::sleep(interval) => {}
+                    }
+                    let removed = broadcaster.cleanup_stale_channels();
+                    tracing::debug!(
                         removed,
                         remaining = broadcaster.channel_count(),
-                        "Cleaned up stale SSE channels"
+                        total_receivers = broadcaster.total_receivers(),
+                        "SSE cleanup cycle completed"
                     );
+                    if removed > 0 {
+                        tracing::info!(
+                            removed,
+                            remaining = broadcaster.channel_count(),
+                            "Cleaned up stale SSE channels"
+                        );
+                    }
                 }
-            }
-        });
+            })
+            .is_err()
+        {
+            tracing::warn!("Source-event cleanup not started because shutdown is active");
+        }
     }
 
     fn get_or_create_channel(
@@ -460,6 +472,18 @@ mod tests {
         let (event_id, event) = rx.recv().await.unwrap();
         assert_eq!(event_id, 1);
         assert_eq!(event.source_id(), Some(source_id));
+    }
+
+    #[tokio::test]
+    async fn cleanup_task_is_owned_and_stops_with_the_root_scope() {
+        let task_tracker = TaskTracker::new();
+        let broadcaster = SourceEventBroadcaster::new();
+        broadcaster.start_cleanup_task(&task_tracker);
+        assert_eq!(task_tracker.task_count(), 1);
+
+        task_tracker.shutdown(Duration::from_millis(50)).await;
+
+        assert_eq!(task_tracker.task_count(), 0);
     }
 
     #[test]

@@ -15,7 +15,7 @@ mod shutdown;
 pub use rate_limit::{RateLimiter, create_rate_limit_middleware};
 pub use request_id::request_id_middleware;
 pub use security_headers::security_headers_middleware;
-pub use shutdown::{TaskTracker, shutdown_signal};
+pub use shutdown::{SpawnRejected, TaskAdmission, TaskTracker, shutdown_signal};
 
 use axum::http::{HeaderName, HeaderValue, Method, header};
 use tower_http::cors::CorsLayer;

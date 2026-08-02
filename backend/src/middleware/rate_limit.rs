@@ -25,6 +25,7 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::ProblemDetails;
+use crate::middleware::TaskTracker;
 
 /// Configuration constants
 const REFILL_INTERVAL: Duration = Duration::from_secs(60);
@@ -156,7 +157,7 @@ impl RateLimiter {
     /// with in-memory fallback. Otherwise, uses in-memory only with a background cleanup task.
     pub fn new(
         requests_per_minute: u32,
-        cancel_token: CancellationToken,
+        task_tracker: TaskTracker,
         redis_url: Option<&str>,
         redis_token: Option<&str>,
     ) -> Self {
@@ -188,9 +189,15 @@ impl RateLimiter {
         // Only spawn cleanup task when Redis is not active (Redis TTL handles expiry)
         if limiter.redis.is_none() {
             let state = Arc::clone(&limiter.in_memory);
-            tokio::spawn(async move {
-                Self::cleanup_loop(state, cancel_token).await;
-            });
+            let cancel_token = task_tracker.cancellation_token();
+            if task_tracker
+                .try_spawn("rate-limit-cleanup", async move {
+                    Self::cleanup_loop(state, cancel_token).await;
+                })
+                .is_err()
+            {
+                tracing::warn!("Rate limiter cleanup not started because shutdown is active");
+            }
         }
 
         limiter

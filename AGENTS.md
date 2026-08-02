@@ -72,7 +72,10 @@ payloads, ordering, or terminal behavior change, update
   module under `backend/migration-core/src/core_track/` and append it to
   `CoreMigrator::migrations()` in that directory's `mod.rs`.
 - Evolve the schema additively. Expand, backfill, deploy compatible readers,
-  and contract only in a later release.
+  and contract only in a later release. The only exception is a release whose
+  notes explicitly declare a coordinated stop-first maintenance window and
+  backup-only rollback, as defined in `CONTRIBUTING.md`; never describe that
+  exception as rolling-compatible.
 - Never run destructive `down`, `fresh`, or `refresh` migration operations.
   Validate first, then apply `up`; rollback means redeploying the previous
   binary or deliberately restoring a backup.

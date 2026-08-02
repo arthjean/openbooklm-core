@@ -4,8 +4,8 @@
   "corpus_version": "1.0.0",
   "corpus_generation": "gen-corpus-v1",
   "chunking_version": "eval-corpus-chunking/1",
-  "code_revision": "corpus-v1-deterministic",
-  "embedding_fingerprint": "deterministic/deterministic-hash-v1/1024",
+  "code_revision": "8f8f5c2b9ba4d1a861078e0dc0de95bd6bdbba2a",
+  "embedding_fingerprint": "emb:v1:deterministic:deterministic-hash-v1:1024:unit",
   "reranker_fingerprint": "none",
   "retrieval": {
     "mode": "hybrid",
@@ -175,16 +175,16 @@
     "split": "train",
     "overall": {
       "cases": 24,
-      "expected_claim_coverage": 0.56,
-      "citation_precision": 0.541667,
-      "citation_coverage": 0.928571,
+      "expected_claim_coverage": 0.6,
+      "citation_precision": 0.583333,
+      "citation_coverage": 0.933333,
       "abstention_accuracy": 0.833333,
       "unsupported_claims": 1,
       "citations_emitted": 24,
-      "citations_correct": 13,
+      "citations_correct": 14,
       "citation_verdicts": {
-        "correct": 13,
-        "unrelated_to_claim": 11
+        "correct": 14,
+        "unrelated_to_claim": 10
       },
       "classifications": {
         "missing_abstention": 4,
@@ -211,16 +211,15 @@
       },
       "exact_identifier": {
         "cases": 3,
-        "expected_claim_coverage": 0.666667,
-        "citation_precision": 0.666667,
+        "expected_claim_coverage": 1.0,
+        "citation_precision": 1.0,
         "citation_coverage": 1.0,
         "abstention_accuracy": 1.0,
         "unsupported_claims": 0,
         "citations_emitted": 3,
-        "citations_correct": 2,
+        "citations_correct": 3,
         "citation_verdicts": {
-          "correct": 2,
-          "unrelated_to_claim": 1
+          "correct": 3
         },
         "classifications": {
           "ok": 3
@@ -333,7 +332,7 @@
   "notes": [
     "Embeddings come from the deterministic in-process hashing provider. Semantic categories score low by construction; the PRD's absolute targets assume a real embedding model.",
     "Lexical scores come from a BM25-shaped in-memory scorer, not from PostgreSQL ts_rank_cd. They are comparable across revisions of this repository and not against a database.",
-    "Fused results carry the production tie-break (score desc, chunk id asc), applied inside reciprocal rank fusion since US-013. The evaluator re-imposes the same order defensively, so a regression in the pipeline's tie-break shows up as a report diff rather than as a flapping report.",
+    "Fused results carry the production tie-break (score desc, chunk id asc), applied inside reciprocal rank fusion since US-013. The evaluator preserves that order, so a tie-break regression remains observable instead of being repaired before scoring.",
     "Claim assertion is decided by the corpus's literal answer markers, never by a model. A judge, when configured, only adds diagnostics.",
     "A citation counts only when its chunk resolves, belongs to the active generation and the query's notebook, and its quoted span supports an asserted claim."
   ]

@@ -80,11 +80,19 @@ jobs:
         run: |
           set -euo pipefail
           cargo run --no-default-features --bin rag-eval -- baseline \
-            --out "${RUNNER_TEMP}/candidate.json" \
-            --revision corpus-v1-deterministic
+            --split train \
+            --out "${RUNNER_TEMP}/candidate-train.json" \
+            --revision "${GITHUB_SHA}"
           cargo run --no-default-features --bin rag-eval -- compare \
             --baseline ../contracts/eval/baseline/hybrid-train.json \
-            --candidate "${RUNNER_TEMP}/candidate.json"
+            --candidate "${RUNNER_TEMP}/candidate-train.json"
+          cargo run --no-default-features --bin rag-eval -- baseline \
+            --split holdout \
+            --out "${RUNNER_TEMP}/candidate-holdout.json" \
+            --revision "${GITHUB_SHA}"
+          cargo run --no-default-features --bin rag-eval -- compare \
+            --baseline ../contracts/eval/baseline/hybrid-holdout.json \
+            --candidate "${RUNNER_TEMP}/candidate-holdout.json"
 
   dependencies:
     name: Licenses and advisories

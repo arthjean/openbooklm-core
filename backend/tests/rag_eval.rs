@@ -42,9 +42,9 @@ use openbooklm::services::rag::eval::retrieval::{
 /// contract — never moves in a committed artifact.
 const FIXED_TIME: &str = "unspecified";
 
-/// Fixed so that a baseline diff reflects a behavior change and not a version
-/// bump. The real revision belongs to whoever runs the gate in CI.
-const FIXED_REVISION: &str = "corpus-v1-deterministic";
+/// Commit that produced the approved baseline. Change it deliberately whenever
+/// the checked-in artifacts are regenerated.
+const FIXED_REVISION: &str = "8f8f5c2b9ba4d1a861078e0dc0de95bd6bdbba2a";
 
 static TRAIN_BASELINE: OnceCell<Baseline> = OnceCell::const_new();
 static HOLDOUT_BASELINE: OnceCell<Baseline> = OnceCell::const_new();

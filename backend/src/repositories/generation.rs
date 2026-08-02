@@ -139,9 +139,11 @@ const PREVIOUS_PUBLISHED_SQL: &str = r"
     SELECT g.id, g.stored_chunk_count
     FROM source_index_generations g
     JOIN sources s ON s.id = g.source_id
+    JOIN source_index_generations active ON active.id = s.active_generation_id
     WHERE g.source_id = $1
       AND g.state = 'published'
-      AND (s.active_generation_id IS NULL OR g.id <> s.active_generation_id)
+      AND g.id <> s.active_generation_id
+      AND g.embedding_fingerprint = active.embedding_fingerprint
     ORDER BY g.published_at DESC, g.id DESC
     LIMIT 1
 ";
@@ -156,9 +158,10 @@ const LIST_FOR_SOURCE_SQL: &str = r"
 /// Generations a reclaim pass may delete.
 ///
 /// Three exclusions, each protecting a different guarantee: the active pointer
-/// (never delete what search reads), the newest other published generation
-/// (never delete the rollback target), and anything younger than the retention
-/// window (never delete what an operator is still deciding about).
+/// (never delete what search reads), the newest compatible published
+/// generation (never delete the rollback target), and anything younger than
+/// the retention window (never delete what an operator is still deciding
+/// about).
 const RECLAIMABLE_SQL: &str = r"
     SELECT g.id
     FROM source_index_generations g
@@ -169,7 +172,12 @@ const RECLAIMABLE_SQL: &str = r"
             SELECT p.id FROM source_index_generations p
             WHERE p.source_id = g.source_id AND p.state = 'published'
               AND (s.active_generation_id IS NULL OR p.id <> s.active_generation_id)
-            ORDER BY p.published_at DESC LIMIT 1
+              AND p.embedding_fingerprint = COALESCE((
+                    SELECT active.embedding_fingerprint
+                    FROM source_index_generations active
+                    WHERE active.id = s.active_generation_id
+                  ), '')
+            ORDER BY p.published_at DESC, p.id DESC LIMIT 1
           ), '00000000-0000-0000-0000-000000000000'::uuid)
       AND g.created_at < now() - make_interval(hours => $2)
       AND g.state <> 'building'
@@ -407,8 +415,14 @@ impl GenerationRepository for SeaOrmGenerationRepository {
 
     #[tracing::instrument(skip(self), fields(%source_id, %retention_hours))]
     async fn reclaim(&self, source_id: Uuid, retention_hours: i32) -> RepoResult<u64> {
-        let rows = self
-            .db
+        let txn = self.db.begin().await?;
+        // Publication and rollback move the active pointer while holding this
+        // same row lock. Keeping it through selection and deletion prevents a
+        // fingerprint change from making a selected generation the new
+        // rollback target between those two operations.
+        txn.query_one(Self::stmt(LOCK_SOURCE_SQL, [source_id.into()]))
+            .await?;
+        let rows = txn
             .query_all(Self::stmt(
                 RECLAIMABLE_SQL,
                 [source_id.into(), retention_hours.into()],
@@ -418,23 +432,12 @@ impl GenerationRepository for SeaOrmGenerationRepository {
         let mut reclaimed = 0;
         for row in rows {
             let id: Uuid = row.try_get("", "id")?;
-            // One statement per generation, outside any shared transaction: a
-            // generation that became referenced since the SELECT fails its
-            // foreign key and is skipped, while the others still go. Cleanup
-            // failure must never take the active or rollback generation with it.
-            match self
-                .db
+            reclaimed += txn
                 .execute(Self::stmt(DELETE_GENERATION_SQL, [id.into()]))
-                .await
-            {
-                Ok(result) => reclaimed += result.rows_affected(),
-                Err(e) => tracing::warn!(
-                    generation_id = %id,
-                    error = %e,
-                    "generation reclaim skipped — still referenced"
-                ),
-            }
+                .await?
+                .rows_affected();
         }
+        txn.commit().await?;
         Ok(reclaimed)
     }
 

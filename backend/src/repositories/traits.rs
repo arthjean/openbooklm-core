@@ -329,10 +329,11 @@ pub trait GenerationRepository: Send + Sync {
         reason: &str,
     ) -> RepoResult<()>;
 
-    /// Repoint a source at its previous complete generation.
+    /// Repoint a source at its previous complete generation in the same
+    /// embedding space as the active generation.
     ///
-    /// Returns `None` when there is no earlier published generation to return
-    /// to. Copies nothing.
+    /// Returns `None` when there is no compatible earlier published generation
+    /// to return to. Copies nothing.
     async fn rollback_to_previous(&self, source_id: Uuid) -> RepoResult<Option<Uuid>>;
 
     /// The ids of every generation of a source, newest first.
@@ -343,8 +344,9 @@ pub trait GenerationRepository: Send + Sync {
 
     /// Delete unreferenced generations older than the retention window.
     ///
-    /// Never touches the active generation or the newest rollback target, and
-    /// reports how many rows it actually removed.
+    /// Locks the source through selection and deletion, never touches the
+    /// active generation or newest compatible rollback target, and reports how
+    /// many rows it actually removed.
     async fn reclaim(&self, source_id: Uuid, retention_hours: i32) -> RepoResult<u64>;
 
     /// Fail building generations abandoned by a process that is gone.

@@ -1600,6 +1600,39 @@ async fn rollback_returns_to_the_previous_complete_generation() {
     f.cleanup().await;
 }
 
+#[tokio::test]
+#[ignore = "Requires PostgreSQL with pgvector (TEST_DATABASE_URL)"]
+async fn rollback_never_activates_an_incompatible_embedding_generation() {
+    let f = fixture_or_skip!();
+    let source_id = f.create_source("rollback fingerprint").await;
+    let old = provenance("model-a");
+    let current = provenance("model-b");
+    let old_generation = f.publish_generation(source_id, "old", 2, &old).await;
+    let current_generation = f
+        .publish_generation(source_id, "current", 2, &current)
+        .await;
+
+    let target = f
+        .generations
+        .rollback_to_previous(source_id)
+        .await
+        .expect("rollback query");
+
+    assert_eq!(target, None);
+    assert_eq!(
+        optional_uuid(
+            &f.db,
+            "SELECT active_generation_id AS value FROM sources WHERE id = $1",
+            [source_id.into()],
+        )
+        .await,
+        Some(current_generation)
+    );
+    assert_ne!(old_generation, current_generation);
+
+    f.cleanup().await;
+}
+
 /// Rollback must wait behind any other active-pointer move for the same source.
 /// Publication takes this row lock through its final `UPDATE sources`, so this
 /// is the serialization point that prevents a stale rollback from overwriting
@@ -1807,18 +1840,30 @@ async fn reclaim_never_removes_a_referenced_or_rollback_eligible_generation() {
     let previous = f.publish_generation(source_id, "previous", 2, &prov).await;
     let active = f.publish_generation(source_id, "active", 2, &prov).await;
 
-    // Age every generation past the retention window so only the exclusions
-    // decide what survives.
+    // Age every generation past the retention window and force a publication
+    // timestamp tie. Reclaim must use the same UUID tie-break as rollback or it
+    // can preserve a different predecessor from the one rollback will select.
     exec(
         &f.db,
-        "UPDATE source_index_generations SET created_at = now() - interval '48 hours'
+        "UPDATE source_index_generations
+         SET created_at = now() - interval '48 hours',
+             published_at = now() - interval '48 hours'
          WHERE source_id = $1",
         [source_id.into()],
     )
     .await;
+    let rollback_target = std::cmp::max(oldest, previous);
+    let obsolete = if rollback_target == oldest {
+        previous
+    } else {
+        oldest
+    };
 
     let reclaimed = f.generations.reclaim(source_id, 24).await.expect("reclaim");
-    assert_eq!(reclaimed, 1, "only the oldest generation was reclaimable");
+    assert_eq!(
+        reclaimed, 1,
+        "only the non-target generation was reclaimable"
+    );
 
     let surviving = f
         .generations
@@ -1830,10 +1875,10 @@ async fn reclaim_never_removes_a_referenced_or_rollback_eligible_generation() {
         "the active generation was removed"
     );
     assert!(
-        surviving.contains(&previous),
+        surviving.contains(&rollback_target),
         "the rollback target was removed"
     );
-    assert!(!surviving.contains(&oldest));
+    assert!(!surviving.contains(&obsolete));
 
     // The rollback target still works after a reclaim pass.
     assert_eq!(
@@ -1842,8 +1887,52 @@ async fn reclaim_never_removes_a_referenced_or_rollback_eligible_generation() {
             .await
             .expect("rollback")
             .expect("target survives"),
-        previous
+        rollback_target
     );
+
+    f.cleanup().await;
+}
+
+/// Reclaim holds the same source-row lock as publication and rollback from
+/// candidate selection through deletion.
+#[tokio::test]
+#[ignore = "Requires PostgreSQL with pgvector (TEST_DATABASE_URL)"]
+async fn reclaim_serializes_on_the_source_pointer() {
+    let f = fixture_or_skip!();
+    let prov = provenance("model-a");
+    let source_id = f.create_source("reclaim-lock").await;
+    f.publish_generation(source_id, "oldest", 2, &prov).await;
+    f.publish_generation(source_id, "previous", 2, &prov).await;
+    f.publish_generation(source_id, "active", 2, &prov).await;
+    exec(
+        &f.db,
+        "UPDATE source_index_generations SET created_at = now() - interval '48 hours'
+         WHERE source_id = $1",
+        [source_id.into()],
+    )
+    .await;
+
+    let blocker = f.db.begin().await.expect("begin blocker");
+    blocker
+        .query_one(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT id FROM sources WHERE id = $1 FOR UPDATE",
+            [source_id.into()],
+        ))
+        .await
+        .expect("lock source");
+
+    let generations = f.generations.clone();
+    let mut reclaim = tokio::spawn(async move { generations.reclaim(source_id, 24).await });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut reclaim)
+            .await
+            .is_err(),
+        "reclaim selected candidates while an active-pointer transaction held the source row"
+    );
+
+    blocker.commit().await.expect("release source lock");
+    assert_eq!(reclaim.await.expect("reclaim task").expect("reclaim"), 1);
 
     f.cleanup().await;
 }

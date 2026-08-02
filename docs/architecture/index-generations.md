@@ -166,19 +166,24 @@ Verified: `a_hundred_concurrent_requests_produce_one_owner`,
 ### Rollback and reclaim
 
 Rollback repoints a source at its newest `published` generation that is not the
-active one, using the same `UPDATE sources` statement publication uses. It
-copies nothing and deletes nothing, and public response shapes do not change.
-Before selecting that predecessor it locks the `sources` row `FOR UPDATE`.
+active one and has the same embedding fingerprint, using the same `UPDATE
+sources` statement publication uses. Crossing vector spaces would make the
+restored index unreadable by the configured query embedder, so no compatible
+predecessor means no rollback. The operation copies nothing and deletes
+nothing, and public response shapes do not change. Before selecting that
+predecessor it locks the `sources` row `FOR UPDATE`.
 Publication's pointer update takes the same row lock, so a concurrent rollback
 observes either the pointer before publication or the committed pointer after
 publication and cannot overwrite a newer generation from a stale snapshot.
 
-Reclaim deletes unreferenced generations older than the retention window, with
-three exclusions: the active generation, the newest other published generation
-(the rollback target), and anything inside the window. Deletions run one
-statement per generation outside any shared transaction, so a generation that
-became referenced since the scan fails its foreign key and is skipped while the
-others still go.
+Reclaim locks the source row, then selects and deletes obsolete generations in
+one transaction. It therefore serializes with publication and rollback before
+a fingerprint change can alter the protected rollback target. It deletes
+unreferenced generations older than the retention window, with
+three exclusions: the active generation, the newest compatible published
+generation (the rollback target), and anything inside the window. Deletions run one
+statement per generation inside the transaction; a failure rolls the reclaim
+pass back without changing the active pointer or rollback target.
 
 Retention is at least one prior complete generation and at least 24 hours.
 Cleanup never runs inside the publication transaction.
@@ -192,10 +197,12 @@ already live, and disk left behind is an operational cost, not a reason to
 report a successful rebuild as a failure.
 
 Verified: `rollback_returns_to_the_previous_complete_generation`,
+`rollback_never_activates_an_incompatible_embedding_generation`,
 `rollback_serializes_on_the_source_pointer`,
 `a_thousand_publication_rollback_schedules_are_linearizable`,
 `rollback_without_a_predecessor_changes_nothing`,
 `reclaim_never_removes_a_referenced_or_rollback_eligible_generation`,
+`reclaim_serializes_on_the_source_pointer`,
 `reclaim_respects_the_retention_window`.
 
 ## Migration and rollout

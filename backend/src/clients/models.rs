@@ -6,6 +6,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::AppError;
 
+pub const ANTHROPIC_CONTEXT_WINDOW: u32 = 200_000;
+pub const OPENAI_GPT5_CONTEXT_WINDOW: u32 = 400_000;
+pub const MISTRAL_SMALL_CONTEXT_WINDOW: u32 = 32_768;
+pub const MISTRAL_LARGE_CONTEXT_WINDOW: u32 = 131_072;
+
 /// Model info returned from provider APIs.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq, Deserialize)]
 pub struct ModelInfo {
@@ -24,19 +29,19 @@ pub fn anthropic_models() -> Vec<ModelInfo> {
             id: "claude-opus-4-6-20260220".into(),
             name: "Claude Opus 4.6".into(),
             description: Some("Most capable model for complex tasks".into()),
-            context_window: Some(200_000),
+            context_window: Some(ANTHROPIC_CONTEXT_WINDOW),
         },
         ModelInfo {
             id: "claude-sonnet-4-6-20260220".into(),
             name: "Claude Sonnet 4.6".into(),
             description: Some("Best for complex agents and coding".into()),
-            context_window: Some(200_000),
+            context_window: Some(ANTHROPIC_CONTEXT_WINDOW),
         },
         ModelInfo {
             id: "claude-haiku-4-5-20251001".into(),
             name: "Claude Haiku 4.5".into(),
             description: Some("Fastest model with near-frontier intelligence".into()),
-            context_window: Some(200_000),
+            context_window: Some(ANTHROPIC_CONTEXT_WINDOW),
         },
     ]
 }
@@ -48,13 +53,13 @@ pub fn openai_models() -> Vec<ModelInfo> {
             id: "gpt-5.2".into(),
             name: "GPT-5.2".into(),
             description: Some("Advanced reasoning".into()),
-            context_window: Some(400_000),
+            context_window: Some(OPENAI_GPT5_CONTEXT_WINDOW),
         },
         ModelInfo {
             id: "gpt-5-mini".into(),
             name: "GPT-5 mini".into(),
             description: Some("Fast and affordable".into()),
-            context_window: Some(400_000),
+            context_window: Some(OPENAI_GPT5_CONTEXT_WINDOW),
         },
     ]
 }
@@ -70,15 +75,49 @@ pub fn mistral_models() -> Vec<ModelInfo> {
             id: "mistral-small-latest".into(),
             name: "Mistral Small".into(),
             description: Some("Fast and efficient".into()),
-            context_window: Some(32_768),
+            context_window: Some(MISTRAL_SMALL_CONTEXT_WINDOW),
         },
         ModelInfo {
             id: "mistral-large-latest".into(),
             name: "Mistral Large".into(),
             description: Some("Advanced reasoning".into()),
-            context_window: Some(131_072),
+            context_window: Some(MISTRAL_LARGE_CONTEXT_WINDOW),
         },
     ]
+}
+
+/// Resolve the context window declared by the static public model catalog.
+///
+/// Returning `None` for dynamically discovered or unknown models keeps callers
+/// from inventing a window that the provider may reject.
+#[must_use]
+pub fn context_window_for_model(provider: &str, model: &str) -> Option<u32> {
+    models_for_provider(provider)?
+        .into_iter()
+        .find(|candidate| candidate.id == model)
+        .and_then(|candidate| candidate.context_window)
+}
+
+/// Model identifiers supported by a provider in this build.
+///
+/// Provider metadata and request budgeting both derive from the same catalog,
+/// so a model cannot be advertised without a declared window.
+#[must_use]
+pub fn model_ids_for_provider(provider: &str) -> Vec<String> {
+    models_for_provider(provider)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|model| model.id)
+        .collect()
+}
+
+fn models_for_provider(provider: &str) -> Option<Vec<ModelInfo>> {
+    match provider {
+        "anthropic" => Some(anthropic_models()),
+        "openai" => Some(openai_models()),
+        "mistral" => Some(mistral_models()),
+        _ => None,
+    }
 }
 
 /// Format a model ID into a human-readable name.

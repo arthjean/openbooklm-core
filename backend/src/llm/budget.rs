@@ -37,6 +37,8 @@
 use std::borrow::Cow;
 use std::fmt::{self, Write as _};
 
+use crate::clients::models::context_window_for_model as catalog_context_window_for_model;
+
 use super::types::LlmMessage;
 
 /// Maximum tokens per individual history message.
@@ -67,6 +69,12 @@ const EVIDENCE_PERCENT: usize = 60;
 /// Ceiling on the memory block, as a share of the window.
 const MEMORY_PERCENT: usize = 10;
 
+/// Conservative allowance for provider-side request framing outside content.
+const REQUEST_OVERHEAD_TOKENS: usize = 16;
+
+/// Conservative allowance for the role and separators of one message.
+const MESSAGE_OVERHEAD_TOKENS: usize = 8;
+
 // ============================================================================
 // Context window sizing
 // ============================================================================
@@ -76,33 +84,19 @@ const MEMORY_PERCENT: usize = 10;
 /// `None` means this build cannot state the window, which is a refusal to
 /// generate rather than a licence to guess (US-018 AC-5).
 ///
-/// Uses `starts_with` prefix matching so versioned model IDs (e.g.
-/// `claude-opus-4-6-20260220`) resolve correctly.
+/// Only model identifiers present in the static public catalog resolve. An
+/// unlisted identifier has no safe window until its metadata is propagated to
+/// this boundary.
 #[must_use]
 pub fn context_window_for_model(provider: &str, model: &str) -> Option<usize> {
-    Some(match provider {
-        "anthropic" => 200_000, // claude-opus-4-6, claude-sonnet-4-6, claude-haiku-4-5
-        "openai" => {
-            if model.starts_with("gpt-5.2") || model.starts_with("gpt-5-mini") {
-                400_000
-            } else {
-                128_000
-            }
-        }
-        "mistral" => {
-            if model.starts_with("mistral-large-") {
-                256_000
-            } else {
-                128_000 // mistral-small and other Mistral models
-            }
-        }
-        // The in-process model behind the offline evaluator and the CI smoke
-        // path. Declared explicitly for the same reason as the hosted ones: a
-        // provider with no entry here cannot be budgeted, and the evaluator
-        // exercises the same assembly code as production.
-        "deterministic" => 128_000,
-        _ => return None,
-    })
+    // The in-process model behind the offline evaluator and the CI smoke path
+    // is not part of the public provider catalog.
+    let window = if (provider, model) == ("deterministic", "deterministic-echo-v1") {
+        128_000
+    } else {
+        catalog_context_window_for_model(provider, model)?
+    };
+    usize::try_from(window).ok()
 }
 
 // ============================================================================
@@ -156,6 +150,7 @@ impl PromptBudget {
         self.window
             .saturating_sub(self.reserve)
             .saturating_sub(self.output)
+            .saturating_sub(REQUEST_OVERHEAD_TOKENS)
     }
 
     /// Ceiling on retrieved evidence.
@@ -177,17 +172,35 @@ impl PromptBudget {
     /// than send it.
     #[must_use]
     pub fn admits(&self, system_prompt: &str, messages: &[LlmMessage]) -> bool {
-        request_tokens(system_prompt, messages) + self.output + self.reserve <= self.window
+        self.admits_with_additional_prompt_tokens(system_prompt, messages, 0)
+    }
+
+    /// Whether the final request fits when the provider receives prompt tokens
+    /// outside `system_prompt` and `messages`, such as Anthropic document
+    /// blocks.
+    #[must_use]
+    pub fn admits_with_additional_prompt_tokens(
+        &self,
+        system_prompt: &str,
+        messages: &[LlmMessage],
+        additional_prompt_tokens: usize,
+    ) -> bool {
+        request_tokens(system_prompt, messages)
+            .saturating_add(additional_prompt_tokens)
+            .saturating_add(self.output)
+            .saturating_add(self.reserve)
+            <= self.window
     }
 }
 
 /// Estimated tokens of an assembled request, excluding output and reserve.
 #[must_use]
 pub fn request_tokens(system_prompt: &str, messages: &[LlmMessage]) -> usize {
-    estimate_tokens(system_prompt)
+    REQUEST_OVERHEAD_TOKENS
+        + estimate_tokens(system_prompt)
         + messages
             .iter()
-            .map(|m| estimate_tokens(&m.content))
+            .map(|m| message_tokens(&m.content))
             .sum::<usize>()
 }
 
@@ -197,11 +210,11 @@ pub fn request_tokens(system_prompt: &str, messages: &[LlmMessage]) -> usize {
 
 /// Counts the tokens of everything written into it, without building a string.
 ///
-/// The single definition of the estimate: bytes/4 for Latin/ASCII text, plus one
-/// token per CJK character on top of its bytes/4 contribution. That yields ~1.75
-/// tokens per CJK character where a real tokenizer gives ~1. The overestimate is
-/// deliberate: a budget that errs high keeps fewer messages, a budget that errs
-/// low overflows a context window.
+/// The single definition of the bound: one token per UTF-8 byte. Supported
+/// provider tokenizers cannot emit more content tokens than input bytes, since
+/// every content token consumes at least one byte. This intentionally trades
+/// some context utilization for a provider-independent upper bound; request and
+/// message framing are counted separately.
 ///
 /// It is a [`fmt::Write`] sink, which is what makes it interchangeable with the
 /// `String` the evidence renderer writes into. Pricing an entry means running
@@ -211,21 +224,19 @@ pub fn request_tokens(system_prompt: &str, messages: &[LlmMessage]) -> usize {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct TokenMeter {
     bytes: usize,
-    cjk: usize,
 }
 
 impl TokenMeter {
     /// Tokens written into this meter so far.
     #[must_use]
     pub const fn tokens(&self) -> usize {
-        self.bytes / 4 + self.cjk
+        self.bytes
     }
 }
 
 impl fmt::Write for TokenMeter {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         self.bytes += s.len();
-        self.cjk += s.chars().filter(|c| is_cjk(*c)).count();
         Ok(())
     }
 }
@@ -241,14 +252,8 @@ pub fn estimate_tokens(text: &str) -> usize {
     meter.tokens()
 }
 
-fn is_cjk(ch: char) -> bool {
-    matches!(ch,
-        '\u{4E00}'..='\u{9FFF}'   // CJK Unified Ideographs
-        | '\u{3400}'..='\u{4DBF}' // CJK Extension A
-        | '\u{3040}'..='\u{309F}' // Hiragana
-        | '\u{30A0}'..='\u{30FF}' // Katakana
-        | '\u{AC00}'..='\u{D7AF}' // Korean Hangul
-    )
+pub(crate) fn message_tokens(content: &str) -> usize {
+    estimate_tokens(content) + MESSAGE_OVERHEAD_TOKENS
 }
 
 // ============================================================================
@@ -286,23 +291,17 @@ pub fn truncate_message_content(content: &str, max_tokens: usize) -> Cow<'_, str
     let marker_tokens = estimate_tokens(TRUNCATION_MARKER);
     let target_tokens = max_tokens.saturating_sub(marker_tokens);
 
-    // Walk characters accumulating token estimate incrementally.
-    // This mirrors `estimate_tokens` (bytes/4 + cjk_count) exactly,
-    // avoiding the CJK mismatch that would arise from a fixed bytes-per-token
-    // multiplier (CJK chars are 3 UTF-8 bytes but count as ~1.75 tokens
-    // under our heuristic, not 0.75).
+    // Walk characters while preserving UTF-8 boundaries. The estimate is the
+    // byte count, so no second tokenizer approximation is involved here.
     let mut byte_count = 0usize;
-    let mut cjk_count = 0usize;
     let mut truncate_at = 0usize;
 
     for (i, c) in content.char_indices() {
         let new_bytes = byte_count + c.len_utf8();
-        let new_cjk = cjk_count + usize::from(is_cjk(c));
-        if new_bytes / 4 + new_cjk > target_tokens {
+        if new_bytes > target_tokens {
             break;
         }
         byte_count = new_bytes;
-        cjk_count = new_cjk;
         truncate_at = i + c.len_utf8();
     }
 
@@ -323,7 +322,7 @@ pub fn fit_history(history: &[LlmMessage], budget_tokens: usize) -> FittedHistor
 
     for msg in history.iter().rev() {
         let content = truncate_message_content(&msg.content, MAX_TOKENS_PER_HISTORY_MESSAGE);
-        let msg_tokens = estimate_tokens(&content);
+        let msg_tokens = message_tokens(&content);
         if total_tokens + msg_tokens > budget_tokens {
             break;
         }
@@ -374,29 +373,28 @@ mod tests {
 
     #[test]
     fn context_window_openai_variants() {
+        assert_eq!(context_window_for_model("openai", "gpt-5.2"), Some(400_000));
         assert_eq!(
-            context_window_for_model("openai", "gpt-5.2-turbo"),
+            context_window_for_model("openai", "gpt-5-mini"),
             Some(400_000)
         );
-        assert_eq!(
-            context_window_for_model("openai", "gpt-5-mini-2025"),
-            Some(400_000)
-        );
-        assert_eq!(
-            context_window_for_model("openai", "gpt-4o-mini"),
-            Some(128_000)
-        );
+        assert_eq!(context_window_for_model("openai", "gpt-4o-mini"), None);
     }
 
     #[test]
     fn context_window_mistral_variants() {
         assert_eq!(
-            context_window_for_model("mistral", "mistral-large-2026-01"),
-            Some(256_000)
+            context_window_for_model("mistral", "mistral-large-latest"),
+            Some(131_072)
         );
         assert_eq!(
             context_window_for_model("mistral", "mistral-small-latest"),
-            Some(128_000)
+            Some(32_768)
+        );
+        assert_eq!(
+            context_window_for_model("mistral", "mistral-small-unknown"),
+            None,
+            "an unlisted model must not inherit an invented window"
         );
     }
 
@@ -419,13 +417,20 @@ mod tests {
     #[test]
     fn estimate_tokens_english() {
         let tokens = estimate_tokens("hello world");
-        assert!(tokens >= 2);
-        assert!(tokens <= 5);
+        assert_eq!(tokens, "hello world".len());
     }
 
     #[test]
-    fn estimate_tokens_cjk_higher_density() {
-        assert!(estimate_tokens("你好世界") > estimate_tokens("abcd"));
+    fn estimate_is_a_conservative_utf8_byte_bound() {
+        for text in [
+            "550e8400-e29b-41d4-a716-446655440000",
+            "fn main() { println!(\"hello\"); }",
+            "مرحبا بالعالم",
+            "你好世界",
+            "😀🧪",
+        ] {
+            assert_eq!(estimate_tokens(text), text.len());
+        }
     }
 
     /// The property the evidence renderer relies on: writing the pieces of a
@@ -447,8 +452,7 @@ mod tests {
         }
 
         let whole = estimate_tokens(&joined);
-        assert!(meter.tokens() <= whole);
-        assert!(whole - meter.tokens() < pieces.len());
+        assert_eq!(meter.tokens(), whole);
     }
 
     #[test]
@@ -466,7 +470,10 @@ mod tests {
     fn the_prompt_allowance_excludes_the_reserve_and_the_answer() {
         let budget = PromptBudget::new(100_000, 4_000);
         assert_eq!(budget.reserve(), 5_000);
-        assert_eq!(budget.prompt_allowance(), 100_000 - 5_000 - 4_000);
+        assert_eq!(
+            budget.prompt_allowance(),
+            100_000 - 5_000 - 4_000 - REQUEST_OVERHEAD_TOKENS
+        );
     }
 
     #[test]
@@ -485,21 +492,28 @@ mod tests {
     #[test]
     fn admits_rejects_a_request_that_would_eat_the_reserve() {
         let budget = PromptBudget::new(10_000, 1_000);
-        // reserve 1,024 + output 1,000 leaves 7,976 tokens for the prompt.
-        let fits = "x".repeat(4 * 7_000);
+        // Reserve, output and request framing leave 7,960 content tokens.
+        let fits = "x".repeat(7_000);
         assert!(budget.admits(&fits, &[]));
 
-        let overflows = "x".repeat(4 * 8_000);
+        let overflows = "x".repeat(8_000);
         assert!(!budget.admits(&overflows, &[]));
     }
 
     #[test]
     fn admits_counts_the_messages_too() {
         let budget = PromptBudget::new(10_000, 1_000);
-        let system = "x".repeat(4 * 7_000);
-        let message = LlmMessage::user("y".repeat(4 * 2_000));
+        let system = "x".repeat(7_000);
+        let message = LlmMessage::user("y".repeat(2_000));
         assert!(budget.admits(&system, &[]));
         assert!(!budget.admits(&system, std::slice::from_ref(&message)));
+    }
+
+    #[test]
+    fn admits_counts_provider_native_document_blocks() {
+        let budget = PromptBudget::new(2_500, 100);
+        assert!(budget.admits_with_additional_prompt_tokens("system", &[], 1_300));
+        assert!(!budget.admits_with_additional_prompt_tokens("system", &[], 1_400));
     }
 
     #[test]
@@ -540,7 +554,7 @@ mod tests {
             truncate_message_content("", 2000),
             Cow::Borrowed(_)
         ));
-        let exact = "a".repeat(8000);
+        let exact = "a".repeat(2000);
         assert_eq!(estimate_tokens(&exact), 2000);
         assert!(matches!(
             truncate_message_content(&exact, 2000),
@@ -566,9 +580,10 @@ mod tests {
     #[test]
     fn history_drops_the_oldest_first() {
         let history: Vec<LlmMessage> = (0..10)
-            .map(|i| LlmMessage::user(format!("msg-{i}: {}", "w".repeat(4_000)))) // ~1,000 tokens
+            .map(|i| LlmMessage::user(format!("msg-{i}: {}", "w".repeat(1_000))))
             .collect();
-        // Each message costs ~1,002 tokens, so two fit and a third would not.
+        // Each message costs just over 1,000 tokens including framing, so two
+        // fit and a third does not.
         let fitted = fit_history(&history, 3_000);
         assert!(fitted.was_truncated);
         assert_eq!(fitted.messages.len(), 2);
@@ -588,7 +603,7 @@ mod tests {
                 .content
                 .contains("[...truncated, full response available in history]")
         );
-        assert!(fitted.tokens <= MAX_TOKENS_PER_HISTORY_MESSAGE + 1);
+        assert!(fitted.tokens <= MAX_TOKENS_PER_HISTORY_MESSAGE + MESSAGE_OVERHEAD_TOKENS);
     }
 
     #[test]

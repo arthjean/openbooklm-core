@@ -419,18 +419,7 @@ impl LlmProvider for AnthropicClient {
     }
 
     fn supported_models(&self) -> Vec<String> {
-        [
-            "claude-opus-4-6-20260220",
-            "claude-sonnet-4-6-20260220",
-            "claude-haiku-4-5-20251001",
-            "claude-opus-4-20250514",
-            "claude-sonnet-4-20250514",
-            "claude-3-5-sonnet-20241022",
-            "claude-3-5-haiku-20241022",
-        ]
-        .into_iter()
-        .map(String::from)
-        .collect()
+        super::models::model_ids_for_provider("anthropic")
     }
 
     async fn stream_chat(

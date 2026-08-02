@@ -187,21 +187,7 @@ impl LlmProvider for MistralClient {
     }
 
     fn supported_models(&self) -> Vec<String> {
-        [
-            // Frontier models (latest)
-            "mistral-large-latest",
-            "mistral-medium-latest",
-            "mistral-small-latest",
-            // Reasoning models
-            "magistral-medium-latest",
-            "magistral-small-latest",
-            // Code models
-            "codestral-latest",
-            "devstral-small-latest",
-        ]
-        .into_iter()
-        .map(String::from)
-        .collect()
+        super::models::model_ids_for_provider(PROVIDER_NAME)
     }
 
     async fn stream_chat(

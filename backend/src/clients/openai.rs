@@ -93,10 +93,7 @@ impl LlmProvider for OpenAiClient {
     }
 
     fn supported_models(&self) -> Vec<String> {
-        ["gpt-5.2", "gpt-5-mini"]
-            .into_iter()
-            .map(String::from)
-            .collect()
+        super::models::model_ids_for_provider(PROVIDER_NAME)
     }
 
     async fn stream_chat(

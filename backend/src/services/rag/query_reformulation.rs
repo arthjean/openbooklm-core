@@ -393,14 +393,15 @@ mod tests {
 
         // One turn just under the budget fits; the same turn plus a second one
         // does not, which is what makes the limit a budget and not a count.
-        // `estimate_tokens` counts bytes/4, so a turn of 6 * budget * 0.4 bytes
-        // is about 60% of the budget: one fits, two cannot.
+        // `estimate_tokens` uses a one-token-per-byte upper bound. A turn of
+        // 6 * budget * 0.1 bytes is about 60% of the budget: one fits, two do
+        // not.
         #[allow(
             clippy::cast_precision_loss,
             clippy::cast_possible_truncation,
             clippy::cast_sign_loss
         )]
-        let words = ((budget as f64) * 0.4) as usize;
+        let words = ((budget as f64) * 0.1) as usize;
         let filler = "token ".repeat(words);
         let history = vec![
             ChatTurn {

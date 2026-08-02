@@ -198,7 +198,11 @@ fn check_case(case: &AdversarialCase, report: &mut IsolationReport) {
     let fabricated = extracted
         .citations
         .iter()
-        .filter(|c| !results.iter().any(|r| r.source_id == c.source_id))
+        .filter(|located| {
+            !results
+                .iter()
+                .any(|r| r.source_id == located.citation.source_id)
+        })
         .count();
     if fabricated > 0 {
         report.fabricated_citations += fabricated;

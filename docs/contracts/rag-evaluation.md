@@ -119,6 +119,10 @@ Four conditions, all required:
 A citation that satisfies only the first is the failure this metric exists to
 catch. It is counted as wrong and classified: `unknown_chunk`,
 `stale_generation`, `cross_notebook`, `span_mismatch`, `unrelated_to_claim`.
+Consecutive markers such as `[1][2]` inherit the same immediately preceding
+claim. A malformed or refused streamed marker remains in the precision
+denominator as `malformed_marker`, and gives the case the explicit
+`malformed_citation` classification.
 
 The chat path refuses the same things before a citation is ever emitted (US-019):
 a marker that resolves to nothing retrieved, a missing or stale active

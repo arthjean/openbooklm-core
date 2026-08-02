@@ -28,10 +28,21 @@ use super::types::{ChunkProvenance, CitableChunk, Citation};
 static CITATION_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\[(\d+)\]").expect("valid regex"));
 
+/// A citation coupled to the byte offset of the marker that earned it.
+///
+/// The association is one value so scoring and final validation cannot observe
+/// a citation without its location, or silently zip vectors of different
+/// lengths.
+#[derive(Debug, Clone)]
+pub struct LocatedCitation<T = Citation> {
+    pub citation: T,
+    pub marker_start: usize,
+}
+
 /// Citations an answer earned, and the markers it did not.
 #[derive(Debug, Clone, Default)]
 pub struct ExtractedCitations {
-    pub citations: Vec<Citation>,
+    pub citations: Vec<LocatedCitation>,
     /// Markers that named something unciteable: out of range, `[0]`, a chunk
     /// with no generation, or a marker written inside code.
     pub rejected: usize,
@@ -44,7 +55,11 @@ pub struct ExtractedCitations {
 /// (`` ```...``` ``), and refuses out-of-bounds references.
 #[must_use]
 pub fn extract_citations(response: &str, context_chunks: &[CitableChunk]) -> Vec<Citation> {
-    extract_citations_verified(response, context_chunks).citations
+    extract_citations_verified(response, context_chunks)
+        .citations
+        .into_iter()
+        .map(|located| located.citation)
+        .collect()
 }
 
 /// [`extract_citations`], reporting how many markers were refused.
@@ -180,13 +195,16 @@ fn extract_citations_with_active_generations(
             continue;
         }
 
-        citations.push(Citation::new(
-            chunk.source_id,
-            chunk.chunk_index,
-            truncate_text(&chunk.content, 200).into_owned(),
-            chunk.relevance_score,
-            provenance,
-        ));
+        citations.push(LocatedCitation {
+            citation: Citation::new(
+                chunk.source_id,
+                chunk.chunk_index,
+                truncate_text(&chunk.content, 200).into_owned(),
+                chunk.relevance_score,
+                provenance,
+            ),
+            marker_start: full_match.start(),
+        });
 
         tracing::debug!(
             citation_index = index,
@@ -883,11 +901,16 @@ mod tests {
             "span_end": 480,
             "section_header": "Retention",
         }));
-        let extracted = extract_citations_verified("Supported [1].", &[chunk]);
+        let response = "Supported [1].";
+        let extracted = extract_citations_verified(response, &[chunk]);
         assert_eq!(extracted.rejected, 0);
-        assert_eq!(extracted.citations[0].page_number, Some(4));
         assert_eq!(
-            extracted.citations[0].section_header.as_deref(),
+            extracted.citations[0].marker_start,
+            response.find('[').unwrap_or(0)
+        );
+        assert_eq!(extracted.citations[0].citation.page_number, Some(4));
+        assert_eq!(
+            extracted.citations[0].citation.section_header.as_deref(),
             Some("Retention")
         );
     }

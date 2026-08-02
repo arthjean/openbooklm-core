@@ -301,7 +301,6 @@ pub(super) async fn stream_llm_response(
         &CitationResolution {
             uses_native_citations,
             native_citations: &native_citations.citations,
-            native_marker_starts: &native_citations.marker_starts,
             doc_citation_map: &native_citations.document_numbers,
             rag_documents: &rag_documents,
             context_chunks: &context_chunks,
@@ -834,8 +833,7 @@ pub enum ChunkResult {
 
 #[derive(Default)]
 pub struct NativeCitationStream {
-    citations: Vec<crate::llm::NativeCitation>,
-    marker_starts: Vec<usize>,
+    citations: Vec<crate::llm::LocatedCitation<crate::llm::NativeCitation>>,
     document_numbers: HashMap<usize, usize>,
 }
 
@@ -924,8 +922,10 @@ pub async fn process_chunk(
                     if full_response.len() + marker.len() > MAX_RESPONSE_SIZE {
                         return Ok(ChunkResult::Truncated);
                     }
-                    state.marker_starts.push(full_response.len());
-                    state.citations.push(citation);
+                    state.citations.push(crate::llm::LocatedCitation {
+                        citation,
+                        marker_start: full_response.len(),
+                    });
                     full_response.push_str(&marker);
                     out.emit(ChatEvent::chunk(marker)).await;
                 }
@@ -1206,8 +1206,15 @@ mod tests {
 
         assert!(matches!(result, ChunkResult::Continue));
         assert_eq!(full_response, "Claim A [1]. Claim B [2]");
-        assert_eq!(native.marker_starts, vec![7, 20]);
         assert_eq!(native.citations.len(), 2);
+        assert_eq!(
+            native
+                .citations
+                .iter()
+                .map(|located| located.marker_start)
+                .collect::<Vec<_>>(),
+            vec![7, 20]
+        );
         for expected in ["Claim A", " [1]", ". Claim B", " [2]"] {
             match rx.recv().await.expect("chunk event") {
                 ChatEvent::Chunk(chunk) => assert_eq!(chunk.text, expected),

@@ -8,19 +8,18 @@ use std::collections::{HashMap, HashSet};
 
 use uuid::Uuid;
 
-use crate::llm::CitableChunk;
 use crate::llm::citations::{
     claim_is_supported_by, extract_citations_verified_against_active, find_code_ranges,
 };
 use crate::llm::types::ChunkProvenance;
+use crate::llm::{CitableChunk, LocatedCitation, NativeCitation};
 use crate::repositories::{ActiveGenerationLease, SourceRepository};
 use crate::services::rag::eval::trace::ReasonCode;
 use crate::types::SearchResult;
 
 pub(super) struct CitationResolution<'a> {
     pub uses_native_citations: bool,
-    pub native_citations: &'a [crate::llm::NativeCitation],
-    pub native_marker_starts: &'a [usize],
+    pub native_citations: &'a [LocatedCitation<NativeCitation>],
     pub doc_citation_map: &'a HashMap<usize, usize>,
     pub rag_documents: &'a [crate::llm::RagDocument],
     pub context_chunks: &'a [SearchResult],
@@ -84,11 +83,9 @@ async fn resolve_native(
     let mut rejected = 0usize;
     let mut candidates = Vec::new();
     let code_ranges = find_code_ranges(input.full_response);
-    for (native, marker_start) in input
-        .native_citations
-        .iter()
-        .zip(input.native_marker_starts.iter().copied())
-    {
+    for located in input.native_citations {
+        let native = &located.citation;
+        let marker_start = located.marker_start;
         let Some(document) = input.rag_documents.get(native.document_index) else {
             rejected += 1;
             continue;
@@ -165,7 +162,8 @@ async fn resolve_prompt_markers(
     );
     let mut rejected = extracted.rejected;
     let mut candidates = Vec::with_capacity(extracted.citations.len());
-    for citation in extracted.citations {
+    for located in extracted.citations {
+        let citation = located.citation;
         if let Some((index, chunk)) = input.context_chunks.iter().enumerate().find(|(_, chunk)| {
             chunk.source_id == citation.source_id && chunk.chunk_index == citation.chunk_index
         }) {

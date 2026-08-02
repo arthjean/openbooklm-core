@@ -19,7 +19,7 @@ pub mod types;
 
 // Re-export commonly used types at module level
 pub use budget::{PromptBudget, context_window_for_model, estimate_tokens, fit_history};
-pub use citations::extract_citations;
+pub use citations::{LocatedCitation, extract_citations};
 pub use fallbacks::{FALLBACK_TEXTS, insufficient_evidence_text, no_sources_text};
 pub use prompts::{build_messages, build_system_prompt};
 pub use provider::{ByteStream, LlmProvider};

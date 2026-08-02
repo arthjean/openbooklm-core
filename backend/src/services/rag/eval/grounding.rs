@@ -40,7 +40,7 @@ use uuid::Uuid;
 
 use crate::core::providers::DeterministicLlm;
 use crate::error::AppError;
-use crate::llm::citations::extract_citations;
+use crate::llm::citations::{LocatedCitation, extract_citations_verified};
 use crate::llm::types::{CitableChunk, Citation};
 use crate::services::rag::search::format_context_for_llm;
 
@@ -82,7 +82,9 @@ pub enum AnswerOutcome {
     /// The model answered, with whatever citations were extracted from it.
     Answered {
         text: String,
-        citations: Vec<Citation>,
+        citations: Vec<LocatedCitation>,
+        /// Markers rejected while parsing or resolving the streamed answer.
+        rejected_citations: usize,
     },
     /// The model declined to answer from the sources.
     Abstained { text: String },
@@ -133,6 +135,8 @@ pub enum CitationVerdict {
     SpanMismatch,
     /// The chunk is real and current, but supports no claim the answer made.
     UnrelatedToClaim,
+    /// The streamed marker could not be parsed or resolved safely.
+    MalformedMarker,
 }
 
 impl CitationVerdict {
@@ -145,6 +149,7 @@ impl CitationVerdict {
             Self::CrossNotebook => "cross_notebook",
             Self::SpanMismatch => "span_mismatch",
             Self::UnrelatedToClaim => "unrelated_to_claim",
+            Self::MalformedMarker => "malformed_marker",
         }
     }
 }
@@ -169,6 +174,8 @@ pub enum CaseClassification {
     SpuriousAbstention,
     /// Answered without emitting a single citation.
     Uncited,
+    /// At least one streamed citation marker was malformed or unsafe.
+    MalformedCitation,
     /// The corpus has no query with this id.
     UnknownQuery,
 }
@@ -182,6 +189,7 @@ impl CaseClassification {
             Self::MissingAbstention => "missing_abstention",
             Self::SpuriousAbstention => "spurious_abstention",
             Self::Uncited => "uncited",
+            Self::MalformedCitation => "malformed_citation",
             Self::UnknownQuery => "unknown_query",
         }
     }
@@ -368,32 +376,43 @@ fn score_case(
     // did not surface it.
     let abstention_expected = !query.answerable || !case.evidence_sufficient;
 
-    let (answer_text, citations, abstained, mut classification) = match &case.outcome {
-        AnswerOutcome::ProviderError { .. } => (
-            String::new(),
-            Vec::new(),
-            false,
-            CaseClassification::ProviderError,
-        ),
-        AnswerOutcome::Abstained { text } => {
-            (text.clone(), Vec::new(), true, CaseClassification::Ok)
-        }
-        AnswerOutcome::Answered { text, citations } => {
-            // A model that emitted the fallback sentence abstained, whatever
-            // the producer labeled it.
-            let abstained = reads_as_abstention(text);
-            (
-                text.clone(),
-                if abstained {
-                    Vec::new()
-                } else {
-                    citations.clone()
-                },
-                abstained,
-                CaseClassification::Ok,
-            )
-        }
-    };
+    let (answer_text, citations, rejected_citations, abstained, mut classification) =
+        match &case.outcome {
+            AnswerOutcome::ProviderError { .. } => (
+                String::new(),
+                Vec::new(),
+                0,
+                false,
+                CaseClassification::ProviderError,
+            ),
+            AnswerOutcome::Abstained { text } => {
+                (text.clone(), Vec::new(), 0, true, CaseClassification::Ok)
+            }
+            AnswerOutcome::Answered {
+                text,
+                citations,
+                rejected_citations,
+            } => {
+                // A model that emitted the fallback sentence abstained, whatever
+                // the producer labeled it.
+                let abstained = reads_as_abstention(text);
+                (
+                    text.clone(),
+                    if abstained {
+                        Vec::new()
+                    } else {
+                        citations.clone()
+                    },
+                    *rejected_citations,
+                    abstained,
+                    if *rejected_citations > 0 {
+                        CaseClassification::MalformedCitation
+                    } else {
+                        CaseClassification::Ok
+                    },
+                )
+            }
+        };
 
     let provider_failed = classification == CaseClassification::ProviderError;
 
@@ -409,9 +428,45 @@ fn score_case(
     };
 
     // --- Citation verdicts ------------------------------------------------
+    let mut associated_claims: Vec<Option<&super::corpus::ExpectedClaim>> =
+        Vec::with_capacity(citations.len());
+    for (index, located) in citations.iter().enumerate() {
+        let previous_marker_start = index
+            .checked_sub(1)
+            .and_then(|previous| citations.get(previous))
+            .map(|previous| previous.marker_start);
+        let direct = associated_claim(
+            &answer_text,
+            located.marker_start,
+            previous_marker_start,
+            &asserted,
+        );
+        let inherited = index
+            .checked_sub(1)
+            .filter(|_| {
+                previous_marker_start.is_some_and(|previous| {
+                    continues_citation_run(&answer_text, previous, located.marker_start)
+                })
+            })
+            .and_then(|previous| associated_claims.get(previous).copied().flatten());
+        associated_claims.push(direct.or(inherited));
+    }
     let verdicts: Vec<CitationVerdict> = citations
         .iter()
-        .map(|citation| judge_citation(corpus, query, case, &asserted, citation))
+        .enumerate()
+        .map(|(index, located)| {
+            judge_citation(
+                corpus,
+                query,
+                case,
+                associated_claims.get(index).copied().flatten(),
+                &located.citation,
+            )
+        })
+        .chain(std::iter::repeat_n(
+            CitationVerdict::MalformedMarker,
+            rejected_citations,
+        ))
         .collect();
     let citations_correct = verdicts
         .iter()
@@ -420,24 +475,19 @@ fn score_case(
 
     // A claim is supported when a correct citation points at a chunk the corpus
     // says carries it.
-    let correctly_cited: BTreeSet<String> = citations
+    let correctly_cited_claims: BTreeSet<&str> = associated_claims
         .iter()
         .zip(&verdicts)
         .filter(|(_, verdict)| **verdict == CitationVerdict::Correct)
-        .filter_map(|(citation, _)| resolve_chunk_slug(corpus, citation))
+        .filter_map(|(claim, _)| claim.map(|claim| claim.id.as_str()))
         .collect();
 
     let supported_claims = asserted
         .iter()
-        .filter(|claim| {
-            claim
-                .supported_by
-                .iter()
-                .any(|slug| correctly_cited.contains(slug))
-        })
+        .filter(|claim| correctly_cited_claims.contains(claim.id.as_str()))
         .count();
 
-    if !provider_failed {
+    if classification == CaseClassification::Ok {
         if abstained && !abstention_expected {
             classification = CaseClassification::SpuriousAbstention;
         } else if !abstained && abstention_expected {
@@ -458,12 +508,12 @@ fn score_case(
         asserted_claims: asserted.len(),
         supported_claims,
         unsupported_claims: asserted.len() - supported_claims,
-        citations_emitted: citations.len(),
+        citations_emitted: citations.len() + rejected_citations,
         citations_correct,
         citation_verdicts: verdicts,
         abstained,
         abstention_expected,
-        abstention_correct: abstained == abstention_expected,
+        abstention_correct: !provider_failed && abstained == abstention_expected,
         diagnostics,
     }
 }
@@ -479,6 +529,43 @@ fn asserts_claim(answer: &str, claim: &super::corpus::ExpectedClaim) -> bool {
             .answer_markers
             .iter()
             .all(|marker| normalized.contains(&marker.to_lowercase()))
+}
+
+/// Resolve one citation marker to exactly one asserted claim in the answer
+/// segment since the previous marker. Ambiguous or detached markers support no
+/// claim.
+fn associated_claim<'a>(
+    answer: &str,
+    marker_start: usize,
+    previous_marker_start: Option<usize>,
+    asserted: &[&'a super::corpus::ExpectedClaim],
+) -> Option<&'a super::corpus::ExpectedClaim> {
+    let local_start = previous_marker_start.map_or(0, |previous| {
+        answer
+            .get(previous..marker_start)
+            .and_then(|between| between.find(']'))
+            .map_or(previous, |closing| previous + closing + 1)
+    });
+    let local = answer.get(local_start..marker_start)?;
+    let mut matches = asserted
+        .iter()
+        .copied()
+        .filter(|claim| asserts_claim(local, claim));
+    let claim = matches.next()?;
+    matches.next().is_none().then_some(claim)
+}
+
+/// Whether two markers are part of the same citation run, such as `[1][2]` or
+/// `[1], [2]`. A run inherits the claim associated with its first marker.
+fn continues_citation_run(answer: &str, previous_start: usize, marker_start: usize) -> bool {
+    answer
+        .get(previous_start..marker_start)
+        .and_then(|between| between.find(']').map(|closing| &between[closing + 1..]))
+        .is_some_and(|between| {
+            between
+                .chars()
+                .all(|character| character.is_whitespace() || character.is_ascii_punctuation())
+        })
 }
 
 /// The corpus chunk a citation points at, by slug.
@@ -503,7 +590,7 @@ fn judge_citation(
     corpus: &EvalCorpus,
     query: &EvalQuery,
     case: &AnswerCase,
-    asserted: &[&super::corpus::ExpectedClaim],
+    associated_claim: Option<&super::corpus::ExpectedClaim>,
     citation: &Citation,
 ) -> CitationVerdict {
     let Some(slug) = resolve_chunk_slug(corpus, citation) else {
@@ -526,10 +613,7 @@ fn judge_citation(
     if !quoted.is_empty() && !chunk.content.contains(quoted) {
         return CitationVerdict::SpanMismatch;
     }
-    if !asserted
-        .iter()
-        .any(|claim| claim.supported_by.contains(&slug))
-    {
+    if !associated_claim.is_some_and(|claim| claim.supported_by.contains(&slug)) {
         return CitationVerdict::UnrelatedToClaim;
     }
     CitationVerdict::Correct
@@ -628,12 +712,16 @@ pub async fn answer_with_deterministic_pipeline(
         let text = DeterministicLlm::answer_for(&system_prompt);
 
         let citable: Vec<CitableChunk> = results.iter().map(CitableChunk::from).collect();
-        let citations = extract_citations(&text, &citable);
+        let extracted = extract_citations_verified(&text, &citable);
 
         let outcome = if reads_as_abstention(&text) {
             AnswerOutcome::Abstained { text }
         } else {
-            AnswerOutcome::Answered { text, citations }
+            AnswerOutcome::Answered {
+                text,
+                citations: extracted.citations,
+                rejected_citations: extracted.rejected,
+            }
         };
 
         cases.push(AnswerCase {
@@ -705,7 +793,29 @@ mod tests {
                 text.push(' ');
             }
         }
+        text.push_str("[1]");
         text
+    }
+
+    fn answered(text: String, citations: Vec<Citation>) -> AnswerOutcome {
+        let marker_starts: Vec<usize> = text.match_indices('[').map(|(start, _)| start).collect();
+        assert_eq!(
+            marker_starts.len(),
+            citations.len(),
+            "test answers must locate every supplied citation"
+        );
+        AnswerOutcome::Answered {
+            text,
+            citations: citations
+                .into_iter()
+                .zip(marker_starts)
+                .map(|(citation, marker_start)| LocatedCitation {
+                    citation,
+                    marker_start,
+                })
+                .collect(),
+            rejected_citations: 0,
+        }
     }
 
     #[test]
@@ -717,10 +827,10 @@ mod tests {
             query_id: query.id.clone(),
             generation_ids: vec![corpus.generation_id()],
             evidence_sufficient: true,
-            outcome: AnswerOutcome::Answered {
-                text: perfect_answer(query),
-                citations: vec![citation(source_id, chunk_index, &content)],
-            },
+            outcome: answered(
+                perfect_answer(query),
+                vec![citation(source_id, chunk_index, &content)],
+            ),
         };
 
         let report = run_grounding_eval(&corpus, &[case], &config(), None, FIXED_TIME);
@@ -732,6 +842,105 @@ mod tests {
     }
 
     #[test]
+    fn consecutive_citations_share_the_same_local_claim() {
+        let corpus = corpus();
+        let (query, content, chunk_index, source_id) = answerable_case(&corpus);
+        let text = format!("{}[2]", perfect_answer(query));
+        let case = AnswerCase {
+            query_id: query.id.clone(),
+            generation_ids: vec![corpus.generation_id()],
+            evidence_sufficient: true,
+            outcome: answered(
+                text,
+                vec![
+                    citation(source_id, chunk_index, &content),
+                    citation(source_id, chunk_index, &content),
+                ],
+            ),
+        };
+
+        let report = run_grounding_eval(&corpus, &[case], &config(), None, FIXED_TIME);
+        assert_eq!(report.overall.citations_correct, 2);
+        assert_eq!(
+            report.cases[0].citation_verdicts,
+            vec![CitationVerdict::Correct, CitationVerdict::Correct]
+        );
+        assert_eq!(report.cases[0].supported_claims, 1);
+    }
+
+    #[test]
+    fn a_rejected_stream_marker_stays_in_the_denominator() {
+        let corpus = corpus();
+        let (query, _, _, _) = answerable_case(&corpus);
+        let case = AnswerCase {
+            query_id: query.id.clone(),
+            generation_ids: vec![corpus.generation_id()],
+            evidence_sufficient: true,
+            outcome: AnswerOutcome::Answered {
+                text: format!("{} [99]", perfect_answer(query).trim_end_matches("[1]")),
+                citations: Vec::new(),
+                rejected_citations: 1,
+            },
+        };
+
+        let report = run_grounding_eval(&corpus, &[case], &config(), None, FIXED_TIME);
+        assert_eq!(
+            report.cases[0].classification,
+            CaseClassification::MalformedCitation
+        );
+        assert_eq!(report.cases[0].citations_emitted, 1);
+        assert_eq!(
+            report.cases[0].citation_verdicts,
+            vec![CitationVerdict::MalformedMarker]
+        );
+        assert!(report.overall.citation_precision.abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn swapped_citations_do_not_support_the_wrong_local_claims() {
+        let corpus = corpus();
+        let query = corpus
+            .queries(Split::Train)
+            .into_iter()
+            .find(|query| query.id == "q-multi-001")
+            .expect("multi-claim fixture exists");
+        let (_, source, retry) = corpus
+            .chunk("ch-runbook-retry")
+            .expect("retry chunk exists");
+        let (_, _, codes) = corpus
+            .chunk("ch-runbook-codes")
+            .expect("codes chunk exists");
+        let text =
+            "The worker gives up after four retries and the previous generation stays active [2]. \
+                    A provider rejection is recorded as OBK-4210 [1]."
+                .to_owned();
+
+        let case = AnswerCase {
+            query_id: query.id.clone(),
+            generation_ids: vec![corpus.generation_id()],
+            evidence_sufficient: true,
+            outcome: answered(
+                text,
+                vec![
+                    citation(source.uuid(), codes.index, &codes.content),
+                    citation(source.uuid(), retry.index, &retry.content),
+                ],
+            ),
+        };
+
+        let report = run_grounding_eval(&corpus, &[case], &config(), None, FIXED_TIME);
+        assert_eq!(report.overall.citations_correct, 0);
+        assert_eq!(report.cases[0].supported_claims, 0);
+        assert_eq!(
+            report.cases[0].citation_verdicts,
+            vec![
+                CitationVerdict::UnrelatedToClaim,
+                CitationVerdict::UnrelatedToClaim,
+            ]
+        );
+    }
+
+    #[test]
     fn a_valid_marker_over_a_span_that_does_not_carry_the_text_is_not_correct() {
         let corpus = corpus();
         let (query, _, chunk_index, source_id) = answerable_case(&corpus);
@@ -740,11 +949,11 @@ mod tests {
             query_id: query.id.clone(),
             generation_ids: vec![corpus.generation_id()],
             evidence_sufficient: true,
-            outcome: AnswerOutcome::Answered {
-                text: perfect_answer(query),
+            outcome: answered(
+                perfect_answer(query),
                 // Right source, right chunk index, invented passage.
-                citations: vec![citation(source_id, chunk_index, "a passage nobody wrote")],
-            },
+                vec![citation(source_id, chunk_index, "a passage nobody wrote")],
+            ),
         };
 
         let report = run_grounding_eval(&corpus, &[case], &config(), None, FIXED_TIME);
@@ -765,10 +974,10 @@ mod tests {
             query_id: query.id.clone(),
             generation_ids: vec![Uuid::from_u128(999)],
             evidence_sufficient: true,
-            outcome: AnswerOutcome::Answered {
-                text: perfect_answer(query),
-                citations: vec![citation(source_id, chunk_index, &content)],
-            },
+            outcome: answered(
+                perfect_answer(query),
+                vec![citation(source_id, chunk_index, &content)],
+            ),
         };
 
         let report = run_grounding_eval(&corpus, &[case], &config(), None, FIXED_TIME);
@@ -799,14 +1008,14 @@ mod tests {
             query_id: query.id.clone(),
             generation_ids: vec![corpus.generation_id()],
             evidence_sufficient: true,
-            outcome: AnswerOutcome::Answered {
-                text: perfect_answer(query),
-                citations: vec![citation(
+            outcome: answered(
+                perfect_answer(query),
+                vec![citation(
                     other_source.uuid(),
                     other_chunk.index,
                     &other_chunk.content,
                 )],
-            },
+            ),
         };
 
         let report = run_grounding_eval(&corpus, &[case], &config(), None, FIXED_TIME);
@@ -825,10 +1034,10 @@ mod tests {
             query_id: query.id.clone(),
             generation_ids: vec![corpus.generation_id()],
             evidence_sufficient: true,
-            outcome: AnswerOutcome::Answered {
-                text: perfect_answer(query),
-                citations: vec![citation(Uuid::from_u128(4242), 7, "anything")],
-            },
+            outcome: answered(
+                perfect_answer(query),
+                vec![citation(Uuid::from_u128(4242), 7, "anything")],
+            ),
         };
 
         let report = run_grounding_eval(&corpus, &[case], &config(), None, FIXED_TIME);
@@ -856,10 +1065,7 @@ mod tests {
             query_id: query.id.clone(),
             generation_ids: vec![corpus.generation_id()],
             evidence_sufficient: false,
-            outcome: AnswerOutcome::Answered {
-                text: "The deadline is thirty days.".to_owned(),
-                citations: Vec::new(),
-            },
+            outcome: answered("The deadline is thirty days.".to_owned(), Vec::new()),
         };
 
         let report = run_grounding_eval(&corpus, &[case], &config(), None, FIXED_TIME);
@@ -933,6 +1139,8 @@ mod tests {
             Some(&1)
         );
         assert_eq!(report.overall.expected_claim_coverage, 0.0);
+        assert!(!report.cases[0].abstention_correct);
+        assert_eq!(report.overall.abstention_accuracy, 0.0);
     }
 
     #[test]
@@ -996,10 +1204,10 @@ mod tests {
             query_id: query.id.clone(),
             generation_ids: vec![corpus.generation_id()],
             evidence_sufficient: true,
-            outcome: AnswerOutcome::Answered {
-                text: perfect_answer(query),
-                citations: vec![citation(source_id, chunk_index, &content)],
-            },
+            outcome: answered(
+                perfect_answer(query),
+                vec![citation(source_id, chunk_index, &content)],
+            ),
         };
 
         let without = run_grounding_eval(

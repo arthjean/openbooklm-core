@@ -722,7 +722,7 @@
         "tags": [
           "chat"
         ],
-        "summary": "DELETE /api/notebooks/{id}/chat - Clear chat history.",
+        "summary": "DELETE /api/notebooks/{id}/chat - Clear chat history and its RAG traces.",
         "operationId": "clear_chat_history_handler",
         "parameters": [
           {
@@ -738,7 +738,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Deletion acknowledgement",
+            "description": "Messages and associated RAG logs deleted",
             "content": {
               "application/json": {
                 "schema": {}

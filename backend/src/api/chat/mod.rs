@@ -168,14 +168,14 @@ pub async fn get_chat_history_handler(
     }))
 }
 
-/// DELETE /api/notebooks/{id}/chat - Clear chat history.
+/// DELETE /api/notebooks/{id}/chat - Clear chat history and its RAG traces.
 #[utoipa::path(
     delete,
     path = "/api/notebooks/{id}/chat",
     tag = "chat",
     params(("id" = uuid::Uuid, Path, description = "Notebook ID")),
     responses(
-        (status = 200, description = "Deletion acknowledgement", body = serde_json::Value),
+        (status = 200, description = "Messages and associated RAG logs deleted", body = serde_json::Value),
         (status = 404, description = "Not found, or owned by another account", body = crate::error::ProblemDetails),
         (status = 401, description = "Missing or invalid credentials", body = crate::error::ProblemDetails),
     ),

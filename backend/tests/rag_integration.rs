@@ -35,9 +35,10 @@ use openbooklm::core::config::DatabasePoolConfig;
 use openbooklm::core::providers::{EMBEDDING_DIM, EmbeddingProvider};
 use openbooklm::error::AppError;
 use openbooklm::repositories::{
-    APPROVED_STRATEGY, ChunkRepository, GenerationRepository, NotebookScope, SeaOrmChunkRepository,
-    SeaOrmGenerationRepository, SeaOrmSearchRepository, SeaOrmSourceRepository, SearchRepository,
-    SourceRepository, VectorCapabilities,
+    APPROVED_STRATEGY, ChatRepository, ChunkRepository, GenerationRepository, NotebookScope,
+    SeaOrmChatRepository, SeaOrmChunkRepository, SeaOrmGenerationRepository,
+    SeaOrmSearchRepository, SeaOrmSourceRepository, SearchRepository, SourceRepository,
+    VectorCapabilities,
 };
 use openbooklm::services::rag::provenance::{
     ChunkingProvenance, EmbeddingProvenance, GenerationProvenance, Normalization,
@@ -783,6 +784,46 @@ async fn rag_log_legacy_writes_are_redacted_before_storage() {
         row.try_get::<String>("", "query_hash").expect("query hash"),
         ""
     );
+    f.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "Requires PostgreSQL with pgvector (TEST_DATABASE_URL)"]
+async fn clearing_chat_history_also_removes_its_rag_traces() {
+    let f = fixture_or_skip!();
+    let message_id = Uuid::new_v4();
+    exec(
+        &f.db,
+        "INSERT INTO chat_messages (id, notebook_id, role, content)
+         VALUES ($1, $2, 'assistant', 'synthetic answer')",
+        [message_id.into(), f.notebook_id.into()],
+    )
+    .await;
+    exec(
+        &f.db,
+        "INSERT INTO rag_logs (id, notebook_id, user_id, response_id, query_hash)
+         VALUES ($1, $2, $3, $4, 'synthetic-hash')",
+        [
+            Uuid::new_v4().into(),
+            f.notebook_id.into(),
+            f.account_id.into(),
+            message_id.into(),
+        ],
+    )
+    .await;
+
+    let chat = SeaOrmChatRepository::new(&f.db);
+    assert_eq!(chat.clear_history(f.notebook_id).await.unwrap(), 1);
+    assert_eq!(
+        scalar_i64(
+            &f.db,
+            "SELECT count(*) AS value FROM rag_logs WHERE notebook_id = $1",
+            [f.notebook_id.into()],
+        )
+        .await,
+        0
+    );
+
     f.cleanup().await;
 }
 

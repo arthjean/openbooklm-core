@@ -4,11 +4,11 @@ use async_trait::async_trait;
 use chrono::{DateTime, FixedOffset};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, DatabaseTransaction,
-    EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set,
+    EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
 };
 use uuid::Uuid;
 
-use crate::entities::{ChatMessage, chat_message};
+use crate::entities::{ChatMessage, RagLog, chat_message, rag_log};
 use crate::error::ChatError;
 use crate::llm::Citation;
 
@@ -229,10 +229,22 @@ impl ChatRepository for SeaOrmChatRepository {
 
     #[tracing::instrument(skip(self), fields(%notebook_id))]
     async fn clear_history(&self, notebook_id: Uuid) -> RepoResult<u64> {
-        Ok(ChatMessage::delete_many()
+        let txn = self.db.begin().await?;
+
+        // A cleared conversation must not leave its interaction trace behind.
+        // Delete the logs first because the legacy FK uses ON DELETE SET NULL.
+        RagLog::delete_many()
+            .filter(rag_log::Column::NotebookId.eq(notebook_id))
+            .exec(&txn)
+            .await?;
+
+        let deleted = ChatMessage::delete_many()
             .filter(chat_message::Column::NotebookId.eq(notebook_id))
-            .exec(&self.db)
+            .exec(&txn)
             .await?
-            .rows_affected)
+            .rows_affected;
+
+        txn.commit().await?;
+        Ok(deleted)
     }
 }

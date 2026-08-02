@@ -95,7 +95,7 @@ export interface paths {
         put?: never;
         /** POST /api/notebooks/{id}/chat - Send a message and get streaming response. */
         post: operations["send_message_handler"];
-        /** DELETE /api/notebooks/{id}/chat - Clear chat history. */
+        /** DELETE /api/notebooks/{id}/chat - Clear chat history and its RAG traces. */
         delete: operations["clear_chat_history_handler"];
         options?: never;
         head?: never;
@@ -1575,7 +1575,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Deletion acknowledgement */
+            /** @description Messages and associated RAG logs deleted */
             200: {
                 headers: {
                     [name: string]: unknown;

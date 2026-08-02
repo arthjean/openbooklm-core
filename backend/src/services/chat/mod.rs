@@ -136,7 +136,7 @@ pub async fn get_recent_history(
     repo.get_recent_history(notebook_id, max_messages).await
 }
 
-/// Clear chat history for a notebook.
+/// Clear chat history and its RAG interaction traces for a notebook.
 #[tracing::instrument(skip(repo), fields(%notebook_id))]
 pub async fn clear_chat_history(
     repo: &dyn ChatRepository,

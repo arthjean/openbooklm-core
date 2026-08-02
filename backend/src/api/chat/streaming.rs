@@ -394,14 +394,12 @@ pub(super) async fn stream_llm_response(
     let context_relevance = mean_relevance(&context_chunks);
     out.emit(ChatEvent::metrics(context_relevance)).await;
 
-    // Process-owned post-response work: extract memories and summarize history.
-    if memory_enabled
-        && let Some(mistral_client) = mistral.clone()
-        && let Some(embedder) = embeddings
-    {
+    // Process-owned post-response work. Temporal decay does not depend on an
+    // extraction provider, so it still runs for Anthropic/OpenAI-only setups.
+    if memory_enabled {
         spawn_memory_tasks(MemoryTaskContext {
-            mistral_client,
-            embedder,
+            mistral_client: mistral.clone(),
+            embedder: embeddings,
             memory_repo: memory_repo.clone(),
             source_repo: source_repo.clone(),
             memory_decay_tracker: memory_decay_tracker.clone(),
@@ -618,8 +616,8 @@ pub(super) fn chat_error_type(error: &AppError) -> &'static str {
 // ============================================================================
 
 struct MemoryTaskContext {
-    mistral_client: MistralClient,
-    embedder: crate::core::providers::SharedEmbeddingProvider,
+    mistral_client: Option<MistralClient>,
+    embedder: Option<crate::core::providers::SharedEmbeddingProvider>,
     memory_repo: Arc<dyn MemoryRepository>,
     source_repo: Arc<dyn SourceRepository>,
     memory_decay_tracker: MemoryDecayTracker,
@@ -633,7 +631,8 @@ struct MemoryTaskContext {
     conversation_turn: usize,
 }
 
-/// Spawn process-owned tasks for memory extraction and conversation summarization.
+/// Spawn independent process-owned tasks for memory decay, extraction and
+/// conversation summarization.
 fn spawn_memory_tasks(ctx: MemoryTaskContext) {
     let MemoryTaskContext {
         mistral_client,
@@ -650,82 +649,12 @@ fn spawn_memory_tasks(ctx: MemoryTaskContext) {
         dropped_messages,
         conversation_turn,
     } = ctx;
-    // Spawn memory extraction + temporal decay
-    let mem_repo = memory_repo.clone();
-    let mem_source_repo = source_repo;
-    let mem_user_question = user_question;
-    let mem_response = full_response;
+    // Decay has no provider dependency and must not wait behind extraction.
+    let decay_repo = memory_repo.clone();
     let decay_tracker = memory_decay_tracker;
-    let extraction_mistral = mistral_client.clone();
-    let extraction_embedder = std::sync::Arc::clone(&embedder);
-    let extraction = async move {
-        let source_names: Vec<String> = match mem_source_repo.list_for_notebook(notebook_id).await {
-            Ok(sources) => sources.into_iter().map(|s| s.title).collect(),
-            Err(e) => {
-                tracing::warn!(
-                    %notebook_id,
-                    error = %e,
-                    "Failed to load source names for memory extraction, proceeding without"
-                );
-                vec![]
-            }
-        };
-
-        match extract_memories(
-            &extraction_mistral,
-            extraction_embedder.as_ref(),
-            &mem_user_question,
-            &mem_response,
-            notebook_id,
-            mem_repo.as_ref(),
-            &source_names,
-            conversation_turn,
-        )
-        .await
-        {
-            Ok(actions) if !actions.is_empty() => {
-                // Authorize the batch, then read the per-notebook cap. Both run
-                // off the request path: this task starts after the response has
-                // been streamed. A denial silently skips extraction, which is
-                // the documented behaviour of the limit it replaces.
-                if let Err(e) = entitlements
-                    .authorize(AuthorizationRequest::new(
-                        &principal,
-                        Operation::CreateMemory { notebook_id },
-                        Uuid::new_v4(),
-                    ))
-                    .await
-                {
-                    tracing::debug!(%notebook_id, error = %e, "Memory creation not authorized — skipping extraction");
-                    return;
-                }
-
-                let limit = entitlements
-                    .quota(&principal, Quota::MemoriesPerNotebook { notebook_id })
-                    .await
-                    .unwrap_or_else(|e| {
-                        tracing::warn!(%notebook_id, error = %e, "Memory quota lookup failed");
-                        None
-                    });
-                match apply_memory_actions(notebook_id, actions, mem_repo.as_ref(), limit).await {
-                    Ok(applied) => {
-                        tracing::info!(%notebook_id, applied, "Memory extraction completed");
-                    }
-                    Err(e) => {
-                        tracing::warn!(%notebook_id, error = %e, "Memory action application failed");
-                    }
-                }
-            }
-            Ok(_) => {
-                tracing::debug!(%notebook_id, "No memories extracted from exchange");
-            }
-            Err(e) => {
-                tracing::warn!(%notebook_id, error = %e, "Memory extraction failed");
-            }
-        }
-
+    let decay = async move {
         if decay_tracker.should_run(notebook_id) {
-            match decay_memories(notebook_id, mem_repo.as_ref()).await {
+            match decay_memories(notebook_id, decay_repo.as_ref()).await {
                 Ok(result) => {
                     if result.decayed_count > 0 || result.deleted_count > 0 {
                         tracing::info!(
@@ -742,23 +671,108 @@ fn spawn_memory_tasks(ctx: MemoryTaskContext) {
             }
         }
     };
-    let extraction_shutdown = task_tracker.cancellation_token();
+    let decay_shutdown = task_tracker.cancellation_token();
     if task_tracker
-        .try_spawn("chat-memory-extraction", async move {
+        .try_spawn("memory-temporal-decay", async move {
             tokio::select! {
                 biased;
-                () = extraction_shutdown.cancelled() => {}
-                () = extraction => {}
+                () = decay_shutdown.cancelled() => {}
+                () = decay => {}
             }
         })
         .is_err()
     {
-        tracing::debug!(%notebook_id, "Memory extraction skipped during shutdown");
+        tracing::debug!(%notebook_id, "Memory temporal decay skipped during shutdown");
+    }
+
+    if let (Some(extraction_mistral), Some(extraction_embedder)) =
+        (mistral_client.clone(), embedder.clone())
+    {
+        let mem_repo = memory_repo.clone();
+        let extraction = async move {
+            let source_names: Vec<String> = match source_repo.list_for_notebook(notebook_id).await {
+                Ok(sources) => sources.into_iter().map(|s| s.title).collect(),
+                Err(e) => {
+                    tracing::warn!(
+                        %notebook_id,
+                        error = %e,
+                        "Failed to load source names for memory extraction, proceeding without"
+                    );
+                    vec![]
+                }
+            };
+
+            match extract_memories(
+                &extraction_mistral,
+                extraction_embedder.as_ref(),
+                &user_question,
+                &full_response,
+                notebook_id,
+                mem_repo.as_ref(),
+                &source_names,
+                conversation_turn,
+            )
+            .await
+            {
+                Ok(actions) if !actions.is_empty() => {
+                    let authorization = entitlements
+                        .authorize(AuthorizationRequest::new(
+                            &principal,
+                            Operation::CreateMemory { notebook_id },
+                            Uuid::new_v4(),
+                        ))
+                        .await;
+                    if let Err(e) = authorization {
+                        tracing::debug!(%notebook_id, error = %e, "Memory creation not authorized; skipping extraction");
+                    } else {
+                        let limit = entitlements
+                            .quota(&principal, Quota::MemoriesPerNotebook { notebook_id })
+                            .await
+                            .unwrap_or_else(|e| {
+                                tracing::warn!(%notebook_id, error = %e, "Memory quota lookup failed");
+                                None
+                            });
+                        match apply_memory_actions(notebook_id, actions, mem_repo.as_ref(), limit)
+                            .await
+                        {
+                            Ok(applied) => {
+                                tracing::info!(%notebook_id, applied, "Memory extraction completed");
+                            }
+                            Err(e) => {
+                                tracing::warn!(%notebook_id, error = %e, "Memory action application failed");
+                            }
+                        }
+                    }
+                }
+                Ok(_) => {
+                    tracing::debug!(%notebook_id, "No memories extracted from exchange");
+                }
+                Err(e) => {
+                    tracing::warn!(%notebook_id, error = %e, "Memory extraction failed");
+                }
+            }
+        };
+        let extraction_shutdown = task_tracker.cancellation_token();
+        if task_tracker
+            .try_spawn("chat-memory-extraction", async move {
+                tokio::select! {
+                    biased;
+                    () = extraction_shutdown.cancelled() => {}
+                    () = extraction => {}
+                }
+            })
+            .is_err()
+        {
+            tracing::debug!(%notebook_id, "Memory extraction skipped during shutdown");
+        }
     }
 
     // Spawn summarization (separate task, independent from extraction)
     let should_summarize = dropped_messages.len() > MIN_DROPPED_FOR_SUMMARY;
-    if should_summarize {
+    if should_summarize
+        && let Some(mistral_client) = mistral_client
+        && let Some(embedder) = embedder
+    {
         let sum_repo = memory_repo;
         let summarization = async move {
             let result = tokio::time::timeout(Duration::from_secs(30), async {

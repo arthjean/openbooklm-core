@@ -578,7 +578,9 @@ impl PurgeTaskState {
 /// Cooldown duration between decay runs per notebook.
 const DECAY_COOLDOWN: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// Tracks the last decay time per notebook to enforce the 24-hour cooldown.
+/// Tracks the last decay time per notebook to enforce a process-local 24-hour
+/// cooldown. Durable `updated_at` eligibility remains the authority after a
+/// restart, so resetting this throttle cannot apply decay twice inside a week.
 ///
 /// Uses `DashMap` for lock-free concurrent access from multiple `tokio::spawn`
 /// tasks. The `entry()` API provides atomic check-and-set semantics.

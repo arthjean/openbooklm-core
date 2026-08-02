@@ -269,6 +269,13 @@ pub struct PipelineFailure {
     pub message: String,
     /// The underlying error, propagated to the caller.
     pub error: AppError,
+    category: PipelineFailureCategory,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PipelineFailureCategory {
+    Inferred,
+    Shutdown,
 }
 
 impl PipelineFailure {
@@ -276,6 +283,15 @@ impl PipelineFailure {
         Self {
             message: message.into(),
             error,
+            category: PipelineFailureCategory::Inferred,
+        }
+    }
+
+    fn shutdown() -> Self {
+        Self {
+            message: SHUTDOWN_MESSAGE.to_owned(),
+            error: AppError::Internal(SHUTDOWN_MESSAGE.to_owned()),
+            category: PipelineFailureCategory::Shutdown,
         }
     }
 
@@ -284,12 +300,21 @@ impl PipelineFailure {
         Self {
             message: error.to_string(),
             error,
+            category: PipelineFailureCategory::Inferred,
+        }
+    }
+
+    fn error_type(&self) -> &'static str {
+        match self.category {
+            PipelineFailureCategory::Inferred => categorize_error(&self.message),
+            PipelineFailureCategory::Shutdown => "shutdown",
         }
     }
 }
 
 /// User-facing message for a build that outlived its deadline.
 const TIMEOUT_MESSAGE: &str = "Processing timed out — please try again or use a smaller document";
+const SHUTDOWN_MESSAGE: &str = "Processing stopped because the server is shutting down";
 
 /// What a completed build produced, before it is published.
 struct BuildOutcome {
@@ -340,22 +365,106 @@ pub async fn process_source(
     // difference matters: `timeout` cancels by dropping the future it wraps, so
     // anything owned *inside* that future would be dropped without a chance to
     // drain. `tasks` is owned outside it and survives to be shut down properly.
-    let build = tokio::time::timeout(
-        processing_timeout,
-        run_build(
-            &deps,
-            &tasks,
-            &ownership,
-            source_id,
-            notebook_id,
-            source_type,
-        ),
-    )
-    .await;
+    let build: Result<Result<BuildOutcome, PipelineFailure>, tokio::time::error::Elapsed> = tokio::select! {
+        biased;
+        () = deps.shutdown.cancelled() => {
+            warn!(
+                source_id = %source_id,
+                generation_id = %ownership.generation_id,
+                "Source processing cancelled by server shutdown"
+            );
+            Ok(Err(PipelineFailure::shutdown()))
+        }
+        build = tokio::time::timeout(
+            processing_timeout,
+            run_build(
+                &deps,
+                &tasks,
+                &ownership,
+                source_id,
+                notebook_id,
+                source_type,
+            ),
+        ) => build,
+    };
 
-    // Ownership of every async task ends here, on every path — success, stage
-    // failure and timeout alike. A successful run that leaves a task embedding
-    // in the background has the same problem as a failed one.
+    let outcome = match build {
+        Ok(Ok(outcome)) => outcome,
+        Ok(Err(failure)) => {
+            // Persist the terminal state before a potentially slow local drain.
+            // In particular, the process-wide deadline may be shorter than the
+            // ingestion drain budget during shutdown.
+            tasks.cancel();
+            let result = fail_generation(
+                &deps,
+                &ownership,
+                source_id,
+                notebook_id,
+                &analytics,
+                failure,
+            )
+            .await;
+            drain_ingestion(&tasks, source_id, &ownership).await;
+            return result;
+        }
+        Err(_elapsed) => {
+            warn!(
+                source_id = %source_id,
+                timeout_secs = processing_timeout.as_secs(),
+                "Source processing timed out"
+            );
+            let failure = PipelineFailure::new(
+                TIMEOUT_MESSAGE,
+                AppError::Internal(format!(
+                    "source processing exceeded its {}s deadline",
+                    processing_timeout.as_secs()
+                )),
+            );
+            tasks.cancel();
+            let result = fail_generation(
+                &deps,
+                &ownership,
+                source_id,
+                notebook_id,
+                &analytics,
+                failure,
+            )
+            .await;
+            drain_ingestion(&tasks, source_id, &ownership).await;
+            return result;
+        }
+    };
+
+    // Ownership of every async task ends before publication. A successful run
+    // that leaves work embedding in the background is not publishable.
+    drain_ingestion(&tasks, source_id, &ownership).await;
+
+    match publish_generation(
+        &deps,
+        &ownership,
+        source_id,
+        notebook_id,
+        &analytics,
+        &outcome,
+    )
+    .await
+    {
+        Ok(()) => Ok(()),
+        Err(failure) => {
+            fail_generation(
+                &deps,
+                &ownership,
+                source_id,
+                notebook_id,
+                &analytics,
+                failure,
+            )
+            .await
+        }
+    }
+}
+
+async fn drain_ingestion(tasks: &IngestionTasks, source_id: Uuid, ownership: &IndexOwnership) {
     let drain = tasks.shutdown(DRAIN_DEADLINE).await;
     if !drain.is_clean() {
         warn!(
@@ -369,49 +478,6 @@ pub async fn process_source(
              still running at the deadline and were not cancelled"
         );
     }
-
-    let failure = match build {
-        Ok(Ok(outcome)) => {
-            match publish_generation(
-                &deps,
-                &ownership,
-                source_id,
-                notebook_id,
-                &analytics,
-                &outcome,
-            )
-            .await
-            {
-                Ok(()) => return Ok(()),
-                Err(failure) => failure,
-            }
-        }
-        Ok(Err(failure)) => failure,
-        Err(_elapsed) => {
-            warn!(
-                source_id = %source_id,
-                timeout_secs = processing_timeout.as_secs(),
-                "Source processing timed out"
-            );
-            PipelineFailure::new(
-                TIMEOUT_MESSAGE,
-                AppError::Internal(format!(
-                    "source processing exceeded its {}s deadline",
-                    processing_timeout.as_secs()
-                )),
-            )
-        }
-    };
-
-    fail_generation(
-        &deps,
-        &ownership,
-        source_id,
-        notebook_id,
-        &analytics,
-        failure,
-    )
-    .await
 }
 
 /// Extraction, chunking, embedding and storage under one building generation.
@@ -604,7 +670,7 @@ async fn fail_generation(
         notebook_id,
         source_id,
         source_type: analytics.source_type,
-        error_type: categorize_error(&failure.message),
+        error_type: failure.error_type(),
         duration_ms: analytics.elapsed_ms(),
     });
 
@@ -680,5 +746,13 @@ mod tests {
         assert_eq!(categorize_error("OCR processing failed"), "ocr_error");
         assert_eq!(categorize_error("Processing timed out"), "timeout");
         assert_eq!(categorize_error("something else"), "unknown_error");
+    }
+
+    #[test]
+    fn shutdown_failure_category_does_not_depend_on_message_wording() {
+        let mut failure = PipelineFailure::shutdown();
+        failure.message = "Stopping now".to_owned();
+
+        assert_eq!(failure.error_type(), "shutdown");
     }
 }

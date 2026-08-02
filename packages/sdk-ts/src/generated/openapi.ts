@@ -1961,6 +1961,15 @@ export interface operations {
                     "application/json": components["schemas"]["ProblemDetails"];
                 };
             };
+            /** @description Server shutdown has closed task admission */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
         };
     };
     source_events_handler: {
@@ -2411,6 +2420,15 @@ export interface operations {
             };
             /** @description Not found, or owned by another account */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProblemDetails"];
+                };
+            };
+            /** @description Server shutdown has closed task admission */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };

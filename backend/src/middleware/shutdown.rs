@@ -102,16 +102,6 @@ impl ShutdownCoordinator {
         admission.spawn(name, future)
     }
 
-    /// Register process-scoped work during the migration to fallible admission.
-    pub fn spawn<F>(&self, name: &'static str, future: F)
-    where
-        F: std::future::Future<Output = ()> + Send + 'static,
-    {
-        if self.try_spawn(name, future).is_err() {
-            tracing::warn!(task = name, "Task rejected because shutdown is active");
-        }
-    }
-
     fn spawn_admitted<F>(&self, name: &'static str, future: F) -> Result<(), SpawnRejected>
     where
         F: std::future::Future<Output = ()> + Send + 'static,

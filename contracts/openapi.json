@@ -1286,6 +1286,16 @@
                 }
               }
             }
+          },
+          "503": {
+            "description": "Server shutdown has closed task admission",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -1910,6 +1920,16 @@
           },
           "404": {
             "description": "Not found, or owned by another account",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Server shutdown has closed task admission",
             "content": {
               "application/json": {
                 "schema": {

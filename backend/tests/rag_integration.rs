@@ -2962,11 +2962,11 @@ async fn an_embedding_error_stops_admitting_new_provider_calls() {
 async fn a_shutdown_signal_stops_ingestion_and_preserves_the_index() {
     use openbooklm::core::entitlements::UnrestrictedPolicy;
     use openbooklm::core::principal::Principal;
+    use openbooklm::middleware::TaskTracker;
     use openbooklm::services::source_processing::{
         ProcessingDeps, claim_index_ownership, process_source,
     };
     use openbooklm::types::SourceType;
-    use tokio_util::sync::CancellationToken;
 
     let f = fixture_or_skip!();
     let prov = provenance("counting:counting-v1");
@@ -2989,7 +2989,7 @@ async fn a_shutdown_signal_stops_ingestion_and_preserves_the_index() {
         fail_on_call: None,
     }) as Arc<dyn EmbeddingProvider>;
     let sink = Arc::new(RecordingSink::default());
-    let shutdown = CancellationToken::new();
+    let task_tracker = TaskTracker::new();
 
     let deps = ProcessingDeps {
         db: f.db.clone(),
@@ -3008,7 +3008,7 @@ async fn a_shutdown_signal_stops_ingestion_and_preserves_the_index() {
         entitlements: Arc::new(UnrestrictedPolicy),
         events: Arc::clone(&sink) as Arc<dyn openbooklm::core::events::EventSink>,
         principal: Principal::new(f.account_id),
-        shutdown: shutdown.clone(),
+        shutdown: task_tracker.cancellation_token(),
     };
 
     let ownership = claim_index_ownership(
@@ -3023,14 +3023,23 @@ async fn a_shutdown_signal_stops_ingestion_and_preserves_the_index() {
     .expect("claim wins");
 
     // A generous deadline: what ends this run is the shutdown signal, not time.
-    let run = tokio::spawn(process_source(
-        deps,
-        ownership.clone(),
-        source_id,
-        f.notebook_id,
-        SourceType::Text,
-        Duration::from_secs(60),
-    ));
+    let (outcome_tx, outcome_rx) = tokio::sync::oneshot::channel();
+    let run_ownership = ownership.clone();
+    let notebook_id = f.notebook_id;
+    task_tracker
+        .try_spawn("source-processing", async move {
+            let outcome = process_source(
+                deps,
+                run_ownership,
+                source_id,
+                notebook_id,
+                SourceType::Text,
+                Duration::from_secs(60),
+            )
+            .await;
+            let _ = outcome_tx.send(outcome);
+        })
+        .expect("source processing admission");
 
     // Let the first batch reach the provider, then shut down.
     while started.load(Ordering::SeqCst) == 0 {
@@ -3038,9 +3047,10 @@ async fn a_shutdown_signal_stops_ingestion_and_preserves_the_index() {
     }
     let at_shutdown = started.load(Ordering::SeqCst);
     let signalled = std::time::Instant::now();
-    shutdown.cancel();
+    task_tracker.begin_shutdown();
 
-    let outcome = run.await.expect("join");
+    task_tracker.wait().await;
+    let outcome = outcome_rx.await.expect("owned task outcome");
     let drained_in = signalled.elapsed();
     block.store(false, Ordering::SeqCst);
 

@@ -122,9 +122,7 @@ impl IngestionTasks {
         F::Output: Send + 'static,
     {
         let handle = self.tracker.spawn(future);
-        if let Ok(mut aborts) = self.aborts.lock() {
-            aborts.push(handle.abort_handle());
-        }
+        self.register_abort(&handle);
         handle
     }
 
@@ -145,12 +143,22 @@ impl IngestionTasks {
     {
         let counter = Arc::clone(&self.blocking_in_flight);
         counter.fetch_add(1, Ordering::SeqCst);
-        tokio::task::spawn_blocking(move || {
-            // Decrement on the way out whatever happens, including a panic:
-            // a closure that died still is not running.
-            let _guard = InFlightGuard(counter);
+        // Construct the guard before handing the closure to Tokio. If an abort
+        // prevents the closure from starting, dropping the queued closure still
+        // decrements the count.
+        let in_flight = InFlightGuard(counter);
+        let handle = self.tracker.spawn_blocking(move || {
+            let _in_flight = in_flight;
             f()
-        })
+        });
+        self.register_abort(&handle);
+        handle
+    }
+
+    fn register_abort<T>(&self, handle: &JoinHandle<T>) {
+        if let Ok(mut aborts) = self.aborts.lock() {
+            aborts.push(handle.abort_handle());
+        }
     }
 
     /// Cancel, drain within `deadline`, then abort what remains.
@@ -178,15 +186,15 @@ impl IngestionTasks {
             };
         }
 
-        // Past the deadline. Abort what can be aborted and count what is left:
-        // `TaskTracker::len` is the tasks that have not finished, which after
-        // the aborts are the ones abort cannot reach.
+        // Past the deadline. Record what was still owned at the boundary, then
+        // request abort. Started blocking closures remain in flight and are
+        // reported separately because abort cannot stop them.
+        let abandoned = self.tracker.len();
         if let Ok(aborts) = self.aborts.lock() {
             for handle in aborts.iter() {
                 handle.abort();
             }
         }
-        let abandoned = self.tracker.len();
         DrainReport {
             drained: spawned.saturating_sub(abandoned),
             abandoned,

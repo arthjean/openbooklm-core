@@ -365,6 +365,8 @@ pub enum AppError {
     RateLimited { detail: String, retry_after: u32 },
     #[error("Provider error: {0}")]
     ProviderError(String),
+    #[error("Service unavailable: {0}")]
+    ServiceUnavailable(String),
     #[error("Internal error: {0}")]
     Internal(String),
     // Database errors
@@ -450,6 +452,7 @@ impl IntoResponse for AppError {
                 retry_after,
             } => ProblemDetails::rate_limited(detail, retry_after),
             AppError::ProviderError(detail) => ProblemDetails::provider_error(detail),
+            AppError::ServiceUnavailable(detail) => ProblemDetails::service_unavailable(detail),
             AppError::Internal(_) | AppError::Database(_) => {
                 ProblemDetails::internal("An internal error occurred. Please try again later.")
             }

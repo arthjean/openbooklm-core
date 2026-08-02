@@ -7,11 +7,16 @@ use axum::{
     response::{IntoResponse, Response, Sse, sse::Event},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use futures::stream::{self, StreamExt};
+use futures::{
+    Stream,
+    stream::{self, StreamExt},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::{convert::Infallible, time::Duration};
+use std::{convert::Infallible, future::Future, time::Duration};
+use tokio::sync::oneshot;
 use tokio_stream::wrappers::BroadcastStream;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -22,6 +27,7 @@ use crate::core::entitlements::{AuthorizationRequest, Operation};
 use crate::core::principal::Principal;
 use crate::entities::source::SourceStatus;
 use crate::error::AppError;
+use crate::middleware::TaskAdmission;
 use crate::services::source_events::SourceEvent;
 use crate::services::source_processing::{
     IndexOwnership, PROCESSING_TIMEOUT, ProcessingDeps, claim_index_ownership,
@@ -167,6 +173,7 @@ pub async fn list_sources_handler(
         (status = 403, description = "Denied by the entitlement policy", body = crate::error::ProblemDetails),
         (status = 404, description = "Not found, or owned by another account", body = crate::error::ProblemDetails),
         (status = 401, description = "Missing or invalid credentials", body = crate::error::ProblemDetails),
+        (status = 503, description = "Server shutdown has closed task admission", body = crate::error::ProblemDetails),
     ),
     security(("bearer_auth" = [])),
 )]
@@ -176,52 +183,13 @@ pub async fn create_source_handler(
     Path(notebook_id): Path<Uuid>,
     Json(payload): Json<CreateSourceRequest>,
 ) -> Result<Json<SourceResponse>, AppError> {
-    verify_notebook_access(state.repos.notebooks.as_ref(), &principal, notebook_id).await?;
-
-    let source_type = SourceType::try_from(payload.source_type.as_str())?;
-    // Authorize before creating anything: a denied source creates no row and
-    // spawns no processing task.
-    state
-        .entitlements
-        .authorize(AuthorizationRequest::new(
-            &principal,
-            Operation::CreateSource {
-                notebook_id,
-                source_type,
-            },
-            Uuid::new_v4(),
-        ))
-        .await?;
-
-    validate_title(&payload.title)?;
-    let max_size = state.config.security.max_source_size_bytes;
-    let (content, metadata) = extract_and_validate_content(source_type, &payload, max_size)?;
-
-    let source = create_source(
-        state.repos.sources.as_ref(),
-        notebook_id,
-        payload.title.trim().to_string(),
-        source_type,
-        content,
-        metadata,
-    )
-    .await?;
-
-    // A brand-new source has no index yet, so this claim cannot lose to
-    // anything; going through the same path as reprocessing is what keeps
-    // "every build is owned" true for both entry points.
-    if let Some(ownership) = claim_or_report(&state, source.id, notebook_id, source_type).await {
-        spawn_source_processing(
-            &state,
-            ownership,
-            source.id,
-            notebook_id,
-            source_type,
-            &principal,
-        );
-    }
-
-    Ok(Json(source.into()))
+    let task_admission = state.task_tracker.try_admit().map_err(|_| {
+        AppError::ServiceUnavailable("Server is shutting down; retry this request".to_owned())
+    })?;
+    run_admitted_source_request(task_admission, "source-create", async move {
+        prepare_source_creation(state, principal, notebook_id, payload).await
+    })
+    .await
 }
 
 /// Claim the right to build a source's index, reporting a refusal on the source
@@ -469,6 +437,7 @@ pub async fn delete_source_handler(
         (status = 200, description = "The source, re-queued for processing", body = SourceResponse),
         (status = 404, description = "Not found, or owned by another account", body = crate::error::ProblemDetails),
         (status = 401, description = "Missing or invalid credentials", body = crate::error::ProblemDetails),
+        (status = 503, description = "Server shutdown has closed task admission", body = crate::error::ProblemDetails),
     ),
     security(("bearer_auth" = [])),
 )]
@@ -477,23 +446,147 @@ pub async fn reprocess_source_handler(
     Extension(principal): Extension<Principal>,
     Path(source_id): Path<Uuid>,
 ) -> Result<Json<SourceResponse>, AppError> {
+    let task_admission = state.task_tracker.try_admit().map_err(|_| {
+        AppError::ServiceUnavailable("Server is shutting down; retry this request".to_owned())
+    })?;
+    run_admitted_source_request(task_admission, "source-reprocess", async move {
+        prepare_source_reprocess(state, principal, source_id).await
+    })
+    .await
+}
+
+// =============================================================================
+// SOURCE PROCESSING
+// =============================================================================
+
+struct SourceProcessingJob {
+    state: CoreState,
+    ownership: IndexOwnership,
+    source_id: Uuid,
+    notebook_id: Uuid,
+    source_type: SourceType,
+    principal: Principal,
+}
+
+async fn run_admitted_source_request<F>(
+    admission: TaskAdmission,
+    task_name: &'static str,
+    prepare: F,
+) -> Result<Json<SourceResponse>, AppError>
+where
+    F: Future<Output = Result<(SourceResponse, Option<SourceProcessingJob>), AppError>>
+        + Send
+        + 'static,
+{
+    use crate::types::RequestContext;
+
+    let request_context = RequestContext::current();
+    // The root task is abortable by process shutdown, while this guard keeps
+    // preparation bound to the HTTP request timeout. Once preparation returns
+    // a response and an owned processing job, that job deliberately outlives
+    // the request body.
+    let request_cancel = CancellationToken::new();
+    let request_guard = request_cancel.clone().drop_guard();
+    let (ready_tx, ready_rx) = oneshot::channel();
+    admission
+        .spawn(
+            task_name,
+            request_context.scope(async move {
+                let prepared = tokio::select! {
+                    biased;
+                    () = request_cancel.cancelled() => return,
+                    prepared = prepare => prepared,
+                };
+                match prepared {
+                    Ok((response, job)) => {
+                        let _ = ready_tx.send(Ok(response));
+                        if let Some(job) = job {
+                            job.run().await;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(error));
+                    }
+                }
+            }),
+        )
+        .map_err(|_| shutdown_unavailable())?;
+
+    let response = ready_rx
+        .await
+        .map_err(|_| shutdown_unavailable())?
+        .map(Json);
+    request_guard.disarm();
+    response
+}
+
+async fn prepare_source_creation(
+    state: CoreState,
+    principal: Principal,
+    notebook_id: Uuid,
+    payload: CreateSourceRequest,
+) -> Result<(SourceResponse, Option<SourceProcessingJob>), AppError> {
+    verify_notebook_access(state.repos.notebooks.as_ref(), &principal, notebook_id).await?;
+
+    let source_type = SourceType::try_from(payload.source_type.as_str())?;
+    // Authorize before creating anything: a denied source creates no row and
+    // starts no processing task.
+    state
+        .entitlements
+        .authorize(AuthorizationRequest::new(
+            &principal,
+            Operation::CreateSource {
+                notebook_id,
+                source_type,
+            },
+            Uuid::new_v4(),
+        ))
+        .await?;
+
+    validate_title(&payload.title)?;
+    let max_size = state.config.security.max_source_size_bytes;
+    let (content, metadata) = extract_and_validate_content(source_type, &payload, max_size)?;
+    let source = create_source(
+        state.repos.sources.as_ref(),
+        notebook_id,
+        payload.title.trim().to_string(),
+        source_type,
+        content,
+        metadata,
+    )
+    .await?;
+
+    // A brand-new source has no index yet, so this claim cannot lose to
+    // anything. Going through the same ownership path as reprocessing keeps
+    // every accepted build under one root task.
+    let ownership = claim_or_report(&state, source.id, notebook_id, source_type).await;
+    let job = ownership.map(|ownership| SourceProcessingJob {
+        state,
+        ownership,
+        source_id: source.id,
+        notebook_id,
+        source_type,
+        principal,
+    });
+    Ok((source.into(), job))
+}
+
+async fn prepare_source_reprocess(
+    state: CoreState,
+    principal: Principal,
+    source_id: Uuid,
+) -> Result<(SourceResponse, Option<SourceProcessingJob>), AppError> {
     let source = verify_source_access(state.repos.sources.as_ref(), &principal, source_id).await?;
     let source_type = SourceType::try_from(source.source_type.as_str())?;
 
-    // Ownership is decided here, before anything is spawned or any status is
-    // written. A duplicate request loses the compare-and-set, and the losing
-    // path below returns the source exactly as it is — same response shape, no
-    // second worker, no status rewritten under the worker that owns the build
-    // (US-009).
+    // A duplicate request loses the compare-and-set and returns the state owned
+    // by the winning worker, without rewriting it or starting another build.
     let Some(ownership) = claim_or_report(&state, source_id, source.notebook_id, source_type).await
     else {
-        // Either another worker owns the build, or the deployment cannot build
-        // one at all. Both are already reported on the source itself; re-reading
-        // it is what makes the response describe the state that actually holds.
         let current = crate::services::sources::get_source(state.repos.sources.as_ref(), source_id)
             .await?
             .unwrap_or(source);
-        return Ok(Json(current.into()));
+        return Ok((current.into(), None));
     };
 
     let updated = update_source_status(
@@ -507,91 +600,72 @@ pub async fn reprocess_source_handler(
         .source_broadcaster
         .broadcast_status(source.notebook_id, source_id, "pending", None);
 
-    spawn_source_processing(
-        &state,
+    let job = SourceProcessingJob {
+        state,
         ownership,
         source_id,
-        source.notebook_id,
+        notebook_id: source.notebook_id,
         source_type,
-        &principal,
-    );
-
-    Ok(Json(updated.into()))
+        principal,
+    };
+    Ok((updated.into(), Some(job)))
 }
 
-// =============================================================================
-// SOURCE PROCESSING
-// =============================================================================
+impl SourceProcessingJob {
+    async fn run(self) {
+        use crate::services::source_processing::process_source;
 
-/// Spawn async source processing task tracked for graceful shutdown.
-///
-/// Uses `task_tracker.spawn()` so the server waits for in-progress processing
-/// before shutting down.
-///
-/// The deadline is *not* applied here. `tokio::time::timeout` cancels by
-/// dropping the future it wraps, which detaches whatever that future owns —
-/// exactly the defect EP-002 removes. `process_source` therefore owns both its
-/// deadline and its tasks, cancels cooperatively, drains within a bounded
-/// window, and marks its building generation failed. The previously active
-/// generation stays searchable in every one of those cases, so nothing out here
-/// needs to write the source's status.
-fn spawn_source_processing(
-    state: &CoreState,
-    ownership: IndexOwnership,
-    source_id: Uuid,
-    notebook_id: Uuid,
-    source_type: SourceType,
-    principal: &Principal,
-) {
-    use crate::services::source_processing::process_source;
-    use crate::types::RequestContext;
+        let deps = ProcessingDeps::from_state(&self.state, self.principal);
 
-    let deps = ProcessingDeps::from_state(state, principal.clone());
+        let mistral = self.state.clients.mistral.clone();
+        let chunk_repo = self.state.repos.chunks.clone();
+        let notebook_repo = self.state.repos.notebooks.clone();
+        let post_processing_shutdown = self.state.task_tracker.cancellation_token();
 
-    // Dependencies for post-processing suggestion generation
-    let mistral = state.clients.mistral.clone();
-    let chunk_repo = state.repos.chunks.clone();
-    let notebook_repo = state.repos.notebooks.clone();
-
-    // Capture the current request context so the spawned task inherits
-    // the request_id for end-to-end tracing of downstream HTTP calls.
-    let ctx = RequestContext::current();
-
-    state.task_tracker.spawn("source-processing", async move {
-        let result = ctx
-            .scope(process_source(
-                deps,
-                ownership,
-                source_id,
-                notebook_id,
-                source_type,
-                PROCESSING_TIMEOUT,
-            ))
-            .await;
+        // `process_source` owns its deadline, child tasks, cooperative drain and
+        // terminal generation state. This root task only owns its lifetime.
+        let result = process_source(
+            deps,
+            self.ownership,
+            self.source_id,
+            self.notebook_id,
+            self.source_type,
+            PROCESSING_TIMEOUT,
+        )
+        .await;
         match result {
             Ok(()) => {
                 // Generate and cache suggested questions post-indexation.
-                // Fire-and-forget: errors are logged but don't affect the source status.
-                if let Err(e) = crate::services::suggestions::generate_and_store(
-                    mistral.as_ref(),
-                    chunk_repo.as_ref(),
-                    notebook_repo.as_ref(),
-                    notebook_id,
-                )
-                .await
-                {
-                    warn!(
-                        error = %e,
-                        %notebook_id,
-                        "Failed to generate suggested questions post-indexation"
-                    );
+                // This optional tail observes root shutdown without affecting
+                // the generation that has already published successfully.
+                tokio::select! {
+                    biased;
+                    () = post_processing_shutdown.cancelled() => {}
+                    suggestions = crate::services::suggestions::generate_and_store(
+                        mistral.as_ref(),
+                        chunk_repo.as_ref(),
+                        notebook_repo.as_ref(),
+                        self.notebook_id,
+                    ) => {
+                        if let Err(e) = suggestions {
+                            warn!(
+                                error = %e,
+                                notebook_id = %self.notebook_id,
+                                "Failed to generate suggested questions post-indexation"
+                            );
+                        }
+                    }
                 }
             }
             Err(e) => {
-                error!(source_id = %source_id, error = %e, "Source processing failed");
+                error!(source_id = %self.source_id, error = %e, "Source processing failed");
             }
         }
-    });
+    }
+}
+
+fn shutdown_unavailable() -> AppError {
+    AppError::ServiceUnavailable("Server is shutting down; retry this request".to_owned())
 }
 
 // =============================================================================
@@ -662,7 +736,8 @@ pub async fn source_events_handler(
         }
     });
 
-    let stream = replay_stream.chain(live_stream);
+    let shutdown = state.task_tracker.cancellation_token();
+    let stream = stop_on_shutdown(replay_stream.chain(live_stream), shutdown);
 
     let sse = Sse::new(stream).keep_alive(
         axum::response::sse::KeepAlive::new()
@@ -671,6 +746,13 @@ pub async fn source_events_handler(
     );
 
     Ok(sse.into_response())
+}
+
+fn stop_on_shutdown<S>(stream: S, shutdown: CancellationToken) -> impl Stream<Item = S::Item>
+where
+    S: Stream,
+{
+    stream.take_until(shutdown.cancelled_owned())
 }
 
 /// Serialize a source event to SSE format with an event ID.
@@ -743,7 +825,18 @@ pub async fn youtube_title_handler(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use super::*;
+
+    struct DropMarker(Arc<AtomicBool>);
+
+    impl Drop for DropMarker {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
 
     #[test]
     fn valid_pdf_bytes_pass_validation() {
@@ -851,5 +944,54 @@ mod tests {
         let event = SourceEvent::ocr_cache_hit(source_id);
         let result = serialize_sse_event(&event, 4, Uuid::nil());
         assert!(result.is_some(), "OCR cache hit event should serialize");
+    }
+
+    #[tokio::test]
+    async fn source_event_stream_ends_when_the_root_scope_stops() {
+        let task_tracker = crate::middleware::TaskTracker::new();
+        let shutdown = task_tracker.cancellation_token();
+        let mut events = Box::pin(stop_on_shutdown(
+            stream::pending::<Result<Event, Infallible>>(),
+            shutdown,
+        ));
+
+        task_tracker.begin_shutdown();
+
+        assert!(events.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn dropping_the_http_waiter_cancels_source_preparation() {
+        let task_tracker = crate::middleware::TaskTracker::new();
+        let admission = task_tracker.try_admit().expect("request admission");
+        let dropped = Arc::new(AtomicBool::new(false));
+        let dropped_by_prepare = Arc::clone(&dropped);
+        let (started_tx, started_rx) = oneshot::channel();
+
+        let waiter = tokio::spawn(run_admitted_source_request(
+            admission,
+            "test-source-request",
+            async move {
+                let _marker = DropMarker(dropped_by_prepare);
+                let _ = started_tx.send(());
+                std::future::pending::<
+                    Result<(SourceResponse, Option<SourceProcessingJob>), AppError>,
+                >()
+                .await
+            },
+        ));
+        started_rx.await.expect("preparation started");
+
+        waiter.abort();
+        let _ = waiter.await;
+        tokio::time::timeout(Duration::from_millis(50), async {
+            while !dropped.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("request cancellation must drop source preparation");
+
+        task_tracker.shutdown(Duration::from_secs(1)).await;
     }
 }

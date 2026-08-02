@@ -700,6 +700,16 @@
                 }
               }
             }
+          },
+          "503": {
+            "description": "Server shutdown has closed task admission",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
           }
         },
         "security": [

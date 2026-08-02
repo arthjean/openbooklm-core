@@ -21,9 +21,9 @@ use axum::{
     response::{IntoResponse, Response, Sse, sse},
 };
 use futures::StreamExt;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
-use tokio_util::sync::CancellationToken;
+use tokio_util::sync::{CancellationToken, DropGuard};
 use uuid::Uuid;
 
 use crate::api::common::verify_notebook_access;
@@ -35,6 +35,7 @@ use crate::error::AppError;
 use crate::llm::TeachingMode;
 use crate::services::chat::{ChatMessageResponse, clear_chat_history, get_chat_history_paginated};
 use crate::services::rag::rag_log::get_rag_log_ids_for_messages;
+use crate::types::RequestContext;
 
 use sse_helpers::{SSE_KEEPALIVE_SECS, apply_sse_headers, chat_event_to_sse};
 use streaming::{CancellableStream, StreamContext, stream_llm_response};
@@ -58,6 +59,7 @@ use types::{ChatHistoryQuery, ChatHistoryResponse, SendMessageRequest, TeachingM
         (status = 403, description = "Denied by the entitlement policy", body = crate::error::ProblemDetails),
         (status = 404, description = "Not found, or owned by another account", body = crate::error::ProblemDetails),
         (status = 401, description = "Missing or invalid credentials", body = crate::error::ProblemDetails),
+        (status = 503, description = "Server shutdown has closed task admission", body = crate::error::ProblemDetails),
     ),
     security(("bearer_auth" = [])),
 )]
@@ -67,25 +69,45 @@ pub async fn send_message_handler(
     Path(notebook_id): Path<Uuid>,
     Json(payload): Json<SendMessageRequest>,
 ) -> Result<Response, AppError> {
+    // Materialize root ownership before `prepare` can persist the user message.
+    // Forced shutdown can then abort either the complete turn or nothing.
+    let task_admission = state.task_tracker.try_admit().map_err(|_| {
+        AppError::ServiceUnavailable("Server is shutting down; retry this request".to_owned())
+    })?;
+
     // The typed event channel and its cancellation token. This handler is the
-    // only layer below this point that knows the transport is SSE; everything
-    // it spawns speaks `ChatEvent`.
+    // only layer below this point that knows the transport is SSE; the owned
+    // turn speaks `ChatEvent`.
     let (out, rx) = ChatEventStream::channel();
     let cancel_token = CancellationToken::new();
+    let cancel_guard = cancel_token.clone().drop_guard();
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let task_state = state.clone();
+    let task_cancel = cancel_token.clone();
+    let request_context = RequestContext::current();
+    task_admission
+        .spawn(
+            "chat-turn",
+            request_context.scope(async move {
+                let outcome =
+                    turn::prepare(&task_state, &principal, notebook_id, &payload, &out).await;
+                match outcome {
+                    Ok(outcome) => {
+                        if ready_tx.send(Ok(())).is_err() {
+                            task_cancel.cancel();
+                        }
+                        run_prepared_turn(outcome, out, task_cancel, &task_state).await;
+                    }
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(error));
+                    }
+                }
+            }),
+        )
+        .map_err(|_| shutdown_unavailable())?;
+    ready_rx.await.map_err(|_| shutdown_unavailable())??;
 
-    let handle = match turn::prepare(&state, &principal, notebook_id, &payload, &out).await? {
-        TurnOutcome::Stream(context) => {
-            spawn_llm_stream(*context, out, cancel_token.clone(), &state)
-        }
-        TurnOutcome::Answer(context) => tokio::spawn(async move {
-            fallback::stream_grounded_fallback(context, &out).await;
-        }),
-        TurnOutcome::Failed(context) => tokio::spawn(async move {
-            fallback::stream_turn_failure(context, &out).await;
-        }),
-    };
-
-    Ok(sse_response(handle, rx, cancel_token, &state))
+    Ok(sse_response(rx, cancel_guard, &state))
 }
 
 /// GET /api/notebooks/{id}/chat - Get paginated chat history.
@@ -207,51 +229,112 @@ pub async fn list_teaching_modes() -> Json<TeachingModesResponse> {
 // SSE stream spawning (handler-only concern — depends on Axum response types)
 // ============================================================================
 
-/// Spawn the LLM streaming task.
+enum ProviderFreeOutcome {
+    Answer(fallback::FallbackContext),
+    Failed(fallback::FailureContext),
+}
+
+async fn run_prepared_turn(
+    outcome: TurnOutcome,
+    out: ChatEventStream,
+    client_cancel: CancellationToken,
+    state: &CoreState,
+) {
+    match outcome {
+        TurnOutcome::Stream(context) => {
+            run_llm_stream(*context, out, client_cancel, state).await;
+        }
+        TurnOutcome::Answer(context) => {
+            run_provider_free(
+                ProviderFreeOutcome::Answer(context),
+                out,
+                client_cancel,
+                state.task_tracker.cancellation_token(),
+            )
+            .await;
+        }
+        TurnOutcome::Failed(context) => {
+            run_provider_free(
+                ProviderFreeOutcome::Failed(context),
+                out,
+                client_cancel,
+                state.task_tracker.cancellation_token(),
+            )
+            .await;
+        }
+    }
+}
+
+async fn run_provider_free(
+    outcome: ProviderFreeOutcome,
+    out: ChatEventStream,
+    client_cancel: CancellationToken,
+    shutdown: CancellationToken,
+) {
+    tokio::select! {
+        biased;
+        () = shutdown.cancelled() => {
+            out.emit(ChatEvent::shutdown("Server shutting down")).await;
+        }
+        () = client_cancel.cancelled() => {}
+        () = async {
+            match outcome {
+                ProviderFreeOutcome::Answer(context) => {
+                    fallback::stream_grounded_fallback(context, &out).await;
+                }
+                ProviderFreeOutcome::Failed(context) => {
+                    fallback::stream_turn_failure(context, &out).await;
+                }
+            }
+        } => {}
+    }
+}
+
+/// Run the LLM branch inside the already-owned chat task.
 ///
 /// Every failure path out of `stream_llm_response` reports one typed
-/// `ChatFailed` event and one terminal `error`, which is why the task is wrapped
-/// here rather than spawned bare like the two provider-free endings.
-fn spawn_llm_stream(
+/// `ChatFailed` event and one terminal `error`.
+async fn run_llm_stream(
     stream_ctx: StreamContext,
     out: ChatEventStream,
     cancel_token: CancellationToken,
     state: &CoreState,
-) -> tokio::task::JoinHandle<()> {
+) {
     // Captured before the context moves into the task.
     let events = state.events.clone();
     let account_id = stream_ctx.principal.account_id;
     let failed_notebook_id = stream_ctx.notebook_id;
     let provider_name = stream_ctx.provider.name().to_owned();
 
-    tokio::spawn(async move {
-        if let Err(e) = stream_llm_response(stream_ctx, &out, cancel_token).await {
-            events.emit(DomainEvent::ChatFailed {
-                account_id,
-                notebook_id: failed_notebook_id,
-                provider: provider_name,
-                error_type: streaming::chat_error_type(&e),
-            });
-            // The one terminal event for every failure path. `ChatEventStream`
-            // drops it if the stream already terminated.
-            out.emit(ChatEvent::error(e.to_string())).await;
-        }
-    })
+    if let Err(e) = stream_llm_response(stream_ctx, &out, cancel_token).await {
+        events.emit(DomainEvent::ChatFailed {
+            account_id,
+            notebook_id: failed_notebook_id,
+            provider: provider_name,
+            error_type: streaming::chat_error_type(&e),
+        });
+        // The one terminal event for every failure path. `ChatEventStream`
+        // drops it if the stream already terminated.
+        out.emit(ChatEvent::error(e.to_string())).await;
+    }
 }
 
-/// Frame a spawned task's typed events as the SSE response.
+fn shutdown_unavailable() -> AppError {
+    AppError::ServiceUnavailable("Server is shutting down; retry this request".to_owned())
+}
+
+/// Frame the owned task's typed events as the SSE response.
 ///
 /// The transport boundary: everything above produces [`ChatEvent`] values, and
 /// everything below converts them to SSE framing, heartbeats and headers.
 fn sse_response(
-    handle: tokio::task::JoinHandle<()>,
     rx: mpsc::Receiver<ChatEvent>,
-    cancel_token: CancellationToken,
+    cancel_guard: DropGuard,
     state: &CoreState,
 ) -> Response {
     let frames =
         ReceiverStream::new(rx).map(|event| Ok::<_, Infallible>(chat_event_to_sse(&event)));
-    let stream = CancellableStream::new(frames, cancel_token, handle, state.task_tracker.clone());
+    let stream = CancellableStream::new(frames, cancel_guard, state.task_tracker.clone());
     let sse = Sse::new(stream).keep_alive(
         sse::KeepAlive::new()
             .interval(Duration::from_secs(SSE_KEEPALIVE_SECS))

@@ -11,8 +11,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use futures::{Stream, StreamExt};
-use tokio::task::JoinHandle;
-use tokio_util::sync::CancellationToken;
+use tokio_util::sync::{CancellationToken, DropGuard};
 use uuid::Uuid;
 
 use crate::clients::MistralClient;
@@ -24,6 +23,7 @@ use crate::core::principal::Principal;
 use crate::core::protocol::{ChatEvent, ChatEventStream};
 use crate::error::AppError;
 use crate::llm::{LlmProvider, LlmStreamEvent, TeachingMode};
+use crate::middleware::TaskTracker;
 use crate::repositories::{ChatRepository, MemoryRepository, RagLogRepository, SourceRepository};
 use crate::services::chat::{CreateMessageParams, create_message};
 use crate::services::memory::{
@@ -68,8 +68,10 @@ pub(super) struct StreamContext {
     pub context_chunks: Vec<SearchResult>,
     pub llm_timeout: Duration,
     pub model: Option<String>,
-    /// Shutdown token from ShutdownCoordinator — cancelled when the server is shutting down.
+    /// Shutdown token from the root task scope.
     pub shutdown_token: CancellationToken,
+    /// Root owner for process-scoped work started after the response is saved.
+    pub task_tracker: TaskTracker,
     /// The account this exchange belongs to.
     pub principal: Principal,
     /// Teaching mode — used to skip follow-up suggestions for Quiz mode.
@@ -137,6 +139,7 @@ pub(super) async fn stream_llm_response(
         llm_timeout,
         model,
         shutdown_token,
+        task_tracker,
         principal,
         teaching_mode,
         mistral,
@@ -170,7 +173,7 @@ pub(super) async fn stream_llm_response(
 
     // Initialize stream with timeout
     let llm_start = std::time::Instant::now();
-    let mut stream = match tokio::time::timeout(
+    let stream_initialization = tokio::time::timeout(
         llm_timeout,
         provider.stream_chat(
             &system_prompt,
@@ -179,9 +182,20 @@ pub(super) async fn stream_llm_response(
             &rag_documents,
             None,
         ),
-    )
-    .await
-    {
+    );
+    tokio::pin!(stream_initialization);
+    let mut stream = tokio::select! {
+        biased;
+        () = shutdown_token.cancelled() => {
+            tracing::info!(%notebook_id, provider = provider.name(), "LLM stream stopped during initialization by server shutdown");
+            out.emit(ChatEvent::shutdown("Server shutting down")).await;
+            return Ok(());
+        }
+        () = cancel_token.cancelled() => {
+            tracing::info!(%notebook_id, provider = provider.name(), "LLM stream cancelled by client during initialization");
+            return Ok(());
+        }
+        result = &mut stream_initialization => match result {
         Ok(Ok(stream)) => stream,
         Ok(Err(e)) => return Err(e),
         Err(_) => {
@@ -194,6 +208,7 @@ pub(super) async fn stream_llm_response(
                 provider: provider.name().into(),
                 timeout_secs: llm_timeout.as_secs(),
             }));
+        }
         }
     };
 
@@ -209,19 +224,6 @@ pub(super) async fn stream_llm_response(
         tokio::select! {
             biased;
 
-            _ = cancel_token.cancelled() => {
-                tracing::info!(
-                    %notebook_id,
-                    provider = provider.name(),
-                    response_length = full_response.len(),
-                    "SSE stream cancelled by client"
-                );
-                if !full_response.is_empty() {
-                    save_partial_response(chat_repo.as_ref(), notebook_id, &full_response, model_name, "[interrupted]", None, Some(session_id)).await;
-                }
-                return Ok(());
-            }
-
             _ = shutdown_token.cancelled() => {
                 tracing::info!(
                     %notebook_id,
@@ -232,6 +234,19 @@ pub(super) async fn stream_llm_response(
                 out.emit(ChatEvent::shutdown("Server shutting down")).await;
                 if !full_response.is_empty() {
                     save_partial_response(chat_repo.as_ref(), notebook_id, &full_response, model_name, "[server shutdown]", None, Some(session_id)).await;
+                }
+                return Ok(());
+            }
+
+            _ = cancel_token.cancelled() => {
+                tracing::info!(
+                    %notebook_id,
+                    provider = provider.name(),
+                    response_length = full_response.len(),
+                    "SSE stream cancelled by client"
+                );
+                if !full_response.is_empty() {
+                    save_partial_response(chat_repo.as_ref(), notebook_id, &full_response, model_name, "[interrupted]", None, Some(session_id)).await;
                 }
                 return Ok(());
             }
@@ -379,7 +394,7 @@ pub(super) async fn stream_llm_response(
     let context_relevance = mean_relevance(&context_chunks);
     out.emit(ChatEvent::metrics(context_relevance)).await;
 
-    // Fire-and-forget: extract memories + summarize truncated history (US-007 + US-002)
+    // Process-owned post-response work: extract memories and summarize history.
     if memory_enabled
         && let Some(mistral_client) = mistral.clone()
         && let Some(embedder) = embeddings
@@ -390,6 +405,7 @@ pub(super) async fn stream_llm_response(
             memory_repo: memory_repo.clone(),
             source_repo: source_repo.clone(),
             memory_decay_tracker: memory_decay_tracker.clone(),
+            task_tracker,
             notebook_id,
             user_question: user_question.clone(),
             full_response: full_response.clone(),
@@ -607,6 +623,7 @@ struct MemoryTaskContext {
     memory_repo: Arc<dyn MemoryRepository>,
     source_repo: Arc<dyn SourceRepository>,
     memory_decay_tracker: MemoryDecayTracker,
+    task_tracker: TaskTracker,
     notebook_id: Uuid,
     user_question: String,
     full_response: String,
@@ -616,7 +633,7 @@ struct MemoryTaskContext {
     conversation_turn: usize,
 }
 
-/// Spawn fire-and-forget tasks for memory extraction + conversation summarization.
+/// Spawn process-owned tasks for memory extraction and conversation summarization.
 fn spawn_memory_tasks(ctx: MemoryTaskContext) {
     let MemoryTaskContext {
         mistral_client,
@@ -624,6 +641,7 @@ fn spawn_memory_tasks(ctx: MemoryTaskContext) {
         memory_repo,
         source_repo,
         memory_decay_tracker,
+        task_tracker,
         notebook_id,
         user_question,
         full_response,
@@ -640,7 +658,7 @@ fn spawn_memory_tasks(ctx: MemoryTaskContext) {
     let decay_tracker = memory_decay_tracker;
     let extraction_mistral = mistral_client.clone();
     let extraction_embedder = std::sync::Arc::clone(&embedder);
-    tokio::spawn(async move {
+    let extraction = async move {
         let source_names: Vec<String> = match mem_source_repo.list_for_notebook(notebook_id).await {
             Ok(sources) => sources.into_iter().map(|s| s.title).collect(),
             Err(e) => {
@@ -723,13 +741,26 @@ fn spawn_memory_tasks(ctx: MemoryTaskContext) {
                 }
             }
         }
-    });
+    };
+    let extraction_shutdown = task_tracker.cancellation_token();
+    if task_tracker
+        .try_spawn("chat-memory-extraction", async move {
+            tokio::select! {
+                biased;
+                () = extraction_shutdown.cancelled() => {}
+                () = extraction => {}
+            }
+        })
+        .is_err()
+    {
+        tracing::debug!(%notebook_id, "Memory extraction skipped during shutdown");
+    }
 
     // Spawn summarization (separate task, independent from extraction)
     let should_summarize = dropped_messages.len() > MIN_DROPPED_FOR_SUMMARY;
     if should_summarize {
         let sum_repo = memory_repo;
-        tokio::spawn(async move {
+        let summarization = async move {
             let result = tokio::time::timeout(Duration::from_secs(30), async {
                 let summary =
                     summarize_truncated_history(&dropped_messages, &mistral_client).await?;
@@ -754,7 +785,20 @@ fn spawn_memory_tasks(ctx: MemoryTaskContext) {
                     tracing::warn!(%notebook_id, "Conversation summarization timed out after 30s");
                 }
             }
-        });
+        };
+        let summary_shutdown = task_tracker.cancellation_token();
+        if task_tracker
+            .try_spawn("chat-conversation-summary", async move {
+                tokio::select! {
+                    biased;
+                    () = summary_shutdown.cancelled() => {}
+                    () = summarization => {}
+                }
+            })
+            .is_err()
+        {
+            tracing::debug!(%notebook_id, "Conversation summary skipped during shutdown");
+        }
     }
 }
 
@@ -974,33 +1018,30 @@ async fn save_partial_response(
 // CancellableStream
 // ============================================================================
 
-/// A stream wrapper that cancels and aborts the associated task when dropped.
+/// A stream wrapper that requests cooperative cancellation when dropped.
 ///
-/// During normal client disconnect, the task is cancelled via `cancel_token` and then aborted.
-/// During server shutdown, the task is already handling the shutdown signal via its own
-/// `shutdown_token` branch — we only cancel (don't abort) to let it save partial responses.
+/// The root task scope owns join and deadline escalation. This wrapper owns only
+/// the client's right to request cancellation, so dropping an HTTP body cannot
+/// bypass response persistence or the server-shutdown terminal event.
 pub struct CancellableStream<S> {
     inner: S,
-    cancel_token: CancellationToken,
+    cancel_guard: Option<DropGuard>,
     shutdown_token: CancellationToken,
-    handle: JoinHandle<()>,
     task_tracker: crate::middleware::TaskTracker,
 }
 
 impl<S> CancellableStream<S> {
     pub fn new(
         inner: S,
-        cancel_token: CancellationToken,
-        handle: JoinHandle<()>,
+        cancel_guard: DropGuard,
         task_tracker: crate::middleware::TaskTracker,
     ) -> Self {
         let shutdown_token = task_tracker.cancellation_token();
         task_tracker.stream_started();
         Self {
             inner,
-            cancel_token,
+            cancel_guard: Some(cancel_guard),
             shutdown_token,
-            handle,
             task_tracker,
         }
     }
@@ -1016,14 +1057,14 @@ impl<S: Stream + Unpin> Stream for CancellableStream<S> {
 
 impl<S> Drop for CancellableStream<S> {
     fn drop(&mut self) {
-        self.cancel_token.cancel();
         if self.shutdown_token.is_cancelled() {
-            // During shutdown, let the task handle cleanup via the shutdown branch
-            // instead of force-aborting it
-            tracing::debug!("CancellableStream dropped during shutdown, task cancelled gracefully");
+            if let Some(guard) = self.cancel_guard.take() {
+                guard.disarm();
+            }
+            tracing::debug!("CancellableStream dropped during server shutdown");
         } else {
-            self.handle.abort();
-            tracing::debug!("CancellableStream dropped, task cancelled and aborted");
+            drop(self.cancel_guard.take());
+            tracing::debug!("CancellableStream dropped, client cancellation requested");
         }
         self.task_tracker.stream_ended();
     }
@@ -1272,26 +1313,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancellable_stream_aborts_task_on_drop() {
+    async fn cancellable_stream_requests_task_cleanup_on_drop() {
         let cancel_token = CancellationToken::new();
         let token_clone = cancel_token.clone();
-
-        // Spawn a task that runs until cancelled
-        let handle = tokio::spawn(async move {
-            token_clone.cancelled().await;
-        });
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let completed_by_task = Arc::clone(&completed);
 
         let task_tracker = crate::middleware::TaskTracker::new();
+        task_tracker
+            .try_spawn("test-chat-stream", async move {
+                token_clone.cancelled().await;
+                completed_by_task.store(true, std::sync::atomic::Ordering::SeqCst);
+            })
+            .expect("task admission");
         let (_tx, rx) = mpsc::channel::<ChatEvent>(1);
 
         let stream = CancellableStream::new(
             ReceiverStream::new(rx),
-            cancel_token.clone(),
-            handle,
-            task_tracker,
+            cancel_token.clone().drop_guard(),
+            task_tracker.clone(),
         );
 
-        // Drop the stream — should cancel token and abort the task
         drop(stream);
 
         assert!(
@@ -1299,8 +1341,13 @@ mod tests {
             "CancellationToken must be cancelled after stream drop"
         );
 
-        // Give tokio a chance to process the abort
-        tokio::task::yield_now().await;
+        tokio::time::timeout(Duration::from_millis(50), async {
+            while !completed.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("task cleanup must complete");
     }
 
     #[tokio::test]
@@ -1320,41 +1367,36 @@ mod tests {
     #[tokio::test]
     async fn cancellable_stream_does_not_abort_task_during_shutdown() {
         let cancel_token = CancellationToken::new();
-        let token_clone = cancel_token.clone();
-
         let task_tracker = crate::middleware::TaskTracker::new();
+        let shutdown = task_tracker.cancellation_token();
 
-        // Spawn a task that waits for cancellation
         let completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let completed_clone = completed.clone();
-        let handle = tokio::spawn(async move {
-            token_clone.cancelled().await;
-            // Simulate cleanup work (e.g., saving partial response)
-            completed_clone.store(true, std::sync::atomic::Ordering::SeqCst);
-        });
+        task_tracker
+            .try_spawn("test-chat-stream", async move {
+                shutdown.cancelled().await;
+                completed_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+            })
+            .expect("task admission");
 
         let (_tx, rx) = mpsc::channel::<ChatEvent>(1);
 
         let stream = CancellableStream::new(
             ReceiverStream::new(rx),
-            cancel_token.clone(),
-            handle,
+            cancel_token.clone().drop_guard(),
             task_tracker.clone(),
         );
 
-        // Simulate server shutdown: cancel the shutdown token BEFORE dropping the stream
-        task_tracker.cancellation_token().cancel();
+        task_tracker.begin_shutdown();
 
-        // Drop the stream — should cancel token but NOT abort the task
         drop(stream);
 
         assert!(
-            cancel_token.is_cancelled(),
-            "CancellationToken must be cancelled after stream drop"
+            !cancel_token.is_cancelled(),
+            "Server shutdown must not be reclassified as client cancellation"
         );
 
-        // Give the task time to complete its cleanup
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        task_tracker.wait().await;
 
         assert!(
             completed.load(std::sync::atomic::Ordering::SeqCst),
@@ -1389,26 +1431,24 @@ mod tests {
     }
 
     /// Dropping a `CancellableStream` while items are actively flowing through
-    /// triggers the cancellation token and aborts the background task — verifying
-    /// that resource cleanup happens even when the stream is mid-delivery.
+    /// triggers cooperative cancellation of the owned background task.
     #[tokio::test]
     async fn drop_mid_stream_triggers_cancellation_and_aborts_task() {
         let cancel_token = CancellationToken::new();
         let token_clone = cancel_token.clone();
 
-        // Spawn a long-running task (simulates stream_llm_response)
-        let handle = tokio::spawn(async move {
-            token_clone.cancelled().await;
-        });
-
         let task_tracker = crate::middleware::TaskTracker::new();
+        task_tracker
+            .try_spawn("test-chat-stream", async move {
+                token_clone.cancelled().await;
+            })
+            .expect("task admission");
         let (tx, rx) = mpsc::channel::<ChatEvent>(10);
 
         let mut stream = CancellableStream::new(
             ReceiverStream::new(rx),
-            cancel_token.clone(),
-            handle,
-            task_tracker,
+            cancel_token.clone().drop_guard(),
+            task_tracker.clone(),
         );
 
         // Send items into the stream (simulating active LLM token delivery)
@@ -1430,8 +1470,13 @@ mod tests {
             "CancellationToken must be cancelled after mid-stream drop"
         );
 
-        // Give tokio a chance to process the abort
-        tokio::task::yield_now().await;
+        tokio::time::timeout(Duration::from_millis(50), async {
+            while task_tracker.task_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("task must stop after client cancellation");
     }
 
     // ========================================================================
@@ -1640,20 +1685,17 @@ mod tests {
 
         let (tx, rx) = mpsc::channel::<ChatEvent>(10);
 
-        // Spawn a task that holds the sender until cancelled, then exits
-        // (simulating stream_llm_response returning on its cancel branch)
-        let handle = tokio::spawn(async move {
-            let _tx = tx; // own the sender so the channel stays open
-            token_for_task.cancelled().await;
-            // Exiting drops _tx, closing the channel
-        });
-
         let task_tracker = crate::middleware::TaskTracker::new();
+        task_tracker
+            .try_spawn("test-chat-stream", async move {
+                let _tx = tx;
+                token_for_task.cancelled().await;
+            })
+            .expect("task admission");
 
         let mut stream = CancellableStream::new(
             ReceiverStream::new(rx),
-            cancel_token.clone(),
-            handle,
+            cancel_token.clone().drop_guard(),
             task_tracker,
         );
 

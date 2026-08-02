@@ -391,6 +391,7 @@ pub(super) async fn prepare(
         llm_timeout: Duration::from_secs(state.config.async_config.llm_timeout_secs),
         model: req.model_for_stream,
         shutdown_token: state.task_tracker.cancellation_token(),
+        task_tracker: state.task_tracker.clone(),
         principal: principal.clone(),
         teaching_mode,
         mistral: state.clients.mistral.clone(),
